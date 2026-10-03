@@ -1,15 +1,16 @@
 //! Reviewed stdio process ownership, extracted from `mcp/stdio.rs`.
 //!
-//! The Rust MCP transport is the first consumer: this session owns spawn,
+//! Both the Rust MCP transport and the selected SDK broker use this lifetime
+//! owner. This session owns spawn,
 //! scrubbed environment, reviewed executable handles, stdin, bounded stderr,
 //! authority cancellation, process-tree containment and graceful teardown.
 //! `StdioTransport` owns only stdout framing and its cancellation-safe buffer.
 //!
-//! This is not a host RPC surface or an arbitrary process executor. It accepts
-//! only the existing Rust MCP configuration; protocol negotiation, catalog
-//! admission, tool approvals and call replay policy remain in their owners.
-//! A future host transport must add Rust-issued launch/write authority before
-//! exposing this lifetime owner across the extension-host boundary.
+//! It accepts only the existing Rust MCP configuration. The SDK broker checks
+//! Rust-issued launch and exact-operation authority before exposing its pipe
+//! operations to the pinned builtin; plugins cannot use this process surface.
+//! Protocol negotiation, catalog admission, tool approvals and call replay
+//! policy remain in their owners.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use tokio::sync::Mutex as TokioMutex;
 use super::McpServerConfig;
 use crate::child_env;
 
-pub(super) struct BrokerSession {
+pub(crate) struct BrokerSession {
     child: Arc<TokioMutex<Child>>,
     stdin: ChildStdin,
     stderr_tail: Arc<StderrTail>,
@@ -86,7 +87,7 @@ impl StderrTail {
 }
 
 impl BrokerSession {
-    pub(super) fn spawn(
+    pub(crate) fn spawn(
         server_name: &str,
         command: &str,
         config: &McpServerConfig,
@@ -259,13 +260,13 @@ impl BrokerSession {
 
 impl BrokerSession {
     /// Write already-framed bytes; the transport owns the framing policy.
-    pub(super) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.stdin.write_all(bytes).await?;
         self.stdin.flush().await?;
         Ok(())
     }
 
-    pub(super) async fn last_stderr_line(&self) -> Option<String> {
+    pub(crate) async fn last_stderr_line(&self) -> Option<String> {
         // The child can write its reason immediately before the error reply.
         tokio::task::yield_now().await;
         if let Some(line) = self.stderr_tail.last_line().await {
@@ -275,16 +276,16 @@ impl BrokerSession {
         self.stderr_tail.last_line().await
     }
 
-    pub(super) async fn stderr_context(&self) -> Option<String> {
+    pub(crate) async fn stderr_context(&self) -> Option<String> {
         format_stderr_context(&self.stderr_tail).await
     }
 
-    pub(super) async fn exit_status(&self) -> Option<std::process::ExitStatus> {
+    pub(crate) async fn exit_status(&self) -> Option<std::process::ExitStatus> {
         self.child.lock().await.try_wait().ok().flatten()
     }
 
     /// Never await or spawn for readiness; a contended child still reads live.
-    pub(super) fn probe_dead(&self) -> bool {
+    pub(crate) fn probe_dead(&self) -> bool {
         match self.child.try_lock() {
             Ok(mut child) => matches!(child.try_wait(), Ok(Some(_))),
             Err(_) => false,
@@ -292,7 +293,7 @@ impl BrokerSession {
     }
 
     /// Reap the direct child and contain descendants through the same grace.
-    pub(super) async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) {
         let mut child = self.child.lock().await;
         terminate_child(&mut child, self.process_tree.as_deref()).await;
     }

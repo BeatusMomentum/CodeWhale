@@ -153,6 +153,7 @@ pub(crate) fn fake_authority(plugin_id: &str) -> crate::plugins::types::PluginAu
 
 fn register(registry: &mut OwnerRegistry, owner: &OwnerRef, name: &str) -> Result<u64, String> {
     registry.register_tool(&RegisterParams {
+        scope: None,
         owner: owner.clone(),
         kind: RegisterKind::Tool,
         spec: RegisterSpecWire {
@@ -306,6 +307,7 @@ fn registry_enforces_schema_and_count_caps() {
         )
         .unwrap();
     let mut params = RegisterParams {
+        scope: None,
         owner: a.clone(),
         kind: RegisterKind::Tool,
         spec: RegisterSpecWire {
@@ -363,6 +365,7 @@ fn admitted_tool(schema: Value) -> Result<super::registry::ToolRegistration, Str
         )
         .unwrap();
     registry.register_tool(&RegisterParams {
+        scope: None,
         owner: owner.clone(),
         kind: RegisterKind::Tool,
         spec: RegisterSpecWire {
@@ -473,23 +476,28 @@ async fn tool_input_is_checked_against_the_registered_schema_before_approval_and
 /// bundler's own `// node_modules/...` markers in the embedded bundle (not
 /// from the generator that writes the notices).
 fn bundled_packages() -> BTreeSet<String> {
-    let text = std::str::from_utf8(super::BUNDLE).expect("the bundle is UTF-8");
     let mut packages = BTreeSet::new();
-    for line in text.lines() {
-        let Some(path) = line.strip_prefix("// ") else {
-            continue;
-        };
-        let Some((_, after)) = path.rsplit_once("node_modules/") else {
-            continue;
-        };
-        let mut parts = after.split('/');
-        let first = parts.next().unwrap_or_default();
-        let name = if first.starts_with('@') {
-            format!("{first}/{}", parts.next().unwrap_or_default())
-        } else {
-            first.to_string()
-        };
-        packages.insert(name);
+    for bytes in [
+        super::BUNDLE,
+        include_bytes!("../../extension-host/dist/builtin/mcp.mjs").as_slice(),
+    ] {
+        let text = std::str::from_utf8(bytes).expect("the bundle is UTF-8");
+        for line in text.lines() {
+            let Some(path) = line.strip_prefix("// ") else {
+                continue;
+            };
+            let Some((_, after)) = path.rsplit_once("node_modules/") else {
+                continue;
+            };
+            let mut parts = after.split('/');
+            let first = parts.next().unwrap_or_default();
+            let name = if first.starts_with('@') {
+                format!("{first}/{}", parts.next().unwrap_or_default())
+            } else {
+                first.to_string()
+            };
+            packages.insert(name);
+        }
     }
     packages
 }
@@ -525,6 +533,17 @@ fn materialized_bundle_directory_carries_its_licence_notices() {
     let notices = dir.join("LICENSES.txt");
     assert_eq!(std::fs::read(&notices).unwrap(), super::NOTICES);
     assert_eq!(std::fs::read(&bundle).unwrap(), super::BUNDLE);
+    let builtin = dir.join("builtin/mcp.mjs");
+    let builtin_bytes = include_bytes!("../../extension-host/dist/builtin/mcp.mjs");
+    assert_eq!(std::fs::read(&builtin).unwrap(), builtin_bytes);
+    let pinned = super::tier::BUILTIN_MODULES
+        .iter()
+        .find(|module| module.id == "mcp")
+        .unwrap();
+    assert_eq!(
+        super::hex(Sha256::digest(builtin_bytes)),
+        pinned.source_sha256
+    );
     assert!(
         std::str::from_utf8(super::NOTICES)
             .unwrap()
@@ -533,7 +552,7 @@ fn materialized_bundle_directory_carries_its_licence_notices() {
     );
     // Written like the bundle: read-only, no staging files left behind.
     #[cfg(unix)]
-    for path in [&bundle, &notices] {
+    for path in [&bundle, &notices, &builtin] {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -547,7 +566,27 @@ fn materialized_bundle_directory_carries_its_licence_notices() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["LICENSES.txt", "codewhale-extension-host.mjs"]);
+    assert_eq!(
+        names,
+        ["LICENSES.txt", "builtin", "codewhale-extension-host.mjs"]
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.join("builtin")).unwrap().count(),
+        super::tier::BUILTIN_MODULES.len()
+    );
+    for module in super::tier::BUILTIN_MODULES {
+        let path = dir.join("builtin").join(format!("{}.mjs", module.id));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(super::hex(Sha256::digest(&bytes)), module.source_sha256);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
+    }
 
     // A directory from a build that wrote only the bundle gets its notices; a
     // tampered or replaced notices file is rewritten, never trusted.
@@ -746,8 +785,8 @@ pub(crate) fn host_tool(
     workspace: &Path,
     name: &str,
 ) -> Arc<dyn ToolSpec> {
-    let mut registry =
-        crate::tools::registry::ToolRegistryBuilder::new().build(ToolContext::new(workspace));
+    let mut registry = crate::tools::registry::ToolRegistryBuilder::new()
+        .build(ToolContext::new(workspace).with_plugin_registry(engine.plugin_view()));
     let installed = engine.install_tools(&mut registry);
     assert!(
         installed.contains(&name.to_string()),
@@ -875,7 +914,7 @@ async fn dsh_plugin_runs_end_to_end_behind_the_approval_gate() {
     );
     assert!(!tool.is_read_only_for(&json!({})));
     assert!(tool.defer_loading());
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let prepared = tool.prepare(json!({}), &context).unwrap();
     assert_eq!(prepared.approval, ApprovalRequirement::Required);
     assert!(
@@ -893,8 +932,8 @@ async fn dsh_plugin_runs_end_to_end_behind_the_approval_gate() {
 }
 
 /// A manifest may declare several `native` entries. They activate under one
-/// owner, in order, and are torn down together; a failing entry fails the whole
-/// plugin and nothing of an earlier entry stays registered.
+/// owner, in order. Entry-scoped failure retires that entry without taking
+/// away a sibling selected by another caller.
 #[tokio::test]
 async fn a_plugin_with_two_native_entries_activates_both_under_one_owner() {
     let Some(node) = node_for_tests("a_plugin_with_two_native_entries") else {
@@ -913,7 +952,9 @@ async fn a_plugin_with_two_native_entries_activates_both_under_one_owner() {
         manager.owner_state(&id("two-entries")),
         Some(OwnerState::Active)
     );
-    assert_eq!(manager.live_tool_names(), ["two_first", "two_second"]);
+    let mut tools = manager.live_tool_names();
+    tools.sort();
+    assert_eq!(tools, ["tef_first", "two_first", "two_second"]);
     assert_eq!(manager.live_command_names(), ["two-hello"]);
     let report = manager.owner_report(&id("two-entries")).unwrap();
     assert!(
@@ -923,7 +964,7 @@ async fn a_plugin_with_two_native_entries_activates_both_under_one_owner() {
         "{:?}",
         report.diagnostics
     );
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     for (name, answer) in [("two_first", "first"), ("two_second", "second")] {
         let result = host_tool(&engine, fixture.workspace(), name)
             .execute(json!({}), &context)
@@ -932,24 +973,28 @@ async fn a_plugin_with_two_native_entries_activates_both_under_one_owner() {
         assert_eq!(result.content, answer);
     }
 
-    // The failing plugin: its second entry throws, so the owner failed, the
-    // first entry's tool is not live, and the reason names the second entry.
+    // The failing entry is retired while its already-active sibling survives.
     let failing = id("two-entries-failing");
+    assert_eq!(manager.owner_state(&failing), Some(OwnerState::Active));
+    assert!(manager.live_tool_names().contains(&"tef_first".to_string()));
     assert!(
-        matches!(manager.owner_state(&failing), Some(OwnerState::Failed(ref reason))
-            if reason.contains("second entry refuses to start")),
-        "{:?}",
-        manager.owner_state(&failing)
-    );
-    assert!(
-        !manager.live_tool_names().contains(&"tef_first".to_string()),
-        "{:?}",
-        manager.live_tool_names()
+        manager
+            .shared
+            .registry
+            .lock()
+            .unwrap()
+            .owner(&failing)
+            .unwrap()
+            .scopes
+            .values()
+            .any(|state| matches!(state, OwnerState::Failed(_)))
     );
     // The healthy plugin sharing the host is untouched, and a later reconcile
     // does not retry the failed bytes.
     engine.sync().await.unwrap();
-    assert_eq!(manager.live_tool_names(), ["two_first", "two_second"]);
+    let mut tools = manager.live_tool_names();
+    tools.sort();
+    assert_eq!(tools, ["tef_first", "two_first", "two_second"]);
     manager.shutdown().await;
 }
 
@@ -966,9 +1011,17 @@ fn plugin_settings(
 }
 
 /// Run an extension tool and parse its JSON answer.
-async fn call_json(tool: &Arc<dyn ToolSpec>, input: Value, workspace: &Path) -> Value {
+async fn call_json(
+    tool: &Arc<dyn ToolSpec>,
+    input: Value,
+    workspace: &Path,
+    engine: &HostAttachment,
+) -> Value {
     let result = tool
-        .execute(input, &ToolContext::new(workspace))
+        .execute(
+            input,
+            &ToolContext::new(workspace).with_plugin_registry(engine.plugin_view()),
+        )
         .await
         .unwrap_or_else(|error| panic!("{error:?}"));
     serde_json::from_str(&result.content).expect("a JSON answer")
@@ -1121,14 +1174,14 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
     }
 
     let probe = host_tool(&engine, fixture.workspace(), "ctx_probe");
-    let seen = call_json(&probe, json!({}), fixture.workspace()).await;
+    let seen = call_json(&probe, json!({}), fixture.workspace(), &engine).await;
     // The plugin's own schema supplied the default for `limit`.
     assert_eq!(seen["config"], json!({"greeting": "Hi", "limit": 3}));
     assert_eq!(seen["workspace"], fixture.workspace().to_str().unwrap());
     assert_eq!(seen["dataDir"], data_dir.to_str().unwrap());
     // The workspace is the call's own, not the process's or the plugin's.
     let elsewhere = fixture.workspace().join("elsewhere");
-    let seen = call_json(&probe, json!({}), &elsewhere).await;
+    let seen = call_json(&probe, json!({}), &elsewhere, &engine).await;
     assert_eq!(seen["workspace"], elsewhere.to_str().unwrap());
     // Nothing else about the machine is in the context.
     assert_eq!(
@@ -1139,7 +1192,7 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
     let error = probe
         .execute(
             json!({"home": true}),
-            &ToolContext::new(fixture.workspace()),
+            &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()),
         )
         .await
         .unwrap_err();
@@ -1147,7 +1200,13 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
 
     // The plugin can write in its own directory, inside the host's sandbox.
     let note = host_tool(&engine, fixture.workspace(), "ctx_note");
-    let written = call_json(&note, json!({"text": "remember"}), fixture.workspace()).await;
+    let written = call_json(
+        &note,
+        json!({"text": "remember"}),
+        fixture.workspace(),
+        &engine,
+    )
+    .await;
     assert_eq!(written["file"], data_dir.join("note.txt").to_str().unwrap());
     assert_eq!(
         std::fs::read_to_string(data_dir.join("note.txt")).unwrap(),
@@ -1155,7 +1214,7 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
     );
 
     // A command is told the workspace it was loaded for, and the same directory.
-    let entries = manager.commands_for_workspace(fixture.workspace());
+    let entries = manager.commands_for_plugins(engine.plugin_view().as_ref());
     let command = entries
         .first()
         .expect("the plugin's command is live")
@@ -1198,7 +1257,7 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
     assert!(generation(&manager).unwrap() > first_generation);
     let probe = host_tool(&engine, fixture.workspace(), "ctx_probe");
     assert_eq!(
-        call_json(&probe, json!({}), fixture.workspace()).await["config"]["greeting"],
+        call_json(&probe, json!({}), fixture.workspace(), &engine).await["config"]["greeting"],
         "Yo"
     );
     // The same directory serves every generation: the note survived.
@@ -1219,7 +1278,7 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
     assert!(manager.live_tool_names().is_empty());
     assert!(
         manager
-            .commands_for_workspace(fixture.workspace())
+            .commands_for_plugins(engine.plugin_view().as_ref())
             .is_empty()
     );
     // ...so does one over the size cap (refused before the host is asked), and
@@ -1268,9 +1327,9 @@ async fn execute_tools_refuses_extension_tools_before_any_host_call() {
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
     let mut registry = crate::tools::registry::ToolRegistryBuilder::new()
-        .build(ToolContext::new(fixture.workspace()));
+        .build(ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()));
     engine.install_tools(&mut registry);
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let started = Instant::now();
     let result = crate::tools::codemode::execute_tools_tool(
         &json!({"code": "return await tools.call('slow_wait', { ms: 5000 })"}),
@@ -1301,7 +1360,7 @@ async fn disabling_mid_call_revokes_at_once_and_teardown_waits_for_async_dispose
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
     let tool = host_tool(&engine, fixture.workspace(), "slow_wait");
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let call = tokio::spawn(async move { tool.execute(json!({}), &context).await });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -1377,7 +1436,7 @@ async fn killed_host_fails_calls_once_and_replays_with_fresh_owners() {
     assert_eq!(manager.spawn_attempts(), 1);
     let pid = manager.host_pid().unwrap();
     let tool = host_tool(&engine, fixture.workspace(), "slow_wait");
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let call = tokio::spawn(async move { tool.execute(json!({}), &context).await });
     tokio::time::sleep(Duration::from_millis(150)).await;
     #[cfg(unix)]
@@ -1493,7 +1552,7 @@ async fn an_extension_named_like_a_script_tool_is_skipped_at_turn_build() {
     engine.sync().await.unwrap();
     assert_eq!(manager.live_tool_names(), vec!["fixture_script_tool"]);
     let mut registry = crate::tools::registry::ToolRegistryBuilder::new()
-        .build(ToolContext::new(fixture.workspace()));
+        .build(ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()));
     registry.register(Arc::new(FakeScriptTool));
     let installed = engine.install_tools(&mut registry);
     assert!(installed.is_empty());
@@ -1546,6 +1605,60 @@ async fn sandboxed_host_cannot_read_codewhale_secrets_or_write_outside_its_data_
     let Some(node) = node_for_tests("sandboxed_host") else {
         return;
     };
+    sandboxed_host_boundary(NODE, node).await;
+}
+
+/// Same actual Rust manager, review/activation, tool and filesystem scenario,
+/// using the exact compiled image selected by the existing Bun resolver.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[tokio::test]
+async fn compiled_native_host_cannot_read_secrets_or_write_outside_its_data_dir() {
+    let Some(binary) = compiled_image_for_tests() else {
+        return;
+    };
+    sandboxed_host_boundary(crate::config::ExtensionHostRuntime::Bun, binary).await;
+    // Emitted only after the complete actual Rust admission/tool scenario.
+    // CI extracts this same full-run success output; no fake-Core promotion.
+    eprintln!(
+        "compiled-native-containment=passed platform={} arch={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+}
+
+/// Resolve the exact requested image through the same production runtime
+/// admission for every compiled Native scenario. Required inputs cannot skip.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn compiled_image_for_tests() -> Option<PathBuf> {
+    let Some(binary) = std::env::var_os("CODEWHALE_COMPILED_HOST_TEST_BINARY") else {
+        assert!(
+            std::env::var_os("CODEWHALE_EXT_HOST_TESTS").is_none(),
+            "required compiled Native image input is missing"
+        );
+        eprintln!("compiled Native receipt unavailable: name a matching canonical compiled image");
+        return None;
+    };
+    let binary = PathBuf::from(binary);
+    let resolution = crate::dependencies::resolve_extension_host_runtime(
+        crate::config::ExtensionHostRuntime::Bun,
+        None,
+        Some(&binary),
+    );
+    let runtime = resolution
+        .selected
+        .as_ref()
+        .unwrap_or_else(|| panic!("compiled Native runtime: {}", resolution.failure()));
+    assert!(
+        runtime.compiled,
+        "receipt requires an actual canonical compiled image, not system Bun"
+    );
+    Some(binary)
+}
+
+async fn sandboxed_host_boundary(
+    choice: crate::config::ExtensionHostRuntime,
+    runtime_path: PathBuf,
+) {
     let _policy = TestPolicyGuard::extension_host(true);
     let fixture = FixturePlugins::new(&["secret-probe"]).await;
     // Created before launch: the deny-list records the canonical spelling of
@@ -1561,11 +1674,19 @@ async fn sandboxed_host_cannot_read_codewhale_secrets_or_write_outside_its_data_
     let tokens = fixture.root.join("tokens");
     std::fs::create_dir_all(&tokens).unwrap();
     std::fs::write(tokens.join("codex.json"), "s3cret-oauth").unwrap();
-    // Outside the Codewhale home, ordinary files stay readable.
+    // Outside Core home, POSIX ordinary reads remain allowed; Windows LPAC
+    // refuses ungranted workspace reads. Neither path grants Core secrets.
     let readable = fixture.workspace().join("readable.txt");
     std::fs::write(&readable, "plain").unwrap();
 
-    let manager = fixture.manager(node.clone());
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: choice,
+        node_override: (choice == NODE).then_some(runtime_path.clone()),
+        bun_override: (choice == crate::config::ExtensionHostRuntime::Bun)
+            .then_some(runtime_path.clone()),
+        root: Some(fixture.root.clone()),
+        ..Default::default()
+    }));
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
     let HostStatus::Ready { sandbox, .. } = manager.status() else {
@@ -1574,54 +1695,24 @@ async fn sandboxed_host_cannot_read_codewhale_secrets_or_write_outside_its_data_
     let sandbox = match sandbox {
         super::supervisor::HostSandbox::Wrapped(name) => name,
         super::supervisor::HostSandbox::Unsandboxed(reason) => {
-            // Only where no wrapper works, checked independently of the
-            // launch's own probe, and the reason is what `/plugin` shows.
-            #[cfg(target_os = "linux")]
-            {
-                let minimal = std::process::Command::new("/usr/bin/bwrap")
-                    .args(["--unshare-all", "--die-with-parent", "--ro-bind", "/", "/"])
-                    .args(["--dev", "/dev", "--proc", "/proc", "--"])
-                    .arg(&node)
-                    .arg("--version")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success());
-                assert!(
-                    !minimal,
-                    "bwrap runs here, so the host must run under it: {reason}"
-                );
-                assert!(reason.starts_with("bwrap unavailable"), "{reason}");
-            }
-            #[cfg(target_os = "macos")]
-            assert!(
-                crate::sandbox::get_platform_sandbox().is_none(),
-                "Seatbelt is available here, so the host must run under it: {reason}"
-            );
-            #[cfg(windows)]
-            assert!(reason.starts_with("Windows"), "{reason}");
-            assert!(
-                super::render_status(&manager).contains(&format!("UNSANDBOXED ({reason})")),
-                "{}",
-                super::render_status(&manager)
-            );
-            eprintln!("skipping sandbox assertions: the host runs unsandboxed here ({reason})");
-            manager.shutdown().await;
-            return;
+            panic!("Native containment requires a verified sandbox: {reason}");
         }
     };
     assert!(super::render_status(&manager).contains(&format!("{sandbox} sandbox")));
 
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let read = host_tool(&engine, fixture.workspace(), "probe_read");
     let write = host_tool(&engine, fixture.workspace(), "probe_write");
 
     let plain = probe(&read, &readable, &context).await;
+    #[cfg(not(windows))]
     assert_eq!(
         plain,
         json!({"ok": true, "text": "plain"}),
         "ordinary reads work"
     );
+    #[cfg(windows)]
+    assert_eq!(plain["ok"], false, "LPAC refuses ungranted workspace reads");
     for denied in [token, backup, tokens.join("codex.json")] {
         let secret = probe(&read, &denied, &context).await;
         assert_eq!(secret["ok"], false, "{} was readable", denied.display());
@@ -1720,7 +1811,7 @@ fn extension_approval_keys_are_bound_to_the_plugin_receipt() {
         .unwrap();
     let first = keys_for(&manager, live(&mut owners, &first), &input);
     assert!(
-        first.0.starts_with("ext:a@hash-a1:shared_tool:"),
+        first.0.starts_with("ext:a@hash-a1:") && first.0.contains(":shared_tool:"),
         "{first:?}"
     );
     assert_eq!(first.0, first.1, "a grant covers the exact call only");
@@ -1990,7 +2081,7 @@ async fn typed_author_example_is_reviewed_before_its_tool_can_execute() {
     let result = tool
         .execute(
             json!({"name": "Codewhale"}),
-            &ToolContext::new(fixture.workspace()),
+            &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()),
         )
         .await
         .unwrap();
@@ -2008,7 +2099,10 @@ async fn typed_author_example_is_reviewed_before_its_tool_can_execute() {
         json!({"name": 7}),
     ] {
         let error = tool
-            .execute(input.clone(), &ToolContext::new(fixture.workspace()))
+            .execute(
+                input.clone(),
+                &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2054,11 +2148,12 @@ fn attachment_changes_discard_the_complete_scan_before_owner_side_effects() {
 
     // An old scan finishes after the engine has already changed workspace.
     attachment.set_plugins(Arc::clone(&current));
+    let current_view = attachment.plugin_view();
     let mut attachments = manager.shared.attachments.lock().unwrap();
     assert!(scan(&old).publish(&mut attachments).is_none());
     assert!(attachments[&attachment.id].desired.is_empty());
     // A current scan publishes both the engine view and owner union.
-    let (owners, _) = scan(&current).publish(&mut attachments).unwrap();
+    let (owners, _) = scan(&current_view).publish(&mut attachments).unwrap();
     assert!(owners.contains_key("plugin"));
     assert_eq!(attachments[&attachment.id].desired["plugin"], "hash-plugin");
     drop(attachments);
@@ -2067,12 +2162,12 @@ fn attachment_changes_discard_the_complete_scan_before_owner_side_effects() {
     // it uses the same snapshot: otherwise its owners could be revoked.
     let other = manager.attach(Arc::clone(&current));
     assert!(
-        scan(&current)
+        scan(&current_view)
             .publish(&mut manager.shared.attachments.lock().unwrap())
             .is_none()
     );
     drop(other);
-    let stale = scan(&current);
+    let stale = scan(&current_view);
     drop(attachment);
     assert!(
         stale
@@ -2082,8 +2177,8 @@ fn attachment_changes_discard_the_complete_scan_before_owner_side_effects() {
 }
 
 pub(crate) fn installed(engine: &HostAttachment, workspace: &Path) -> Vec<String> {
-    let mut registry =
-        crate::tools::registry::ToolRegistryBuilder::new().build(ToolContext::new(workspace));
+    let mut registry = crate::tools::registry::ToolRegistryBuilder::new()
+        .build(ToolContext::new(workspace).with_plugin_registry(engine.plugin_view()));
     engine.install_tools(&mut registry)
 }
 
@@ -2116,7 +2211,7 @@ async fn engines_in_one_process_never_revoke_each_others_plugins() {
     let first = manager.attach(slow.registry());
     first.sync().await.unwrap();
     let tool = host_tool(&first, slow.workspace(), "slow_wait");
-    let context = ToolContext::new(slow.workspace());
+    let context = ToolContext::new(slow.workspace()).with_plugin_registry(first.plugin_view());
     let call = tokio::spawn(async move { tool.execute(json!({"ms": 600}), &context).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2284,7 +2379,7 @@ async fn a_call_past_its_method_deadline_is_cancelled_and_the_host_stays_usable(
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
     let pid = manager.host_pid();
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     // `slow_wait` answers after 30 s unless it is cancelled.
     let slow = host_tool(&engine, fixture.workspace(), "slow_wait");
     let started = Instant::now();
@@ -2589,8 +2684,11 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
     assert_ne!(registration.owner, replayed.owner);
     assert_ne!(registration.handle, replayed.handle);
     assert!(matches!(
-        old.execute(json!({"ms": 1}), &ToolContext::new(fixture.workspace()))
-            .await,
+        old.execute(
+            json!({"ms": 1}),
+            &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view())
+        )
+        .await,
         Err(ToolError::NotAvailable { .. })
     ));
     // A delayed outcome from the retired process cannot dirty its replacement.
@@ -2862,7 +2960,10 @@ async fn three_crashes_stop_replay_until_explicit_retry() {
         }
         previous = Some(registration.owner);
         let outcome = tool
-            .execute(json!({}), &ToolContext::new(fixture.workspace()))
+            .execute(
+                json!({}),
+                &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()),
+            )
             .await;
         assert!(matches!(outcome, Err(ToolError::NotAvailable { .. })));
         if crash < 3 {
@@ -2949,15 +3050,20 @@ async fn heartbeat_recovers_a_delayed_pong_then_kills_a_hung_host() {
     engine.sync().await.unwrap();
     let tool = host_tool(&engine, fixture.workspace(), "hang_probe");
     let workspace = fixture.workspace().to_path_buf();
+    let plugins = engine.plugin_view();
     let task = tokio::spawn(async move {
-        tool.execute(json!({"ms": 400}), &ToolContext::new(&workspace))
-            .await
+        tool.execute(
+            json!({"ms": 400}),
+            &ToolContext::new(&workspace).with_plugin_registry(plugins),
+        )
+        .await
     });
     wait_host(&manager, || {
         matches!(manager.status(), HostStatus::Unresponsive { .. })
     })
     .await;
-    assert!(task.await.unwrap().is_ok());
+    let result = task.await.unwrap();
+    assert!(result.is_ok(), "delayed live call failed: {result:?}");
     wait_host(&manager, || {
         matches!(manager.status(), HostStatus::Ready { .. })
     })
@@ -2966,7 +3072,10 @@ async fn heartbeat_recovers_a_delayed_pong_then_kills_a_hung_host() {
     let tool = host_tool(&engine, fixture.workspace(), "hang_probe");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        tool.execute(json!({}), &ToolContext::new(fixture.workspace())),
+        tool.execute(
+            json!({}),
+            &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view()),
+        ),
     )
     .await
     .unwrap();
@@ -3081,8 +3190,11 @@ async fn replay_rechecks_persisted_disable_and_keeps_workspace_tools_separate() 
     first.sync().await.unwrap();
     let tool = host_tool(&first, a.workspace(), "crash_probe");
     assert!(matches!(
-        tool.execute(json!({}), &ToolContext::new(a.workspace()))
-            .await,
+        tool.execute(
+            json!({}),
+            &ToolContext::new(a.workspace()).with_plugin_registry(first.plugin_view())
+        )
+        .await,
         Err(ToolError::NotAvailable { .. })
     ));
     wait_host(&manager, || {
@@ -3136,14 +3248,20 @@ async fn explicit_retry_refreshes_same_byte_authority_without_inheriting_old_han
         .clone();
     assert_ne!(old_owner, current_owner);
     assert!(matches!(
-        old.execute(json!({}), &ToolContext::new(fixture.workspace()))
-            .await,
+        old.execute(
+            json!({}),
+            &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view())
+        )
+        .await,
         Err(ToolError::NotAvailable { .. })
     ));
     let current = host_tool(&engine, fixture.workspace(), "fixture_script_tool");
     assert!(
         current
-            .execute(json!({}), &ToolContext::new(fixture.workspace()))
+            .execute(
+                json!({}),
+                &ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view())
+            )
             .await
             .is_ok()
     );
@@ -3254,13 +3372,14 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
             kind,
             path: PathBuf::from("/opt/runtime/bin").join(kind.name()),
             version: (1, 4, 0),
+            compiled: false,
             native_code_flags: match kind {
                 HostRuntimeKind::Bun => Vec::new(),
                 HostRuntimeKind::Node => crate::dependencies::NODE_NATIVE_CODE_FLAGS.to_vec(),
             },
         };
         let launch = super::supervisor::plan_launch(
-            HostTier::Plugin,
+            HostTier::Builtin,
             &runtime,
             &bundle,
             home.path(),
@@ -3429,7 +3548,7 @@ async fn handshake_refuses_a_tier_or_built_in_module_digest_mismatch() {
         super::supervisor::plan_launch(tier, &runtime, &bundle, home.path(), 1 << 30).unwrap()
     };
 
-    // Each tier's host reports its own tier and the build's (empty) digests.
+    // Each tier reports its own tier and the exact embedded module digests.
     for tier in HostTier::ALL {
         let host = super::supervisor::HostProcess::spawn(
             1,
@@ -3443,15 +3562,21 @@ async fn handshake_refuses_a_tier_or_built_in_module_digest_mismatch() {
         host.shutdown().await;
     }
 
+    let mut embedded: Vec<_> = super::tier::BUILTIN_MODULES
+        .iter()
+        .map(|module| format!("{}={}", module.id, &module.source_sha256[..12]))
+        .collect();
+    embedded.sort();
+    let module_mismatch = format!(
+        "host bundle embeds the built-in module digests [{}] but the core pins [demo=0123456789ab]",
+        embedded.join(", ")
+    );
     for (case, expected) in [
         (
             "tier",
             "host reports the plugin tier but the builtin tier was launched",
         ),
-        (
-            "modules",
-            "host bundle embeds the built-in module digests [] but the core pins [demo=0123456789ab]",
-        ),
+        ("modules", module_mismatch.as_str()),
     ] {
         let mut launch = launch_for(HostTier::Plugin);
         match case {
@@ -3513,7 +3638,7 @@ async fn bun_host_runs_the_dsh_plugin_reports_bun_and_restarts_on_bun() {
     assert!(report.contains("runtime: bun "), "{report}");
 
     let tool = host_tool(&engine, fixture.workspace(), "load_workspace_dependencies");
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let result = tool.execute(json!({}), &context).await.unwrap();
     assert!(result.success, "{}", result.content);
     let payload: Value = serde_json::from_str(&result.content).unwrap();
@@ -3665,7 +3790,7 @@ async fn memory_hog_is_stopped(
     };
     assert_eq!(memory, MemoryEnforcement::planned(kind));
     let tool = host_tool(&engine, fixture.workspace(), "memory_hog");
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let outcome = tokio::time::timeout(
         Duration::from_secs(60),
         tool.execute(json!({"mib": 2048}), &context),
@@ -3763,6 +3888,25 @@ async fn memory_cap_stops_a_bun_host() {
     memory_hog_is_stopped(manager, &fixture, crate::dependencies::HostRuntimeKind::Bun).await;
 }
 
+/// Actual Rust containment/memory authority, using the same exact compiled
+/// image as the containment receipt rather than transferring system-Bun proof.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[tokio::test]
+async fn compiled_native_host_memory_cap_is_enforced() {
+    let Some(binary) = compiled_image_for_tests() else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["memory-hog"]).await;
+    let manager = bun_manager(&fixture, binary, memory_cap_supervision());
+    memory_hog_is_stopped(manager, &fixture, crate::dependencies::HostRuntimeKind::Bun).await;
+    eprintln!(
+        "compiled-native-memory=passed platform={} arch={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Extension commands
 // ---------------------------------------------------------------------------
@@ -3774,6 +3918,7 @@ fn register_command(
     hint: Option<&str>,
 ) -> Result<u64, String> {
     registry.register(&RegisterParams {
+        scope: None,
         owner: owner.clone(),
         kind: RegisterKind::Command,
         spec: RegisterSpecWire {
@@ -3832,6 +3977,7 @@ fn command_registry_refuses_shadowing_and_undoes_exactly_one_entry() {
     // A command has no input schema; descriptions and hints are bounded,
     // non-empty, single-line text.
     let mut params = RegisterParams {
+        scope: None,
         owner: a.clone(),
         kind: RegisterKind::Command,
         spec: RegisterSpecWire {
@@ -4048,9 +4194,10 @@ export function apply(ctx) {{
     engine.sync().await.unwrap();
     let run = |name: &'static str| {
         let manager = Arc::clone(&manager);
+        let plugins = engine.plugin_view();
         async move {
             let entry = manager
-                .commands_for_workspace(&manager_workspace(&manager))
+                .commands_for_plugins(plugins.as_ref())
                 .into_iter()
                 .find(|entry| entry.registration.name == name)
                 .unwrap_or_else(|| panic!("{name} is not live"));
@@ -4087,21 +4234,6 @@ export function apply(ctx) {{
             .contains("unknown result kind")
     );
     manager.shutdown().await;
-}
-
-/// The workspace the single attached engine was given.
-fn manager_workspace(manager: &ExtensionHostManager) -> PathBuf {
-    manager
-        .shared
-        .attachments
-        .lock()
-        .unwrap()
-        .values()
-        .next()
-        .expect("an attached engine")
-        .plugins
-        .workspace()
-        .to_path_buf()
 }
 
 /// With no built-in command catalog installed, a command cannot be checked
@@ -4168,6 +4300,9 @@ async fn a_command_from_a_dead_host_reports_host_down() {
         registry.mark_active(&owner);
         let handle = register_command(&mut registry, &owner, "probe-cmd", None).unwrap();
         super::command::ExtensionCommandRef {
+            selection: None,
+            scope: None,
+            content_hash: String::new(),
             handle,
             plugin_id: "probe".into(),
             generation: owner.generation,
@@ -4239,7 +4374,7 @@ async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
     engine.sync().await.unwrap();
     let reference = |name: &str| {
         manager
-            .commands_for_workspace(fixture.workspace())
+            .commands_for_plugins(engine.plugin_view().as_ref())
             .into_iter()
             .find(|entry| entry.registration.name == name)
             .unwrap_or_else(|| panic!("{name} is not live"))
@@ -4327,6 +4462,7 @@ use sha2::{Digest, Sha256};
 
 fn tier_register_params(owner: &OwnerRef, name: &str) -> RegisterParams {
     RegisterParams {
+        scope: None,
         owner: owner.clone(),
         kind: RegisterKind::Tool,
         spec: RegisterSpecWire {
@@ -4613,6 +4749,7 @@ fn launch_plans_carry_their_tier_and_use_a_data_directory_each() {
     let home = tempfile::tempdir().unwrap();
     let bundle = home.path().join("codewhale-extension-host.mjs");
     let runtime = HostRuntime {
+        compiled: false,
         kind: HostRuntimeKind::Node,
         path: PathBuf::from("/opt/runtime/bin/node"),
         version: (22, 19, 0),
@@ -4621,7 +4758,27 @@ fn launch_plans_carry_their_tier_and_use_a_data_directory_each() {
     let mut dirs = Vec::new();
     for tier in HostTier::ALL {
         let launch =
-            super::supervisor::plan_launch(tier, &runtime, &bundle, home.path(), 1 << 30).unwrap();
+            match super::supervisor::plan_launch(tier, &runtime, &bundle, home.path(), 1 << 30) {
+                Ok(launch) => launch,
+                Err(error) if tier == HostTier::Plugin => {
+                    assert!(
+                        error.contains("Native extensions require a verified OS sandbox"),
+                        "{error}"
+                    );
+                    assert!(matches!(
+                        super::supervisor::planned_sandbox(tier, &runtime, home.path()),
+                        Ok(super::supervisor::HostSandbox::Unsandboxed(_))
+                    ));
+                    let data = super::supervisor::tier_data_dir(home.path(), tier);
+                    assert!(data.is_dir());
+                    assert!(
+                        super::supervisor::tier_data_dir(home.path(), HostTier::Builtin).is_dir()
+                    );
+                    dirs.push(data);
+                    continue;
+                }
+                Err(error) => panic!("pinned Builtin plan failed: {error}"),
+            };
         assert_eq!(launch.tier, tier);
         // The runtime's own argv ends `<bundle> --tier=<tier>`, wrapped by the
         // OS sandbox or not.
@@ -4669,17 +4826,25 @@ fn place_builtin_source(root: &Path, id: &str, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
 }
 
-/// Production's table is empty, so with the default options a plugin starts
-/// the plugin host and the builtin tier is never spawned.
+/// The production table pins MCP, but ordinary plugin attachment never
+/// starts that independent builtin backend until the Engine selects it.
 #[tokio::test]
-async fn the_builtin_tier_never_spawns_in_production() {
+async fn plugin_attachment_never_spawns_the_independent_builtin_mcp_backend() {
+    let manager = ExtensionHostManager::new(ExtensionHostOptions::default());
+    assert_eq!(
+        manager.shared.builtin_modules.len(),
+        super::tier::BUILTIN_MODULES.len()
+    );
     assert!(
-        ExtensionHostManager::new(ExtensionHostOptions::default())
+        manager
             .shared
             .builtin_modules
-            .is_empty()
+            .iter()
+            .any(|module| module.id == "mcp")
     );
-    let Some(node) = node_for_tests("the_builtin_tier_never_spawns_in_production") else {
+    let Some(node) =
+        node_for_tests("plugin_attachment_never_spawns_the_independent_builtin_mcp_backend")
+    else {
         return;
     };
     let _policy = TestPolicyGuard::extension_host(true);
@@ -4691,10 +4856,12 @@ async fn the_builtin_tier_never_spawns_in_production() {
     assert_eq!(manager.tier_spawn_attempts(HostTier::Plugin), 1);
     assert_eq!(manager.tier_spawn_attempts(HostTier::Builtin), 0);
     assert_eq!(manager.tier_status(HostTier::Builtin), HostStatus::Idle);
-    assert!(
-        !super::supervisor::tier_data_dir(&fixture.root, HostTier::Builtin).exists(),
-        "no builtin data directory exists until a builtin host needs one"
-    );
+    // Planning creates an empty sibling so the Native sandbox can mask it,
+    // including on Linux where bubblewrap requires the denied root to exist.
+    // That directory is not evidence of a Builtin process or backend.
+    let builtin_data = super::supervisor::tier_data_dir(&fixture.root, HostTier::Builtin);
+    assert!(builtin_data.is_dir());
+    assert_eq!(std::fs::read_dir(builtin_data).unwrap().count(), 0);
     let report = super::render_status(&manager);
     assert!(!report.contains("built-in host"), "{report}");
     manager.shutdown().await;
@@ -4858,7 +5025,7 @@ async fn a_tier_zero_host_runs_apart_from_the_plugin_host_and_its_tool_approval_
         plugin_tool.approval_requirement(),
         ApprovalRequirement::Required
     );
-    let context = ToolContext::new(fixture.workspace());
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     assert_eq!(
         listed.prepare(json!({}), &context).unwrap().approval,
         ApprovalRequirement::Auto
@@ -4939,5 +5106,395 @@ async fn a_tier_zero_host_runs_apart_from_the_plugin_host_and_its_tool_approval_
     );
     assert!(!report.contains("tool zz_tier0_listed"), "{report}");
     assert!(!report.contains("command /"), "{report}");
+    manager.shutdown().await;
+}
+
+/// The existing installer, registry projection and final spec invocation use
+/// one attachment receipt. Two entry scopes under one owner never union into
+/// either caller, and withdrawing one does not cancel its sibling.
+#[tokio::test(flavor = "current_thread")]
+async fn native_preset_membership_filters_discovery_and_final_tool_invocation() {
+    let Some(node) = node_for_tests("native_preset_membership") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let _catalog = stub_builtin_commands();
+    let fixture = FixturePlugins::new(&["two-entries"]).await;
+    let manager = fixture.manager(node);
+    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
+    let initial = manager.attach(fixture.registry());
+    initial.sync().await.unwrap();
+    let presets = super::native_presets_for_plugins(initial.plugin_view().as_ref());
+    let first = presets
+        .iter()
+        .find(|(preset, _)| preset.entry.path.ends_with("tools.mjs"))
+        .unwrap()
+        .0
+        .clone();
+    let second = presets
+        .iter()
+        .find(|(preset, _)| preset.entry.path.ends_with("commands.mjs"))
+        .unwrap()
+        .0
+        .clone();
+    let a = manager.attach(Arc::new(
+        fixture.registry().with_native_preset(first).unwrap(),
+    ));
+    let b = manager.attach(Arc::new(
+        fixture.registry().with_native_preset(second).unwrap(),
+    ));
+    drop(initial);
+    a.sync().await.unwrap();
+    assert_eq!(installed(&a, fixture.workspace()), ["two_first"]);
+    assert_eq!(installed(&b, fixture.workspace()), ["two_second"]);
+    assert!(
+        manager
+            .commands_for_plugins(a.plugin_view().as_ref())
+            .is_empty()
+    );
+    assert_eq!(
+        manager.commands_for_plugins(b.plugin_view().as_ref())[0]
+            .registration
+            .name,
+        "two-hello"
+    );
+    let old = host_tool(&a, fixture.workspace(), "two_first");
+    let a_context = ToolContext::new(fixture.workspace()).with_plugin_registry(a.plugin_view());
+    let b_context = ToolContext::new(fixture.workspace()).with_plugin_registry(b.plugin_view());
+    assert!(
+        old.prepare(json!({}), &b_context).is_err(),
+        "a retained spec cannot execute under another caller"
+    );
+    assert_eq!(
+        old.execute(json!({}), &a_context).await.unwrap().content,
+        "first"
+    );
+    a.set_plugins(Arc::new(PluginRegistry::empty(fixture.workspace())));
+    assert!(
+        old.prepare(json!({}), &a_context).is_err(),
+        "withdrawal rejects a retained approval/spec receipt before reconciliation"
+    );
+    a.sync().await.unwrap();
+    assert_eq!(
+        host_tool(&b, fixture.workspace(), "two_second")
+            .execute(json!({}), &b_context)
+            .await
+            .unwrap()
+            .content,
+        "second"
+    );
+    // Rediscovery must preserve a now-invalid narrowed selector. A disabled
+    // build never turns a selected caller into a broad default caller.
+    manager.refresh_workspace(&fixture.disable("two-entries"));
+    assert!(!b.plugin_view().selected_native_entries().is_empty());
+    b.sync().await.unwrap();
+    assert!(installed(&b, fixture.workspace()).is_empty());
+    manager.shutdown().await;
+}
+
+/// A real installed raw roster: initial default and two child snapshots share
+/// one owner but all five discovery paths and final invocation use one receipt.
+#[tokio::test(flavor = "current_thread")]
+async fn raw_agent_presets_use_one_default_and_all_five_caller_views() {
+    let Some(node) = node_for_tests("raw_agent_presets_use_one_default_and_all_five_caller_views")
+    else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let _catalog = stub_builtin_commands();
+    let fixture = FixturePlugins::new(&["raw-agent-presets"]).await;
+    let original = fixture.registry();
+    assert_eq!(original.selected_native_entries().len(), 1);
+    assert!(
+        original.selected_native_entries()[0]
+            .entry
+            .path
+            .ends_with("/a.mjs")
+    );
+    let manager = fixture.manager(node);
+    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
+    let a = manager.attach(Arc::clone(&original));
+    a.sync().await.unwrap();
+    let roster = super::native_presets_for_plugins(a.plugin_view().as_ref());
+    assert_eq!(
+        roster.len(),
+        2,
+        "roster discovery offers admitted alternatives without activating a union"
+    );
+    assert_eq!(a.prompt_sections().await.unwrap()[0].text, "A:a");
+    let selected_b = roster
+        .iter()
+        .find(|(preset, _)| preset.entry.path.ends_with("/b.mjs"))
+        .unwrap()
+        .0
+        .clone();
+    let b = manager.attach(Arc::new(original.with_native_preset(selected_b).unwrap()));
+    b.sync().await.unwrap();
+    let check = |view: &HostAttachment, expected: &str| {
+        assert_eq!(installed(view, fixture.workspace()), ["preset_echo"]);
+        let commands = manager.commands_for_plugins(view.plugin_view().as_ref());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].registration.name, "preset-echo");
+        let roots = super::skills::roots_for_plugins(view.plugin_view().as_ref());
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].0.path.ends_with(expected));
+        assert_eq!(roots[0].0.snapshots[0].name, "preset-note");
+    };
+    check(&a, "a");
+    check(&b, "b");
+    assert_eq!(a.prompt_sections().await.unwrap()[0].text, "A:a");
+    assert_eq!(b.prompt_sections().await.unwrap()[0].text, "B:b");
+    let hook_payload = protocol::HookCallPayload {
+        name: "read".into(),
+        call_id: "raw-preset-hook".into(),
+        input: json!({}),
+        mode: "Agent".into(),
+        workspace: fixture.workspace().to_string_lossy().into_owned(),
+        model: "fixture".into(),
+    };
+    let hooks_a = a.tool_before_hooks(hook_payload.clone()).await;
+    let hooks_b = b.tool_before_hooks(hook_payload).await;
+    assert_eq!(hooks_a.len(), 1);
+    assert_eq!(hooks_b.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&hooks_a[0].stdout).unwrap()["additionalContext"],
+        "A:a"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&hooks_b[0].stdout).unwrap()["additionalContext"],
+        "B:b"
+    );
+    let a_context = ToolContext::new(fixture.workspace()).with_plugin_registry(a.plugin_view());
+    let b_context = ToolContext::new(fixture.workspace()).with_plugin_registry(b.plugin_view());
+    let retained = host_tool(&a, fixture.workspace(), "preset_echo");
+    assert!(retained.prepare(json!({}), &b_context).is_err());
+    assert_eq!(
+        retained
+            .execute(json!({}), &a_context)
+            .await
+            .unwrap()
+            .content,
+        "A:a"
+    );
+    let command = manager.commands_for_plugins(a.plugin_view().as_ref())[0].reference();
+    assert!(
+        super::run_command_for_plugins(&command, "", None, b.plugin_view().as_ref())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        super::run_command_for_plugins(&command, "", None, a.plugin_view().as_ref())
+            .await
+            .unwrap(),
+        super::command::CommandOutcome::Show { text: "A:a".into() }
+    );
+    a.set_plugins(Arc::new(PluginRegistry::empty(fixture.workspace())));
+    assert!(retained.prepare(json!({}), &a_context).is_err());
+    a.sync().await.unwrap();
+    assert!(a.prompt_sections().await.unwrap().is_empty());
+    assert_eq!(
+        host_tool(&b, fixture.workspace(), "preset_echo")
+            .execute(json!({}), &b_context)
+            .await
+            .unwrap()
+            .content,
+        "B:b"
+    );
+    let disabled = fixture.disable("raw-agent-presets");
+    manager.refresh_workspace(&disabled);
+    assert!(!b.plugin_view().selected_native_entries().is_empty());
+    b.sync().await.unwrap();
+    assert!(installed(&b, fixture.workspace()).is_empty());
+    assert!(b.prompt_sections().await.unwrap().is_empty());
+    assert!(super::skills::roots_for_plugins(b.plugin_view().as_ref()).is_empty());
+    assert!(
+        manager
+            .commands_for_plugins(b.plugin_view().as_ref())
+            .is_empty()
+    );
+    assert!(
+        b.tool_before_hooks(protocol::HookCallPayload {
+            name: "read".into(),
+            call_id: "withdrawn".into(),
+            input: json!({}),
+            mode: "Agent".into(),
+            workspace: fixture.workspace().to_string_lossy().into_owned(),
+            model: "fixture".into()
+        })
+        .await
+        .is_empty()
+    );
+    manager.shutdown().await;
+}
+
+/// No default is an upstream fact. Catalog discovery must neither start the
+/// host nor grant any contribution until the exact child receipt is selected.
+#[tokio::test(flavor = "current_thread")]
+async fn raw_agent_presets_without_default_require_explicit_child_selection() {
+    let Some(node) =
+        node_for_tests("raw_agent_presets_without_default_require_explicit_child_selection")
+    else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let _catalog = stub_builtin_commands();
+    let fixture = FixturePlugins::new(&["raw-agent-presets-no-default"]).await;
+    let original = fixture.registry();
+    assert!(original.selected_native_entries().is_empty());
+    let manager = fixture.manager(node);
+    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
+    let roster = super::native_presets_for_plugins(original.as_ref());
+    assert_eq!(
+        roster.len(),
+        2,
+        "healthy admitted catalog is available before a host exists"
+    );
+    let idle = manager.attach(Arc::clone(&original));
+    idle.sync().await.unwrap();
+    assert!(installed(&idle, fixture.workspace()).is_empty());
+    assert!(idle.prompt_sections().await.unwrap().is_empty());
+    assert!(
+        manager
+            .commands_for_plugins(idle.plugin_view().as_ref())
+            .is_empty()
+    );
+    assert!(super::skills::roots_for_plugins(idle.plugin_view().as_ref()).is_empty());
+    assert!(
+        idle.tool_before_hooks(protocol::HookCallPayload {
+            name: "read".into(),
+            call_id: "unselected".into(),
+            input: json!({}),
+            mode: "Agent".into(),
+            workspace: fixture.workspace().to_string_lossy().into_owned(),
+            model: "fixture".into()
+        })
+        .await
+        .is_empty()
+    );
+    let selected = roster
+        .iter()
+        .find(|(preset, _)| preset.entry.path.ends_with("/b.mjs"))
+        .unwrap()
+        .0
+        .clone();
+    let child = manager.attach(Arc::new(original.with_native_preset(selected).unwrap()));
+    child.sync().await.unwrap();
+    assert_eq!(installed(&child, fixture.workspace()), ["preset_echo"]);
+    assert_eq!(child.prompt_sections().await.unwrap()[0].text, "B:b");
+    let context = ToolContext::new(fixture.workspace()).with_plugin_registry(child.plugin_view());
+    assert_eq!(
+        host_tool(&child, fixture.workspace(), "preset_echo")
+            .execute(json!({}), &context)
+            .await
+            .unwrap()
+            .content,
+        "B:b"
+    );
+    manager.refresh_workspace(&original);
+    idle.sync().await.unwrap();
+    assert!(idle.plugin_view().selected_native_entries().is_empty());
+    assert!(
+        installed(&idle, fixture.workspace()).is_empty(),
+        "another caller's selected owner cannot broaden the catalog-only caller"
+    );
+    assert!(idle.prompt_sections().await.unwrap().is_empty());
+    assert_eq!(
+        super::native_presets_for_plugins(idle.plugin_view().as_ref()).len(),
+        2
+    );
+    manager.shutdown().await;
+}
+
+/// The real configured-hook consumers redeem the pinned Builtin across every
+/// existing firepoint, and a changed project receipt cannot fall back.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn all_fifteen_project_hook_events_use_the_pinned_runner_and_reject_changed_receipts() {
+    let _env = crate::test_support::lock_test_env();
+    let _policy = TestPolicyGuard::extension_host(true);
+    let Some(node) = node_for_tests("all_fifteen_project_hook_events") else {
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".codewhale")).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let _config = crate::test_support::EnvVarGuard::set(
+        "CODEWHALE_CONFIG_PATH",
+        home.path().join("config.toml"),
+    );
+    let mut config = crate::hooks::HooksConfig {
+        enabled: true,
+        ..crate::hooks::HooksConfig::default()
+    };
+    for event in crate::hooks::config::ALL_HOOK_EVENTS {
+        config.hooks.push(crate::hooks::Hook::new(
+            event,
+            &format!(
+                "printf '%s|%s|%s' '{}' \"$DEEPSEEK_SESSION_ID\" \"$DEEPSEEK_TOOL_CALL_ID\"",
+                event.as_str()
+            ),
+        ));
+    }
+    let hook_path = workspace.join(".codewhale/hooks.toml");
+    std::fs::write(&hook_path, toml::to_string(&config).unwrap()).unwrap();
+    crate::config::save_workspace_trust(&workspace).unwrap();
+    let (reviewed, _) = crate::hooks::authority::review_project_hooks(&workspace).unwrap();
+    crate::hooks::authority::approve_project_hooks(&workspace, &reviewed.digest).unwrap();
+    let admitted = crate::hooks::HooksConfig::load_with_project(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            ..crate::hooks::HooksConfig::default()
+        },
+        &workspace,
+    );
+    assert_eq!(admitted.hooks.len(), 15);
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        node_override: Some(node),
+        root: Some(home.path().join("host")),
+        ..ExtensionHostOptions::default()
+    }));
+    manager.bind_engine_handle(tokio::runtime::Handle::current());
+    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
+    let executor = crate::hooks::HookExecutor::new(admitted, workspace.clone());
+    let context = crate::hooks::HookContext::new()
+        .with_session_id("actual-session")
+        .with_tool_call_id("actual-call")
+        .with_caller(crate::hooks::HookCaller {
+            workspace,
+            plugins: None,
+            session_id: Some("actual-session".into()),
+            agent_id: Some("actual-agent".into()),
+            origin_turn_id: Some("actual-turn".into()),
+            origin_call_id: Some("actual-call".into()),
+        });
+    let env_scope = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        let _env = crate::test_support::join_env_scope(env_scope);
+        let _policy = crate::plugins::activation::PolicyScope::propagate(true);
+        for event in crate::hooks::config::ALL_HOOK_EVENTS {
+            let results = executor.execute(event, &context);
+            assert_eq!(results.len(), 1, "{event:?}");
+            assert!(results[0].success, "{event:?}: {:?}", results[0]);
+            assert_eq!(
+                results[0].stdout,
+                format!("{}|actual-session|actual-call", event.as_str()),
+                "{event:?}"
+            );
+        }
+        std::fs::write(hook_path, "# changed after admission\n").unwrap();
+        let rejected = executor.execute(crate::hooks::HookEvent::SessionStart, &context);
+        assert_eq!(rejected.len(), 1);
+        assert!(!rejected[0].success);
+        assert!(rejected[0].stdout.is_empty());
+        assert!(rejected[0].exit_code.is_none());
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        manager.tier_status(HostTier::Builtin),
+        HostStatus::Ready { .. }
+    ));
+    assert!(!matches!(manager.status(), HostStatus::Ready { .. }));
     manager.shutdown().await;
 }

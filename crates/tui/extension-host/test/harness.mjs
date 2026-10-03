@@ -36,7 +36,7 @@ export const HOST_ARGS = IS_BUN
       '--no-experimental-sqlite',
       ...(process.allowedNodeEnvironmentFlags.has('--no-experimental-ffi') ? ['--no-experimental-ffi'] : []),
     ]
-export const HOST_ENV = { NODE_OPTIONS: '', ...(IS_BUN ? { BUN_JSC_useShadowRealm: '0' } : {}) }
+export const HOST_ENV = { NODE_OPTIONS: '', ...(IS_BUN ? { BUN_JSC_useShadowRealm: '0', BUN_OPTIONS: '', BUN_BE_BUN: '0' } : {}) }
 
 export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_deadline_ms: 2000, activate_deadline_ms: 5000 }
 
@@ -50,13 +50,14 @@ export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_
  * cancelled is not answered. Requests are recorded in `coreCalls`, the host's
  * `$/cancel` ids in `cancels`.
  */
-export async function startHost({ admit, env, ownGroup = false, tier = 'plugin', coreCall } = {}) {
+export async function startHost({ admit, env, ownGroup = false, tier = 'plugin', coreCall, compiledHost, cwd } = {}) {
   const started = performance.now()
   // `ownGroup` spawns the host as a process-group leader and tells it so, as
   // the Rust core does on Unix.
-  const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE, ...(tier === null ? [] : [`--tier=${tier}`])], {
+  const child = spawn(compiledHost ?? process.execPath, [...(compiledHost ? [] : [...HOST_ARGS, BUNDLE]), ...(tier === null ? [] : [`--tier=${tier}`])], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...HOST_ENV, ...env, ...(ownGroup ? { CODEWHALE_HOST_PROCESS_GROUP: '1' } : {}) },
+    cwd,
+    env: { ...process.env, ...HOST_ENV, ...env, ...(compiledHost ? { NODE_OPTIONS: '', BUN_OPTIONS: '', BUN_BE_BUN: '0', BUN_JSC_useShadowRealm: '0' } : {}), ...(ownGroup ? { CODEWHALE_HOST_PROCESS_GROUP: '1' } : {}) },
     detached: ownGroup,
   })
   const decoder = new FrameDecoder()

@@ -672,20 +672,23 @@ the diagnosed fallback. The same embedded bundle runs on either runtime.
   cap: CI runs it with Node on Linux, macOS and Windows; the Bun case has run
   on macOS only.
 
-Not done: the bundled single-executable host (`bun build --compile`, D1) is
-not built, signed or shipped; the host still runs on a user-installed Bun or
-Node. DSH's own loader, HMR and inspector bridge stay Node-only (spike §2); the
-Codewhale host does not use them. Bun on Linux runs under the same bwrap
-wrapper as Node, and on Windows is unsandboxed exactly as Node is. The Windows Job Object limit and the Linux `RLIMIT_DATA`
-path were not run on this machine; CI runs the memory-cap tests there. The
-Rust CI job still runs the Rust integration tests on Node only; the Bun ones
-skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set. So the Bun default
-cutover is not done: Node stays the default until the four gates hold on
-Linux and Windows too. Under Bun, a `tsconfig.json` next to or above a
-plugin's files (including one above the reviewed bundle) steers its imports
-through `paths`/`baseUrl`; Node ignores it. The Linux `RLIMIT_DATA` path
-clamps to a lower inherited hard limit and still reports the configured cap.
-The native-code lockdown covers the entry points found so far.
+2026-10-02 source checkpoint: `compile-host.mjs` builds the same canonical host
+with an explicitly supplied local Bun and no runtime download. An adjacent
+compiled image is optional for Bun/Auto and must report this Engine's exact
+source digest; Node remains the default. Six local compiled-image/fake-Core
+cases pass, including both tiers, same-PID macOS jetsam, FFI/Worker refusal,
+embedded no-install flags and zero registry traffic. This is separate from
+Rust execution, code signing, release packaging and installed-binary proof.
+
+Native launch now refuses an absent or failed verified OS wrapper. The pinned
+Builtin exception remains diagnosed and ticket-bound; it does not close D9.
+The CI source requires Node and Bun in the Rust three-OS matrix and adds
+source/compiled-host suites, but these jobs have not run on this source. Linux
+and Windows isolation/memory receipts, release assets and the four D2 gates
+remain required before a Bun default cutover. The Linux `RLIMIT_DATA` path
+clamps to a lower inherited hard limit and reports the configured cap.
+Reviewed import closures diagnose Bun query/fragment and dynamic CommonJS
+identity limitations explicitly rather than choosing a different module.
 
 ## As built: phase 2a supervision (2026-09-29)
 
@@ -758,9 +761,10 @@ differences from the text below:
   when a launch-time probe shows bwrap works; each Codewhale home is masked
   whole and its readable entries bound again, since bwrap cannot deny a path
   that does not exist yet (`extension_host::supervisor` lists what that does
-  not cover). Where bwrap is missing or cannot start, and on Windows, the host
-  runs unsandboxed, and `/plugin` and doctor say why. §4.5 remains the plan
-  for real containment.
+  not cover). Current Native admission refuses missing or failed verified
+  wrappers, including Windows while filesystem/network isolation is absent.
+  Only the pinned Builtin exception can run unsandboxed with its diagnostic;
+  §4.5's full containment and mandatory-host cutover remain open.
 - **Extension tool names that the approval path keys by name are refused.**
   Approval keys (`approval_cache`), approval-card summaries and the approval /
   auto-review category are derived from the tool name. A plugin tool named
@@ -1407,7 +1411,7 @@ There is no `CompositeDispatch` and no `HostExtensionDispatch` (removed). Only o
 | pnpm install with build-script approval | **Tier C** | v1 accepts path and tarball only, with no scripts |
 | Rebuilding a retired preset revision after restart | Out (DSH does not do it either) | |
 
-**Sizing** (from the DSH memo's approximate grep): about 13–21 of the ~90 parsed `inject`-declaring packages are headless and within reach by phase 5. About 69 need DSH UI or internal services and stay skipped. The honest headline: **DSH's headless host-code plugins and all of its config bundles run natively. Its UI and loop-replacing plugins do not.**
+**Sizing** (from the DSH memo's approximate grep): about 13–21 of the ~90 parsed `inject`-declaring packages are headless and within reach by phase 5. About 69 need DSH UI or internal services and stay skipped. This is a planning estimate. Accepted Native source now reviews closed compositions and exact preset entries; unsupported service or prompt-replacement rows remain visibly broken. Complete stock-bundle acceptance must be established from actual installed Engine fixtures before claiming that every config bundle runs. UI and loop-replacing plugins remain outside the shared Engine boundary.
 
 ### 6.2 Module resolution: what "natively" requires
 
@@ -1435,7 +1439,7 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 |---|---|---|---|
 | **0** | `crates/mcp` client pool, `InMemoryMcpClient`, `ChildProcessMcpClient` and legacy CLI aggregation proxy | Removed in the 0.10.1 completion source | The earlier "no production caller" premise was false: the CLI proxy spawned registered child clients. Under the recorded founder D5 decision, that proxy is removed and `mcp-server` delegates to existing native `serve --mcp`. The unused Core/App-server pool and `/mcp/startup` route/docs were removed together. The small shared bounded instruction sanitizer remains; saved legacy definitions are preserved without a new reader/writer. Hosted and package acceptance are separate pending receipts. |
 | **1** (no deletion) | Nothing. Phase 1 adds the host behind the flag and deletes nothing, because no consumer has moved yet. The `ExternalToolDispatch` seam is the lane's option or phase 3's work (§5.2) | 0 | — |
-| **3** (MCP move) | `McpConnection`, transport trait, discovery, pool connect / supervise / backoff / reconnect / stale retry / route (`mcp.rs` ~1466–2660 and most of 2709–5240); `mcp/{sse, streamable_http, http, http_client, wire, headers}.rs`; stdio framing (spawn moves to the broker); about half of `mcp/tests.rs` | ~4,700 | `core/engine.rs`, `turn_loop.rs`, `tool_execution.rs`, `tool_preparation.rs`, `dispatch.rs`, `runtime_api.rs`, `hooks/executor.rs`, `tools/subagent/mod.rs`, `tools/runtime_mcp.rs`, `tools/registry.rs`, `codemode.rs`, `lib.rs`, `tui/views/extensions.rs`, `tui/command_palette.rs`, `tui/setup/tools_mcp.rs`. All of them go through `HostMcpClient`'s snapshot API or `ExternalToolDispatch` |
+| **3** (MCP move) | `McpConnection`, transport trait, discovery, pool connect / supervise / backoff / reconnect / stale retry / route (`mcp.rs` ~1466–2660 and most of 2709–5240); `mcp/{sse, streamable_http, http, http_client, wire, headers}.rs`; stdio framing (spawn moves to the broker); about half of `mcp/tests.rs` | ~4,700 | `core/engine.rs`, `turn_loop.rs`, `tool_execution.rs`, `tool_preparation.rs`, `dispatch.rs`, `runtime_api.rs`, `hooks/executor.rs`, `tools/subagent/mod.rs`, `tools/runtime_mcp.rs`, `tools/registry.rs`, `codemode.rs`, `lib.rs`, `tui/views/extensions.rs`, `tui/command_palette.rs`, `tui/setup/tools_mcp.rs`. Current adoption supersedes this estimate: callers retain `McpPool`/`McpConnection` as the sole Rust authority and use the selected SDK transport. Only native protocol/client orchestration is deleted after the one-release default window; shared ProcessBroker, guarded HTTP/OAuth, framing bounds and catalogue/session policy remain |
 | **0** | Legacy `run_stdio_server` aggregating proxy | Removed with its last CLI consumer | Founder D5 drops the proxy. The CLI spelling remains an alias of the native server and introduces no SDK proxy or second client pool. |
 | **4** (hooks) | `hooks/executor.rs` orchestration: matching, env building, sync and background runs, observers, message-submit transform; part of `hooks/config.rs` validation | ~2,450 | Turn-loop fire points (kept), `tui/ui/observer_hooks.rs`, `exec_agent`. **Kept in Rust:** the verdict fold, `authority.rs` project-hook receipts, output sanitizers, and the process tree (moved into the broker) |
 | **4** (script tools, new row, R1) | `tools/plugin.rs` (`ScriptPluginTool`, `CommandPluginTool`, frontmatter parser; 893 lines incl. tests), `ToolRegistry::load_plugins`, the non-`Disabled` arms of `apply_overrides`, `configure_plugin_tools` (`core/engine.rs:7360-7400`) | ~700 | Users' `~/.codewhale/tools/*` scripts and `[tools.overrides]` `Script` / `Command` entries. They become one `builtin:script-tools` host plugin: each script is registered as an extension tool, spawned through the broker (the same executor as shell hooks, which is why this lands with phase 4). **Two user-visible changes are decision D9:** `# approval: auto` is no longer honoured (Required, rememberable), and a script can no longer replace a built-in. `[tools.overrides] X = "disabled"` stays in Rust: it is configuration, not extensibility |
@@ -1537,24 +1541,35 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 - The trust-tier split: host #0 builtin, host #1 third-party. This is **required before phase 3**.
 - (Removed: running Computer Use's `agent.mjs` as a host plugin. It is a remote SSH agent, not host code, R7.)
 
-### Phase 3: MCP moves to the host (deletes the pool)
+### Phase 3: MCP protocol orchestration moves to the host
 
 **Entry gates:**
 - the phase-2 tier split exists, so `builtin:mcp` runs in host #0 only;
-- decision D1 is made;
+- decision D1 is ratified in Ops CURRENT_DECISIONS §26: system Node with a doctor diagnostic;
 - the `ExternalToolDispatch` seam exists, landed by the lane or at the start of this phase.
 
 **Work:**
 - ProcessBroker (merged spawn path) and FetchProxy with auth injection.
 - `builtin:mcp`, the SDK client adapted from DSH `mcp-client`.
-- `HostMcpClient` snapshot and the Rust catalog cache.
+- The actual pinned SDK transport under the existing `McpConnection`/`McpPool`
+  Rust authority facade: catalogue/session/permission/provenance and credential
+  state stay in Rust. `mcp_backend = "host"` demand starts the Builtin tier
+  independently of optional Native activation; harness/third-party activation
+  continues to require the actual Native policy, including after restart.
 - Grant enforcement at the broker and proxy with the default-deny method policy (§4.4, threat 5).
 
 **Exit gates:**
 - Every existing `mcp/tests.rs` behaviour test, not the transport internals, passes against the host through a Rust↔host conformance harness that reuses the MCP fixture servers.
 - The CU screenshot latency gate (§5.1).
 - Code mode's nested MCP calls pass the lane's MCP tests unchanged through `HostMcpDispatch`.
-- **Deletion row 3 lands in the same PR series.** The flag then graduates to Beta, because MCP now depends on it: an MCP user without Node gets a diagnostic, per decision D1.
+- The unchanged recorded corpus and real HTTP/OAuth/Computer Use/broker tests
+  pass; platform isolation and the measured Phase 3 gates pass before a mandatory
+  default. D9 forbids making tier 0 mandatory before Linux/Windows host sandboxes.
+- Ops CURRENT_DECISIONS §26 orders the default flip for one release, then
+  deletion of the native protocol/client adapters after their last selected
+  consumers migrate. The Rust pool's authority/cache stays. Optional Native
+  activation is not made mandatory by MCP. An MCP user without supported Node
+  gets the existing doctor diagnostic, per ratified D1; no Rust fallback.
 
 ### Phase 4: hooks and script tools move to the host
 
@@ -1618,7 +1633,7 @@ This follows the evidence rules in AGENTS.md: match the evidence to the surface.
 - **TS unit tests** (`node --test` against `dist/`, run by root `npm test` through `npm --prefix`, and by an explicit Node-22 CI step): framing, shims, refusal list, the `dsh-tools` compat module, fiber teardown and leak detection.
 - **Protocol conformance corpus.** JSON fixtures that Rust `serde` and TS both parse and round-trip. Generated types plus the drift check arrive in phase 2.
 - **Rust integration tests** that spawn the **real bundle** under a real Node. **CI installs Node 22 for this job, so they run there.** Locally they skip with a visible reason when no Node ≥22.19 is found. They cover admission, gating (direct, and code mode as refused on main or suspended once the lane lands), revocation, crash, and anti-spoofing: a stale token, a cross-owner handle, a name collision against natives and against scripts, and a refused `provide`. Restart and replay join in phase 2.
-- **MCP parity harness** (phase 3): the existing MCP fixture servers are driven through both `McpPoolDispatch` and `HostMcpDispatch` with the same assertions, until the pool is deleted. Transport-internal Rust tests are deleted with the code they test. Behaviour tests are re-targeted.
+- **MCP parity harness** (phase 3): the existing MCP fixture servers are driven through both `McpPoolDispatch` and `HostMcpDispatch` with the same assertions, until the native protocol adapters retire after the one-release default window. The Rust pool's authority/cache remains. Transport-internal Rust tests are deleted with the code they test; security guards and behaviour tests are re-targeted to the actual SDK/broker consumers.
 - **The DSH corpus** reuses the 41 `test_convert_plugin.py` cases as *install and review* cases (phase 5), plus the pinned real packages:
   - `tool-workspace-dependencies` in phase 1;
   - `dsh-mcp-client` rows in phase 3;
@@ -1626,12 +1641,16 @@ This follows the evidence rules in AGENTS.md: match the evidence to the surface.
 - **Performance:** `hyperfine` on startup with the flag on and off, and the CU screenshot latency gate in phase 3.
 - **Not claimed by any of the above:** hosted CI, a real provider call, or a customer run. Each is a separate level of evidence.
 
-### 9.4 Open decisions for the founder
+### 9.4 Decisions and remaining choices
 
-- **D1. Node for MCP users.**
-  - (a) Diagnostic only. **Recommended through phase 3.**
-  - (b) Ship a pinned Node runtime in non-npm channels: +30–45 MB per platform, and a security-update duty.
-  - (c) Keep a Rust MCP fallback. **This reintroduces two stacks; I advise against it.**
+Ops CURRENT_DECISIONS §26 is the current decision authority; older alternatives
+below are historical proposals unless that table leaves the choice open.
+
+- **D1. Node for MCP users — ratified.** System Node ≥22.19 with the existing
+  doctor diagnostic for the initial 0.10.1 host. The September 29 founder
+  follow-up makes Bun the target runtime and bundled executable after the four
+  measured D2 gates; Node remains a diagnosed fallback while that work lands.
+  Selected Host failures never silently fall back to the Rust adapter.
 - **D2. Node floor.** `^22.19 || >=24` for the host, matching DSH. I recommend it: Node 20 is end-of-life, and `module.registerHooks` needs ≥22.15. Computer Use is a separate MCP server process (R7) and keeps its own `>=20` floor. Several CI jobs still pin Node 20 (`ci.yml` version-drift and conversion jobs, release workflows), and none of them run host code.
 - **D3. Stdio secrets.** Relayed broker, which I recommend; or a `direct_stdio` ticket for builtin servers only if the phase-3 latency gate fails.
 - **D4. Legacy stdio proxy:** resolved by Ops CURRENT_DECISIONS §26 D5: drop it. The native `serve --mcp` server remains.

@@ -174,7 +174,7 @@ const ALIASES: [RegExp, string][] = [
 
 export function discoveryText(entry: CatalogueEntry): string {
   const aliases = ALIASES.filter(([pattern]) => pattern.test(entry.name)).map(([, text]) => text);
-  return normalizeSearch([entry.name, entry.title, ...entry.api, ...aliases].join(" "));
+  return normalizeSearch([entry.name, entry.title, ...displayApi(entry), ...aliases].join(" "));
 }
 
 export function getGuidance(entry: CatalogueEntry, locale: string): {
@@ -213,4 +213,22 @@ export function getGuidance(entry: CatalogueEntry, locale: string): {
 export function filterByTask(entries: readonly CatalogueEntry[], taskId: string): CatalogueEntry[] {
   const task = TASKS.find((candidate) => candidate.id === taskId);
   return task ? entries.filter((entry) => task.families.includes(entry.family)) : [...entries];
+}
+
+/**
+ * The exporter reads API symbols from gallery fixture code, where the studio
+ * sections share one private frame: every showcase entry reports only the
+ * whale-motion types that happen to appear bare. Curate what each composed
+ * scene actually presents (verified against src/gallery/showcase.rs).
+ */
+const ENTRY_API: Record<string, string[]> = {
+  "showcase-work": ["TerminalShell", "Message", "NativeComposer", "PostureBar", "MetricsLine", "Workbar", "OceanColumn"],
+  "showcase-decision": ["TerminalShell", "ApprovalCard", "Diff", "Form", "Toggle"],
+  "showcase-color": ["TuiPalette", "Ombre", "Segmented", "HorizonRule"],
+  "showcase-life": ["Whale", "WhaleState", "Habitat", "Picker"],
+  "showcase-narrow": ["TerminalShell", "Message", "NativeComposer", "PostureBar", "MetricsLine", "Workbar", "OceanColumn"],
+};
+
+export function displayApi(entry: CatalogueEntry): string[] {
+  return ENTRY_API[entry.name] ?? entry.api;
 }

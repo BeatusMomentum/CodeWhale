@@ -223,8 +223,26 @@ pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
     registry().get_info(name)
 }
 
-/// Execute a slash command
+/// Execute a slash command with its captured active configuration.
+pub fn execute_with_config(
+    cmd: &str,
+    app: &mut App,
+    config: &crate::config::Config,
+) -> CommandResult {
+    execute_in_context(cmd, app, Some(config))
+}
+
+/// Legacy fixture entry; it cannot authorize a model route change.
+#[cfg(test)]
 pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
+    execute_in_context(cmd, app, None)
+}
+
+fn execute_in_context(
+    cmd: &str,
+    app: &mut App,
+    config: Option<&crate::config::Config>,
+) -> CommandResult {
     // Keep the command's raw remainder available for commands whose payload is
     // byte-sensitive. Most slash commands intentionally receive a normalized
     // argument below; `/preview-request --prompt`, however, must describe the
@@ -319,7 +337,7 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
                     capabilities,
                     handler: contextual,
                 } => {
-                    let mut bundle = app.command_contexts();
+                    let mut bundle = app.command_contexts_with_config(config);
                     contextual(bundle.contexts(capabilities), command_arg)
                 }
             };
@@ -346,10 +364,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
             if let Some(result) = groups::skills::run_skill_by_name(app, command.as_str(), arg) {
                 return result;
             }
-            let suggestions =
-                user_registry::with_registry_for_workspace(Some(&app.workspace), |user_commands| {
-                    suggest_command_names(command.as_str(), 3, user_commands)
-                });
+            let suggestions = user_registry::with_registry_for_app(app, |user_commands| {
+                suggest_command_names(command.as_str(), 3, user_commands)
+            });
             if suggestions.is_empty() {
                 CommandResult::error(format!(
                     "Unknown command: /{command}. Type /help for available commands."
@@ -497,7 +514,7 @@ fn suggest_command_names(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
     use crate::tools::todo::TodoStatus;
     use crate::tui::app::{App, AppAction, TuiOptions};
@@ -1842,9 +1859,9 @@ mod tests {
     fn balance_command_dispatches_live_fetch_for_prepaid_providers() {
         let mut app = create_test_app();
         for provider in [
-            ApiProvider::Deepseek,
-            ApiProvider::Openrouter,
-            ApiProvider::Siliconflow,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Siliconflow,
         ] {
             app.api_provider = provider;
             let result = execute("/balance", &mut app);
@@ -1859,7 +1876,7 @@ mod tests {
     #[test]
     fn balance_command_reports_unsupported_provider_clearly() {
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::Ollama;
+        app.set_provider_identity(ProviderKind::Ollama, "ollama");
 
         let result = execute("/balance", &mut app);
         let msg = result

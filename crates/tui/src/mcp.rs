@@ -24,13 +24,13 @@ use sha2::Digest as _;
 pub mod external_import;
 mod headers;
 mod http;
-mod http_client;
+pub(crate) mod http_client;
 pub mod oauth;
-mod process_broker;
-mod sse;
+pub(crate) mod process_broker;
+pub(crate) mod sse;
 mod stdio;
 mod streamable_http;
-mod wire;
+pub(crate) mod wire;
 
 use self::http::HttpTransport;
 use self::http_client::McpHttpAuth;
@@ -38,8 +38,8 @@ use self::http_client::McpHttpAuth;
 use self::process_broker::STDIO_SHUTDOWN_GRACE;
 use self::sse::SseTransport;
 use self::stdio::StdioTransport;
-pub(crate) use self::stdio::read_line_capped;
 pub(crate) use self::wire::MAX_MCP_RESPONSE_BYTES;
+pub(crate) use self::wire::read_line_capped;
 use self::wire::{
     is_mcp_connection_lost_error, is_mcp_session_rejected_error, is_mcp_stale_session_body,
 };
@@ -49,7 +49,7 @@ use crate::utils::write_atomic;
 // === Error diagnostics helpers (#71) ===
 
 /// Bytes of a non-2xx response body to surface in connection errors.
-const ERROR_BODY_PREVIEW_BYTES: usize = 200;
+pub(crate) const ERROR_BODY_PREVIEW_BYTES: usize = 200;
 
 /// Newest dated MCP protocol revision Codewhale advertises at `initialize` and
 /// answers as the native MCP server.
@@ -367,7 +367,7 @@ pub(crate) fn static_mcp_command_availability(
 /// `https://user:secret@host`) are replaced with `***`. Failures fall back to
 /// the original string so we don't lose context — we never want masking to
 /// produce an empty error.
-fn mask_url_secrets(url: &str) -> String {
+pub(crate) fn mask_url_secrets(url: &str) -> String {
     if let Ok(parsed) = reqwest::Url::parse(url) {
         let mut clone = parsed.clone();
         if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -470,7 +470,7 @@ fn redact_body_preview(body: &str) -> String {
 /// soon as the cap is reached, so an unbounded or never-ending error response
 /// cannot make diagnostics retain the entire body. Best-effort — if the body
 /// can't be read, returns the literal string `<no body>`.
-async fn bounded_body_excerpt(response: reqwest::Response, max_bytes: usize) -> String {
+pub(crate) async fn bounded_body_excerpt(response: reqwest::Response, max_bytes: usize) -> String {
     use futures_util::StreamExt;
 
     let declared_truncated = response
@@ -685,6 +685,7 @@ pub(crate) struct ReviewedPluginMcpSource {
     approved_remote_endpoint: Option<String>,
     approved_remote_origin: Option<String>,
     host_environment: Arc<crate::plugins::HostEnvironment>,
+    native_mcp: Option<crate::extension_host::native_mcp::NativeMcpRef>,
 }
 
 impl ReviewedPluginMcpSource {
@@ -710,6 +711,7 @@ impl ReviewedPluginMcpSource {
             approved_remote_endpoint,
             approved_remote_origin,
             host_environment,
+            native_mcp: None,
         })
     }
 
@@ -808,6 +810,9 @@ impl ReviewedPluginMcpSource {
     }
 
     fn required_capability(&self) -> crate::plugins::activation::PluginActivationCapability {
+        if self.native_mcp.is_some() {
+            return crate::plugins::activation::PluginActivationCapability::Native;
+        }
         if self.approved_remote_endpoint.is_some() {
             crate::plugins::activation::PluginActivationCapability::McpRemote
         } else {
@@ -815,7 +820,10 @@ impl ReviewedPluginMcpSource {
         }
     }
 
-    fn validate_before_use(&self, server_name: &str, operation: &str) -> Result<()> {
+    pub(crate) fn validate_before_use(&self, server_name: &str, operation: &str) -> Result<()> {
+        if let Some(native) = self.native_mcp.as_ref() {
+            native.validate().map_err(anyhow::Error::msg)?;
+        }
         let remediation = format!(
             "Run `/plugin reload`, inspect `/plugin show {0}`, then repeat the displayed trust command and `/plugin enable {0}` before retrying",
             self.authority.plugin_name
@@ -845,6 +853,14 @@ impl ReviewedPluginMcpSource {
     }
 
     fn catalog_is_current(&self) -> bool {
+        if self
+            .native_mcp
+            .as_ref()
+            .is_some_and(|native| native.validate().is_err())
+        {
+            return false;
+        }
+
         // Catalog exposure is an authority boundary too: stale tool, prompt,
         // or resource descriptions can steer the model even when the later
         // operation would be denied. Revalidate both the mutable reviewed
@@ -1567,8 +1583,19 @@ where
 // === Transport Trait ===
 
 #[async_trait::async_trait]
-pub trait McpTransport: Send + Sync {
+pub(crate) trait McpTransport: Send + Sync {
     async fn send(&mut self, msg: Vec<u8>) -> Result<()>;
+    /// The SDK stdio adapter keeps the actual person-decision inside Rust.
+    /// Existing transports retain their current byte send and attestation path.
+    async fn send_decided(
+        &mut self,
+        msg: Vec<u8>,
+        _decision: Option<&crate::core::engine::HumanDecision>,
+        _timeout: Duration,
+    ) -> Result<()> {
+        self.send(msg).await
+    }
+
     async fn recv(&mut self) -> Result<Vec<u8>>;
 
     /// Record the protocol revision negotiated at `initialize`. Only the
@@ -1677,7 +1704,7 @@ impl McpCatalogBudget {
     }
 }
 
-fn is_legacy_sse_transport(config: &McpServerConfig) -> bool {
+pub(crate) fn is_legacy_sse_transport(config: &McpServerConfig) -> bool {
     config
         .transport
         .as_deref()
@@ -1825,17 +1852,141 @@ fn http_request_ceiling_secs(config: &McpServerConfig, global: &McpTimeouts) -> 
         .max(config.effective_execute_timeout(global))
 }
 
+async fn prepare_mcp_http_client(
+    name: &str,
+    config: &McpServerConfig,
+    global_timeouts: &McpTimeouts,
+    network_policy: Option<&NetworkPolicyDecider>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    connect_timeout_secs: u64,
+) -> Result<http_client::McpHttpClient> {
+    let url = config.url.as_deref().context("MCP HTTP URL absent")?;
+    // Per-domain network policy gate (#135). Only the HTTP/SSE transport
+    // is gated; STDIO MCP servers run as local subprocesses and never
+    // touch the network from this code path.
+    if let Some(decider) = network_policy
+        && let Some(host) = host_from_url(url)
+    {
+        match decider.evaluate(&host, "mcp") {
+            Decision::Allow => {}
+            Decision::Deny => {
+                anyhow::bail!(
+                    "MCP server '{name}' connection to '{host}' blocked by network policy"
+                );
+            }
+            Decision::Prompt => {
+                anyhow::bail!(
+                    "MCP server '{name}' connection to '{host}' requires approval; \
+             re-run after `/network allow {host}` or set network.default = \"allow\" in config"
+                );
+            }
+        }
+    }
+    let client = http_client::McpHttpClient::new(
+        url,
+        config.runtime_added,
+        config.reviewed_plugin.is_some(),
+        config.allow_private_network,
+        network_policy,
+        Duration::from_secs(connect_timeout_secs),
+        // Transport total-request ceiling, not the read knob: it must
+        // cover the longest request this connection carries
+        // (`tools/call` at the execute budget), so a raised
+        // `execute_timeout` governs HTTP servers too. The read knob
+        // itself stays intact for the connection-level waits below.
+        Duration::from_secs(http_request_ceiling_secs(config, global_timeouts)),
+    )?;
+    let oauth_runtime = if config.reviewed_plugin.is_some() {
+        None
+    } else {
+        match oauth::build_default_headers(&config.headers, &config.env_headers) {
+            Ok(default_headers) => {
+                let prepared = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        anyhow::bail!(
+                    "MCP OAuth setup cancelled after plugin authority changed"
+                        )
+                    }
+                    prepared = oauth::McpOAuthRuntime::from_server_config_with_client(
+                        name,
+                        config,
+                        default_headers,
+                        client.clone(),
+                    ) => prepared,
+                };
+                match prepared {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        if config.reviewed_plugin.is_some() {
+                            tracing::warn!(
+                                target: "mcp",
+                                server = %name,
+                                "failed to prepare reviewed plugin MCP OAuth runtime; provider details suppressed; continuing without stored OAuth token"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "mcp",
+                                server = %name,
+                                error = %err,
+                                "failed to prepare MCP OAuth runtime; continuing without stored OAuth token"
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                if config.reviewed_plugin.is_some() {
+                    tracing::warn!(
+                        target: "mcp",
+                        server = %name,
+                        "failed to prepare reviewed plugin MCP OAuth headers; details suppressed; continuing without stored OAuth token"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "mcp",
+                        server = %name,
+                        error = %err,
+                        "failed to prepare MCP OAuth default headers; continuing without stored OAuth token"
+                    );
+                }
+                None
+            }
+        }
+    };
+    let client = client.with_mcp_auth(McpHttpAuth::from_config(name, config, oauth_runtime));
+    Ok(client)
+}
+
 impl McpConnection {
     /// Connect to an MCP server and initialize it.
     ///
     /// `network_policy` (added in v0.7.0 for #135) is consulted for HTTP/SSE
     /// transports only — STDIO transports are unaffected. Pass `None` to
     /// match pre-v0.7.0 permissive behavior.
+    #[cfg(test)]
     pub async fn connect_with_policy(
         name: String,
         config: McpServerConfig,
         global_timeouts: &McpTimeouts,
         network_policy: Option<&NetworkPolicyDecider>,
+    ) -> Result<Self> {
+        Self::connect_with_backend(
+            name,
+            config,
+            global_timeouts,
+            network_policy,
+            McpBackend::Rust,
+        )
+        .await
+    }
+    pub(crate) async fn connect_with_backend(
+        name: String,
+        config: McpServerConfig,
+        global_timeouts: &McpTimeouts,
+        network_policy: Option<&NetworkPolicyDecider>,
+        backend: McpBackend,
     ) -> Result<Self> {
         let connect_timeout_secs = config.effective_connect_timeout(global_timeouts);
         let read_timeout_secs = config.effective_read_timeout(global_timeouts);
@@ -1857,103 +2008,34 @@ impl McpConnection {
                 Arc::clone(&authority_revocation_reason),
             )
         });
-        let transport: Box<dyn McpTransport> = if let Some(url) = &config.url {
-            // Per-domain network policy gate (#135). Only the HTTP/SSE transport
-            // is gated; STDIO MCP servers run as local subprocesses and never
-            // touch the network from this code path.
-            if let Some(decider) = network_policy
-                && let Some(host) = host_from_url(url)
-            {
-                match decider.evaluate(&host, "mcp") {
-                    Decision::Allow => {}
-                    Decision::Deny => {
-                        anyhow::bail!(
-                            "MCP server '{name}' connection to '{host}' blocked by network policy"
-                        );
-                    }
-                    Decision::Prompt => {
-                        anyhow::bail!(
-                            "MCP server '{name}' connection to '{host}' requires approval; \
-                             re-run after `/network allow {host}` or set network.default = \"allow\" in config"
-                        );
-                    }
-                }
-            }
-            let client = http_client::McpHttpClient::new(
-                url,
-                config.runtime_added,
-                config.reviewed_plugin.is_some(),
-                config.allow_private_network,
-                network_policy,
-                Duration::from_secs(connect_timeout_secs),
-                // Transport total-request ceiling, not the read knob: it must
-                // cover the longest request this connection carries
-                // (`tools/call` at the execute budget), so a raised
-                // `execute_timeout` governs HTTP servers too. The read knob
-                // itself stays intact for the connection-level waits below.
-                Duration::from_secs(http_request_ceiling_secs(&config, global_timeouts)),
-            )?;
-            let oauth_runtime = if config.reviewed_plugin.is_some() {
-                None
-            } else {
-                match oauth::build_default_headers(&config.headers, &config.env_headers) {
-                    Ok(default_headers) => {
-                        let prepared = tokio::select! {
-                            biased;
-                            _ = cancel_token.cancelled() => {
-                                anyhow::bail!(
-                                    "MCP OAuth setup cancelled after plugin authority changed"
-                                )
-                            }
-                            prepared = oauth::McpOAuthRuntime::from_server_config_with_client(
-                                &name,
-                                &config,
-                                default_headers,
-                                client.clone(),
-                            ) => prepared,
-                        };
-                        match prepared {
-                            Ok(runtime) => runtime,
-                            Err(err) => {
-                                if config.reviewed_plugin.is_some() {
-                                    tracing::warn!(
-                                        target: "mcp",
-                                        server = %name,
-                                        "failed to prepare reviewed plugin MCP OAuth runtime; provider details suppressed; continuing without stored OAuth token"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        target: "mcp",
-                                        server = %name,
-                                        error = %err,
-                                        "failed to prepare MCP OAuth runtime; continuing without stored OAuth token"
-                                    );
-                                }
-                                None
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        if config.reviewed_plugin.is_some() {
-                            tracing::warn!(
-                                target: "mcp",
-                                server = %name,
-                                "failed to prepare reviewed plugin MCP OAuth headers; details suppressed; continuing without stored OAuth token"
-                            );
-                        } else {
-                            tracing::warn!(
-                                target: "mcp",
-                                server = %name,
-                                error = %err,
-                                "failed to prepare MCP OAuth default headers; continuing without stored OAuth token"
-                            );
-                        }
-                        None
-                    }
-                }
-            };
-            let client =
-                client.with_mcp_auth(McpHttpAuth::from_config(&name, &config, oauth_runtime));
+        let http_client = if config.url.is_some() {
+            Some(
+                prepare_mcp_http_client(
+                    &name,
+                    &config,
+                    global_timeouts,
+                    network_policy,
+                    &cancel_token,
+                    connect_timeout_secs,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let transport: Box<dyn McpTransport> = if backend == McpBackend::Host {
+            Box::new(
+                crate::extension_host::mcp::SdkTransport::connect_with_http(
+                    &name,
+                    &config,
+                    cancel_token.clone(),
+                    Duration::from_secs(connect_timeout_secs),
+                    http_client,
+                )
+                .await?,
+            )
+        } else if let Some(url) = &config.url {
+            let client = http_client.expect("prepared HTTP authority");
             if is_legacy_sse_transport(&config) {
                 Box::new(
                     SseTransport::connect(
@@ -2029,7 +2111,8 @@ impl McpConnection {
         // The built-in Computer Use plugin accepts consent and script calls
         // only with a decision attested by its host. Its keys travel as the
         // first message on the plugin's own stdin, never in its environment.
-        if conn.config.url.is_none()
+        if backend == McpBackend::Rust
+            && conn.config.url.is_none()
             && conn.config.command.is_some()
             && conn
                 .config
@@ -2490,7 +2573,8 @@ impl McpConnection {
                 COMPUTER_USE_DECISION_META: attest_decision(key, tool_name, &params["arguments"])?,
             });
         }
-        self.call_method("tools/call", params, timeout_secs).await
+        self.call_method_decided("tools/call", params, timeout_secs, decision)
+            .await
     }
 
     /// Read a resource from this MCP server
@@ -2534,6 +2618,44 @@ impl McpConnection {
         params: serde_json::Value,
         timeout_secs: u64,
     ) -> Result<serde_json::Value> {
+        self.call_method_decided(method, params, timeout_secs, None)
+            .await
+    }
+    async fn call_method_decided(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout_secs: u64,
+        decision: Option<&crate::core::engine::HumanDecision>,
+    ) -> Result<serde_json::Value> {
+        let cancellation = self
+            .config
+            .reviewed_plugin
+            .as_ref()
+            .and_then(|source| source.native_mcp.as_ref())
+            .cloned();
+        let Some(cancellation) = cancellation else {
+            return self
+                .call_method_decided_inner(method, params, timeout_secs, decision)
+                .await;
+        };
+        let outcome = tokio::select! {
+            biased;
+            _=cancellation.withdrawn()=>None,
+            result=self.call_method_decided_inner(method,params,timeout_secs,decision)=>Some(result),
+        };
+        match outcome {
+            Some(result)=>result,
+            None=>self.finish_guarded_error(anyhow::anyhow!("Native MCP operation cancelled because its definition was withdrawn; the operation is not replayed")).await,
+        }
+    }
+    async fn call_method_decided_inner(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout_secs: u64,
+        decision: Option<&crate::core::engine::HumanDecision>,
+    ) -> Result<serde_json::Value> {
         if self.state != ConnectionState::Ready {
             anyhow::bail!(
                 "Failed to call MCP method '{}': connection '{}' is not ready",
@@ -2559,12 +2681,16 @@ impl McpConnection {
         );
         match tokio::time::timeout_at(
             deadline,
-            self.send(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": &call_id,
-                "method": method,
-                "params": params
-            })),
+            self.send_decided(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": &call_id,
+                    "method": method,
+                    "params": params
+                }),
+                decision,
+                Duration::from_secs(timeout_secs),
+            ),
         )
         .await
         {
@@ -2608,6 +2734,9 @@ impl McpConnection {
             Err(error) => return self.finish_guarded_error(error).await,
         };
 
+        if let Some(source) = self.config.reviewed_plugin.as_ref() {
+            source.validate_before_use(&self.name, method)?;
+        }
         if let Some(error) = response.get("error") {
             if self.config.reviewed_plugin.is_some() {
                 // Preserve only the fixed recovery class, just as initialize
@@ -2711,6 +2840,14 @@ impl McpConnection {
     }
 
     async fn send(&mut self, msg: serde_json::Value) -> Result<()> {
+        self.send_decided(msg, None, self.discovery_timeout).await
+    }
+    async fn send_decided(
+        &mut self,
+        msg: serde_json::Value,
+        decision: Option<&crate::core::engine::HumanDecision>,
+        timeout: Duration,
+    ) -> Result<()> {
         let bytes = serde_json::to_vec(&msg).context("Failed to serialize MCP JSON-RPC message")?;
         let cancel_token = self.cancel_token.clone();
         let name = self.name.clone();
@@ -2719,7 +2856,7 @@ impl McpConnection {
             _ = cancel_token.cancelled() => {
                 Err(anyhow::anyhow!("MCP connection '{name}' was cancelled"))
             }
-            result = self.transport.send(bytes) => result,
+            result = self.transport.send_decided(bytes, decision, timeout) => result,
         };
         if result.is_err() {
             // A dead write side is as fatal as a dead read side: the pool
@@ -2983,7 +3120,26 @@ pub(crate) async fn authenticate_tool_via_pool(
 }
 
 /// Pool of MCP connections for reuse
+/// Protocol owner selected only by user configuration. Rust is the default;
+/// Host explicitly selects the SDK and never falls back to Rust on refusal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpBackend {
+    #[default]
+    Rust,
+    Host,
+}
+impl McpBackend {
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        config
+            .extension_host
+            .as_ref()
+            .map_or(Self::Rust, |host| host.mcp_backend)
+    }
+}
+
 pub struct McpPool {
+    backend: McpBackend,
     /// Immutable operator ceiling; source reloads and shared child pools cannot relax it.
     disallowed_tools: Vec<String>,
     connections: HashMap<String, McpConnection>,
@@ -3006,6 +3162,7 @@ pub struct McpPool {
     catalog_generation: AtomicU64,
     /// Most recently observed mtime for `config_sources`.
     last_mtimes: Vec<Option<std::time::SystemTime>>,
+    native_mcp_epoch: u64,
     /// Dynamically added MCP servers (from tool calls at runtime).
     /// These are not persisted to disk and live for the process lifetime.
     pub(crate) dynamic_servers: Arc<RwLock<HashMap<String, McpServerConfig>>>,
@@ -3071,6 +3228,7 @@ pub(crate) struct SupervisionDue {
 /// One supervisor sweep's plan: candidates to redial plus the transitions
 /// the plan phase already knows (recoveries and newly parked servers).
 pub(crate) struct SupervisionPlan {
+    pub backend: McpBackend,
     pub due: Vec<SupervisionDue>,
     pub recovered: Vec<String>,
     pub parked: Vec<String>,
@@ -3159,6 +3317,7 @@ impl McpPool {
     pub fn new(config: McpConfig) -> Self {
         let config_hash = hash_mcp_config(&config);
         Self {
+            backend: McpBackend::Rust,
             connections: HashMap::new(),
             disallowed_tools: Vec::new(),
             config,
@@ -3175,10 +3334,19 @@ impl McpPool {
             supervised_parked: HashSet::new(),
             connecting: HashSet::new(),
             last_mtimes: Vec::new(),
+            native_mcp_epoch: crate::extension_host::native_mcp::epoch(),
             dynamic_servers: Arc::new(RwLock::new(HashMap::new())),
             needs_auth_servers: BTreeSet::new(),
             needs_auth_generation: 0,
         }
+    }
+
+    pub fn with_backend(mut self, backend: McpBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+    pub(crate) fn backend(&self) -> McpBackend {
+        self.backend
     }
 
     /// Create a pool from a configuration file path.
@@ -3407,7 +3575,10 @@ impl McpPool {
             .iter()
             .map(|path| mcp_config_mtime(path))
             .collect();
-        if !force && current_mtimes == self.last_mtimes {
+        let native_epoch = crate::extension_host::native_mcp::epoch();
+        let native_changed =
+            self.plugin_registry.is_some() && native_epoch != self.native_mcp_epoch;
+        if !force && !native_changed && current_mtimes == self.last_mtimes {
             return Ok(false);
         }
         // An mtime moved, or the user explicitly requested a reload: re-read
@@ -3430,6 +3601,7 @@ impl McpPool {
         // Always advance mtimes so a touched-but-unchanged file doesn't
         // make us re-read on every subsequent call.
         self.last_mtimes = current_mtimes;
+        self.native_mcp_epoch = native_epoch;
         if !force && new_hash == self.config_hash {
             return Ok(false);
         }
@@ -3504,9 +3676,123 @@ impl McpPool {
         Ok(())
     }
 
+    /// Refresh one retained caller snapshot through the same transactional
+    /// source loader. A different attachment must fork; it cannot retarget a
+    /// parent's shared pool. No transport, credential or catalog owner changes.
+    pub(crate) fn bind_caller_plugins(
+        &mut self,
+        plugins: Arc<crate::plugins::PluginRegistry>,
+    ) -> Result<()> {
+        let next = plugins.caller_selection();
+        let previous = self
+            .plugin_registry
+            .as_deref()
+            .and_then(crate::plugins::PluginRegistry::caller_selection);
+        if next == previous {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            previous.is_none() || next.is_some(),
+            "MCP caller selection was omitted"
+        );
+        if let (Some(previous), Some(next)) = (previous, next) {
+            anyhow::ensure!(
+                previous.attachment_id == next.attachment_id,
+                "another MCP caller must use its selected pool fork"
+            );
+        }
+        crate::extension_host::validate_caller_plugins(Some(&plugins))
+            .map_err(anyhow::Error::msg)?;
+        if let Some(path) = self.config_sources.first().cloned() {
+            let workspace = plugins.workspace().to_path_buf();
+            self.switch_workspace_config_source(&path, &workspace, plugins)?;
+        } else {
+            let mut config = self.config.clone();
+            config
+                .servers
+                .retain(|_, server| server.reviewed_plugin.is_none());
+            let config = merge_plugin_mcp_servers(config, &plugins)?;
+            self.drop_all_connections("caller selection changed");
+            self.config_hash = hash_mcp_config(&config);
+            self.config = config;
+            self.workspace = Some(plugins.workspace().to_path_buf());
+            self.plugin_registry = Some(plugins);
+            self.catalog_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.native_mcp_epoch = crate::extension_host::native_mcp::epoch();
+        Ok(())
+    }
+
+    /// A selected child uses this same Rust pool factory with its own caller
+    /// receipt. Dynamic operator servers keep their single shared registry.
+    pub(crate) fn fork_for_plugins(
+        &self,
+        plugins: Arc<crate::plugins::PluginRegistry>,
+    ) -> Result<Self> {
+        let workspace = plugins.workspace().to_path_buf();
+        let config = match self.config_sources.first() {
+            Some(primary) => {
+                load_config_with_workspace_and_plugins(primary, &workspace, plugins.as_ref())?
+            }
+            None => {
+                let mut config = self.config.clone();
+                config
+                    .servers
+                    .retain(|_, server| server.reviewed_plugin.is_none());
+                merge_plugin_mcp_servers(config, plugins.as_ref())?
+            }
+        };
+        let mut pool = Self::new(config)
+            .with_backend(self.backend)
+            .with_disallowed_tools(self.disallowed_tools.clone());
+        pool.network_policy = self.network_policy.clone();
+        pool.oauth_callback_port = self.oauth_callback_port;
+        pool.oauth_callback_url = self.oauth_callback_url.clone();
+        pool.dynamic_servers = Arc::clone(&self.dynamic_servers);
+        pool.config_sources = self.config_sources.clone();
+        if pool.config_sources.len() > 1 {
+            pool.config_sources[1] = checked_workspace_mcp_config_path(&workspace)?;
+        }
+        pool.last_mtimes = pool
+            .config_sources
+            .iter()
+            .map(|path| mcp_config_mtime(path))
+            .collect();
+        pool.workspace = Some(workspace);
+        pool.plugin_registry = Some(plugins);
+        Ok(pool)
+    }
+    pub(crate) fn validate_native_caller(
+        &self,
+        plugins: Option<&crate::plugins::PluginRegistry>,
+    ) -> Result<()> {
+        if self.config.servers.values().any(|server| {
+            server
+                .reviewed_plugin
+                .as_ref()
+                .is_some_and(|source| source.native_mcp.is_some())
+        }) {
+            let selection = plugins.and_then(crate::plugins::PluginRegistry::caller_selection);
+            anyhow::ensure!(
+                selection
+                    == self
+                        .plugin_registry
+                        .as_deref()
+                        .and_then(crate::plugins::PluginRegistry::caller_selection)
+                    && self
+                        .config
+                        .servers
+                        .values()
+                        .filter_map(|server| server.reviewed_plugin.as_ref()?.native_mcp.as_ref())
+                        .all(|receipt| Some(receipt.selection()) == selection),
+                "Native MCP pool belongs to another caller composition"
+            );
+            crate::extension_host::validate_caller_plugins(plugins).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
     /// Get or create a connection to a server
     pub async fn get_or_connect(&mut self, server_name: &str) -> Result<&mut McpConnection> {
-        self.require_server(server_name)?;
         // Lazy auto-reload (#1267 part 2): cheap mtime-then-hash check before
         // each connection lookup. Transient FS errors are logged but not
         // propagated so a brief hiccup can't take down the whole tool dispatch.
@@ -3514,6 +3800,7 @@ impl McpPool {
             tracing::warn!("MCP config reload check failed: {e:#}");
         }
 
+        self.require_server(server_name)?;
         let plugin_source = self
             .connections
             .get(server_name)
@@ -3572,11 +3859,12 @@ impl McpPool {
             anyhow::bail!("Failed to connect MCP server '{server_name}': server is disabled");
         }
 
-        let mut connection = match McpConnection::connect_with_policy(
+        let mut connection = match McpConnection::connect_with_backend(
             server_name.to_string(),
             server_config,
             &self.config.timeouts,
             self.network_policy.as_ref(),
+            self.backend,
         )
         .await
         {
@@ -3651,11 +3939,12 @@ impl McpPool {
             anyhow::bail!("Failed to connect MCP server '{server_name}': server is disabled");
         }
 
-        let mut connection = match McpConnection::connect_with_policy(
+        let mut connection = match McpConnection::connect_with_backend(
             server_name.to_string(),
             server_config,
             &self.config.timeouts,
             self.network_policy.as_ref(),
+            self.backend,
         )
         .await
         {
@@ -3873,6 +4162,7 @@ impl McpPool {
             });
         }
         SupervisionPlan {
+            backend: self.backend,
             due,
             recovered,
             parked,
@@ -3947,6 +4237,7 @@ impl McpPool {
                 plan.timeouts,
                 plan.network_policy.clone(),
                 plan.catalog_generation,
+                plan.backend,
             );
             let mut update = McpSupervisorUpdate {
                 recovered: plan.recovered,
@@ -4115,6 +4406,52 @@ impl McpPool {
             .collect()
     }
 
+    /// Match discovery intent against actual configured server identities only.
+    /// No guessed tool/schema is inserted; the caller still obtains tools/list.
+    pub(crate) fn configured_servers_for_search(
+        &self,
+        query: &str,
+        match_kind: &str,
+        permitted: impl Fn(&str) -> bool,
+    ) -> Result<Vec<String>> {
+        const MAX_DISCOVERY_SERVERS: usize = 8;
+        let regex = match match_kind {
+            "regex" => Some(crate::regex_cache::compile_user_regex(query)?),
+            "bm25" => None,
+            _ => anyhow::bail!("Unsupported tool search match algorithm"),
+        };
+        let query = query.trim().to_ascii_lowercase();
+        let mut names = Vec::new();
+        for (name, config) in &self.config.servers {
+            if !config.is_enabled() || !self.server_allowed(name) || !permitted(name) {
+                continue;
+            }
+            let name_lower = name.to_ascii_lowercase();
+            let prefix = format!("mcp_{name_lower}_");
+            let matches = if let Some(regex) = &regex {
+                // A general regex such as .* is not MCP launch intent. Match
+                // only a named server, or an explicit MCP namespace search.
+                (query.contains("mcp_")
+                    && (regex.is_match(&prefix)
+                        || query.trim_start_matches('^').starts_with(&prefix)))
+                    || query == name_lower
+            } else {
+                query.split_whitespace().any(|term| {
+                    term == "mcp"
+                        || term == name_lower
+                        || term.starts_with(&prefix)
+                        || (term.len() >= 3 && name_lower.contains(term))
+                })
+            };
+            if matches {
+                names.push(name.clone());
+            }
+        }
+        names.sort();
+        names.truncate(MAX_DISCOVERY_SERVERS);
+        Ok(names)
+    }
+
     /// Enabled, allowed servers — configured or dynamic — covered by an
     /// explicit tool selection (`mcp_<server>_*` names or `mcp_<prefix>*`
     /// globs). These are the names a turn is allowed to start on demand.
@@ -4162,6 +4499,7 @@ impl McpPool {
         timeouts: McpTimeouts,
         network_policy: Option<NetworkPolicyDecider>,
         catalog_generation: u64,
+        backend: McpBackend,
     ) -> tokio::task::JoinSet<(String, Result<McpConnection, anyhow::Error>)> {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(Self::CONNECT_CONCURRENCY));
         let mut joins: tokio::task::JoinSet<(String, Result<McpConnection, anyhow::Error>)> =
@@ -4172,11 +4510,12 @@ impl McpPool {
             joins.spawn(async move {
                 let connection = std::panic::AssertUnwindSafe(async {
                     let _permit = permit.acquire_owned().await;
-                    McpConnection::connect_with_policy(
+                    McpConnection::connect_with_backend(
                         name.clone(),
                         config,
                         &timeouts,
                         network_policy.as_ref(),
+                        backend,
                     )
                     .await
                     .map(|mut connection| {
@@ -4254,6 +4593,7 @@ impl McpPool {
                 self.config.timeouts,
                 self.network_policy.clone(),
                 self.catalog_generation.load(Ordering::SeqCst),
+                self.backend,
             );
             while let Some(joined) = connects.join_next().await {
                 let (name, result) = joined
@@ -6179,19 +6519,19 @@ pub fn resolve_server_scope(global_path: &Path, workspace: &Path, name: &str) ->
 }
 
 /// Plugin name of the built-in Computer Use bundle.
-const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
+pub(crate) const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
 
 /// First message the host sends the built-in Computer Use plugin: its
 /// per-connection decision key and the persisted-ledger key.
-const COMPUTER_USE_HOST_KEYS_METHOD: &str = "codewhale/host_keys";
+pub(crate) const COMPUTER_USE_HOST_KEYS_METHOD: &str = "codewhale/host_keys";
 
 /// `_meta` key carrying an attested person's decision on a `tools/call`.
-const COMPUTER_USE_DECISION_META: &str = "codewhale/user_decision";
+pub(crate) const COMPUTER_USE_DECISION_META: &str = "codewhale/user_decision";
 
 /// Secret-store slot of the key that signs remembered Computer Use grants.
 const COMPUTER_USE_LEDGER_KEY_SLOT: &str = "codewhale_cu_ledger_key";
 
-fn random_key() -> Result<[u8; 32]> {
+pub(crate) fn random_key() -> Result<[u8; 32]> {
     use ring::rand::SecureRandom as _;
     let mut key = [0_u8; 32];
     ring::rand::SystemRandom::new()
@@ -6202,7 +6542,7 @@ fn random_key() -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()
@@ -6215,7 +6555,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// `{nonce, args_json, mac}` for one call: `mac` is HMAC-SHA256 over
 /// `tool \0 args_json \0 nonce`, and the plugin checks that `args_json`
 /// parses to the arguments it received.
-fn attest_decision(
+pub(crate) fn attest_decision(
     key: &[u8; 32],
     tool_name: &str,
     arguments: &serde_json::Value,
@@ -6244,7 +6584,7 @@ fn attest_decision(
 /// The key that signs remembered Computer Use grants, created once in the
 /// secret store. `None` when the store is unavailable: remembered grants
 /// then do not survive the session.
-async fn computer_use_ledger_key() -> Option<String> {
+pub(crate) async fn computer_use_ledger_key() -> Option<String> {
     if cfg!(test) {
         return None;
     }
@@ -6394,7 +6734,37 @@ fn merge_plugin_mcp_servers(
     let host_environment = registry.host_environment().ok_or_else(|| {
         anyhow::anyhow!("active plugin registry is missing its pre-dotenv environment snapshot")
     })?;
-    merge_plugin_mcp_servers_from_plugins_with_environment(config, plugins, host_environment)
+    let mut config = merge_plugin_mcp_servers_from_plugins_with_environment(
+        config,
+        plugins,
+        Arc::clone(&host_environment),
+    )?;
+    for (name, mut server, authority, receipt) in
+        crate::extension_host::native_mcp::for_plugins(registry).map_err(anyhow::Error::msg)?
+    {
+        let qualified = qualified_plugin_server_name(&authority.plugin_name, &name);
+        anyhow::ensure!(
+            !config.servers.contains_key(&qualified),
+            "Native MCP namespace collides with an existing reviewed or explicit server"
+        );
+        if server.command.is_some() {
+            let root = authority
+                .staged_manifest
+                .parent()
+                .context("Native stage has no root")?;
+            server.cwd = Some(resolve_plugin_mcp_cwd(root, server.cwd.as_deref())?);
+            freeze_plugin_stdio_paths(&mut server, root)?;
+        }
+        let mut source = ReviewedPluginMcpSource::from_authority(
+            authority,
+            server.url.as_deref(),
+            Arc::clone(&host_environment),
+        )?;
+        source.native_mcp = Some(receipt);
+        server.reviewed_plugin = Some(source);
+        config.servers.insert(qualified, server);
+    }
+    Ok(config)
 }
 
 fn merge_plugin_mcp_servers_from_plugins_with_environment(
@@ -6525,7 +6895,7 @@ pub fn split_qualified_plugin_server_name(qualified: &str) -> Option<(&str, &str
     Some((plugin, server.strip_prefix('-')?))
 }
 
-fn qualified_plugin_server_name(plugin_name: &str, server_name: &str) -> String {
+pub(crate) fn qualified_plugin_server_name(plugin_name: &str, server_name: &str) -> String {
     format!(
         "plugin-{}-{}-{}",
         plugin_name.len(),
@@ -6719,6 +7089,23 @@ fn hash_mcp_config(config: &McpConfig) -> u64 {
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
+    let mut native = config
+        .servers
+        .iter()
+        .filter_map(|(name, server)| {
+            Some((
+                name,
+                server
+                    .reviewed_plugin
+                    .as_ref()?
+                    .native_mcp
+                    .as_ref()?
+                    .catalog_identity(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    native.sort_by_key(|(name, _)| *name);
+    native.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -7051,9 +7438,10 @@ pub async fn discover_manager_snapshot_with_workspace_and_plugins(
     network_policy: Option<NetworkPolicyDecider>,
     reload_required: bool,
     plugins: Arc<crate::plugins::PluginRegistry>,
+    backend: McpBackend,
 ) -> Result<McpManagerSnapshot> {
     let cfg = load_config_with_workspace_and_plugins(path, workspace, plugins.as_ref())?;
-    let mut pool = McpPool::new(cfg.clone());
+    let mut pool = McpPool::new(cfg.clone()).with_backend(backend);
     pool.workspace = Some(checked_workspace_path(workspace)?);
     pool.plugin_registry = Some(plugins);
     if let Some(policy) = network_policy {

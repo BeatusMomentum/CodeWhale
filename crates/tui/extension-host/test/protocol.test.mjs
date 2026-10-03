@@ -19,8 +19,8 @@ test('the corpus is non-trivial in both directions', () => {
   }
 })
 
-// Every method allows both tiers today, so each case reads the same under
-// either one.
+// These shared corpus rows apply to both tiers; the generated method table
+// governs builtin-only production requests.
 for (const entry of corpus) {
   for (const tier of ['plugin', 'builtin']) {
     test(`corpus ${entry.name} (${tier} tier): ${entry.valid ? 'parses and round-trips' : 'is rejected'}`, () => {
@@ -37,7 +37,7 @@ for (const entry of corpus) {
 }
 
 // The tier rule, against a table with a method reserved for the built-in tier
-// (the generated table has none yet).
+// independently of the generated production table.
 const RESERVED = [
   { name: 'test/reserved', direction: 'host_to_core', request: true, params: 'EmptyParams', tiers: ['builtin'] },
   { name: 'test/reserved-in', direction: 'core_to_host', request: false, params: 'EmptyParams', tiers: ['builtin'] },

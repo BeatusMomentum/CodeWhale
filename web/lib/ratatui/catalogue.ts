@@ -1,5 +1,5 @@
 import catalogue from "@/public/ratatui/catalogue.json";
-import { discoveryText, normalizeSearch } from "./learning";
+import { discoveryText, displayApi, normalizeSearch } from "./learning";
 
 export interface CatalogueEntry {
   name: string;
@@ -39,7 +39,7 @@ export function searchEntries(entries: readonly CatalogueEntry[], query: string,
   const terms = normalizeSearch(query).split(/\s+/).filter(Boolean);
   return entries.filter((entry) => {
     if (family !== "all" && entry.family !== family) return false;
-    const text = normalizeSearch([entry.name, entry.title, ...entry.api, discoveryText(entry)].join(" "));
+    const text = normalizeSearch([entry.name, entry.title, ...displayApi(entry), discoveryText(entry)].join(" "));
     return terms.every((term) => text.includes(term));
   });
 }

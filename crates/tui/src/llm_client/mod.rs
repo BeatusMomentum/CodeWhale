@@ -121,10 +121,9 @@ pub trait LlmClient: Send + Sync {
         requested_model: &str,
         dispatched_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
-        let provider = crate::config::ApiProvider::parse(self.provider_name())
-            .unwrap_or(crate::config::ApiProvider::Custom);
-        crate::cost_status::EffectiveRouteEnvelope::capture(
-            None,
+        let provider = crate::config::ProviderKind::parse(self.provider_name())
+            .unwrap_or(crate::config::ProviderKind::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture_observed(
             provider,
             self.provider_name(),
             requested_model,
@@ -1248,6 +1247,86 @@ pub type RetryResult<T> = Result<T, RetryError>;
 /// - The delay before the next attempt
 pub type RetryCallback = Box<dyn Fn(&LlmError, u32, Duration) + Send + Sync>;
 
+/// An observation of the existing request, never another retry driver. Its
+/// lexical scope captures the producing Engine queue, not an ambient session.
+pub(crate) type RetryStatusEmitter =
+    std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct RequestRetryObservation {
+    pub(crate) retries: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) emit: RetryStatusEmitter,
+}
+
+tokio::task_local! {
+    static REQUEST_RETRY_OBSERVATION: Option<RequestRetryObservation>;
+}
+
+pub(crate) async fn observe_request_retries<F: Future>(
+    observation: Option<RequestRetryObservation>,
+    future: F,
+) -> F::Output {
+    REQUEST_RETRY_OBSERVATION.scope(observation, future).await
+}
+
+async fn observe_transport_status(message: String) {
+    let observation = REQUEST_RETRY_OBSERVATION
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    if let Some(observation) = observation {
+        (observation.emit)(message).await;
+    }
+}
+
+fn observe_transport_attempt() {
+    let _ = REQUEST_RETRY_OBSERVATION.try_with(|observation| {
+        if let Some(observation) = observation {
+            let mut count = observation
+                .retries
+                .load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                match observation.retries.compare_exchange_weak(
+                    count,
+                    count.saturating_add(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => count = current,
+                }
+            }
+        }
+    });
+}
+
+/// A public receipt must never include the provider-controlled error payload.
+/// Raw errors remain intact in the original result and diagnostic/log paths.
+pub(crate) fn retry_reason_summary(error: &LlmError) -> String {
+    match error {
+        LlmError::RateLimited { .. } => "rate limited".into(),
+        LlmError::ServerError { status, .. } => format!("upstream {status}"),
+        LlmError::NetworkError(_) => "network error".into(),
+        LlmError::Timeout(_) => "timeout".into(),
+        _ => "non-retryable provider failure".into(),
+    }
+}
+
+async fn observe_transport_stopped(retries: u32, error: &LlmError, exhausted: bool) {
+    if retries > 0 {
+        let disposition = if exhausted {
+            "Retry exhaustion"
+        } else {
+            "Retry stopped"
+        };
+        observe_transport_status(format!(
+            "{disposition}: transport request stopped after {retries} retries; {}",
+            retry_reason_summary(error),
+        ))
+        .await;
+    }
+}
+
 // === with_retry - Generic Retry Wrapper ===
 
 /// Executes an async operation with configurable retry logic.
@@ -1325,18 +1404,32 @@ where
         if let Some(timeout) = total_timeout
             && start_time.elapsed() >= timeout
         {
+            let error = last_error.unwrap_or(LlmError::Timeout(timeout));
+            observe_transport_stopped(attempt.saturating_sub(1), &error, true).await;
             return Err(RetryError {
-                last_error: last_error.unwrap_or(LlmError::Timeout(timeout)),
+                last_error: error,
                 attempts: attempt,
                 total_time: start_time.elapsed(),
             });
         }
 
+        if attempt > 0 {
+            observe_transport_attempt();
+        }
         match operation().await {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                if attempt > 0 {
+                    observe_transport_status(format!(
+                        "Retry recovery: transport request recovered after {attempt} retries"
+                    ))
+                    .await;
+                }
+                return Ok(result);
+            }
             Err(err) => {
                 // Non-retryable errors fail immediately
                 if !err.is_retryable() {
+                    observe_transport_stopped(attempt, &err, false).await;
                     return Err(RetryError {
                         last_error: err,
                         attempts: attempt + 1,
@@ -1346,6 +1439,7 @@ where
 
                 // Last attempt - no more retries
                 if attempt >= config.max_retries {
+                    observe_transport_stopped(attempt, &err, true).await;
                     return Err(RetryError {
                         last_error: err,
                         attempts: attempt + 1,
@@ -1367,6 +1461,14 @@ where
                     cb(&err, attempt, delay);
                 }
 
+                observe_transport_status(format!(
+                    "Retry attempt: transport {}/{}; {}; waiting {:.2}s",
+                    attempt + 1,
+                    config.max_retries,
+                    retry_reason_summary(&err),
+                    delay.as_secs_f64(),
+                ))
+                .await;
                 last_error = Some(err);
 
                 // Wait before retrying

@@ -109,3 +109,12 @@ pub use posture::*;
 
 mod instrument;
 pub use instrument::*;
+
+mod native_composer;
+pub use native_composer::*;
+
+mod dock_tabs;
+pub use dock_tabs::*;
+mod braille_frame;
+pub(crate) use braille_frame::paint_braille_cells;
+pub use braille_frame::*;

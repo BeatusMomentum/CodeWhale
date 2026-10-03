@@ -9,12 +9,13 @@
  * host's own index by handle so a later `tool/call` or `command/run` can find
  * the definition.
  */
-import type { OwnerRef } from '../protocol.ts'
+import type { OwnerRef, EntryRef } from '../protocol.ts'
 import type { RpcPeer } from '../rpc.ts'
 
 /** What an owner record must carry for registrations to be tracked on it. */
 export interface OwnerBase {
   ref: OwnerRef
+  scope?: EntryRef
   state: 'activating' | 'active' | 'failed' | 'disposed'
   /** In-flight `registry/register` requests, awaited before activation acks. */
   pendingRegistrations: Set<Promise<void>>
@@ -41,14 +42,14 @@ export class OwnedRegistrations<O extends OwnerBase, T extends OwnedEntry<O>> {
   readonly byHandle = new Map<number, T>()
 
   private readonly rpc: RpcPeer
-  private readonly kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'skill_root'
+  private readonly kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'shell_hook' | 'mcp_server'
   /** The owner's own index of this kind, for the leak report at deactivation. */
   private readonly ownedBy: (owner: O) => Map<number, T>
   private readonly warn: (message: string, owner: O) => void
 
   constructor(
     rpc: RpcPeer,
-    kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'skill_root',
+    kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'shell_hook' | 'mcp_server',
     ownedBy: (owner: O) => Map<number, T>,
     warn: (message: string, owner: O) => void,
   ) {
@@ -61,15 +62,15 @@ export class OwnedRegistrations<O extends OwnerBase, T extends OwnedEntry<O>> {
   /** Called inside the owner's effect; returns the effect's cleanup. */
   add(entry: T, spec: RegisterSpec): () => void {
     const owner = entry.owner
+    if (owner.state!=='activating' && owner.state!=='active') throw new Error('registration owner was disposed')
     const registration: Promise<void> = this.rpc
-      .request('registry/register', { owner: owner.ref, kind: this.kind, spec })
+      .request('registry/register', { owner: owner.ref, ...(owner.scope ? {scope:owner.scope} : {}), kind: this.kind, spec })
       .then(
         (result: any) => {
           if (typeof result?.handle === 'number') {
             entry.handle = result.handle
-            if (entry.disposed) {
-              void this.unregister(entry)
-              return
+            if (entry.disposed || (owner.state!=='activating' && owner.state!=='active')) {
+              return this.unregister(entry)
             }
             this.ownedBy(owner).set(result.handle, entry)
             this.byHandle.set(result.handle, entry)
@@ -93,15 +94,19 @@ export class OwnedRegistrations<O extends OwnerBase, T extends OwnedEntry<O>> {
   }
 
   /** Undo exactly this entry. The core revokes first, so a failure here is expected after revocation. */
-  private async unregister(entry: T) {
+  private unregister(entry: T): Promise<void> {
     const handle = entry.handle!
-    this.ownedBy(entry.owner).delete(handle)
+    const owner = entry.owner
+    this.ownedBy(owner).delete(handle)
     this.byHandle.delete(handle)
-    try {
-      await this.rpc.request('registry/unregister', { owner: entry.owner.ref, handle })
-    } catch {
-      // The core revoked first.
-    }
+    // Rollback is part of owner quiescence, including an admission response
+    // arriving after its fiber failed. No activation/disposal ack precedes it.
+    const cleanup: Promise<void> = this.rpc
+      .request('registry/unregister', { owner: owner.ref, handle })
+      .then(() => undefined, () => undefined) // Core may have revoked first.
+      .finally(() => owner.pendingRegistrations.delete(cleanup))
+    owner.pendingRegistrations.add(cleanup)
+    return cleanup
   }
 
   /** Drop the host's index of everything `owner` registered (after its teardown). */

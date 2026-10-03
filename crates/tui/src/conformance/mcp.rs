@@ -14,8 +14,8 @@
 //! [`DISPATCHES`] is the seam for the TypeScript migration
 //! (TS-EXTENSION-HOST-DESIGN §5.2, §9.3): today it holds the Rust pool path
 //! production uses (`Engine::execute_mcp_tool_with_pool`); `HostMcpDispatch`
-//! joins it in Phase 2 and must produce the *same* golden, because the
-//! golden does not name the dispatch. Production MCP code is not touched.
+//! now joins it and must produce the *same* golden, because the golden
+//! does not name the dispatch. It uses the real pinned SDK and Rust broker.
 //!
 //! Normalization: the server URL/port is masked; results are
 //! `{"ok": {success, content, metadata, content_blocks}}` with JSON content
@@ -127,7 +127,10 @@ trait McpDispatchUnderTest: Send + Sync {
 type DispatchFactory = fn(setup: DispatchSetup) -> Box<dyn McpDispatchUnderTest>;
 
 /// Every dispatch runs every transcript against the same golden.
-const DISPATCHES: &[(&str, DispatchFactory)] = &[("mcp_pool", McpPoolDispatch::boxed)];
+const DISPATCHES: &[(&str, DispatchFactory)] = &[
+    ("mcp_pool", McpPoolDispatch::boxed),
+    ("host_sdk", HostMcpDispatch::boxed),
+];
 
 /// The Rust path production uses today: the shared pool behind the engine's
 /// direct MCP execution seam.
@@ -204,6 +207,73 @@ impl McpDispatchUnderTest for McpPoolDispatch {
 
     async fn shutdown(&self) {
         self.pool.lock().await.shutdown_all().await;
+    }
+}
+
+/// The selected production Host pool, not a semantic fake. The sandbox
+/// already seals CODEWHALE_HOME; manager materialization and native child
+/// launch use that same root. Guards live through shutdown on this runner's
+/// current-thread runtime, so host workers never inherit another case's policy.
+struct HostMcpDispatch {
+    inner: McpPoolDispatch,
+    manager: Arc<crate::extension_host::ExtensionHostManager>,
+    _manager: crate::extension_host::TestManagerGuard,
+    _policy: crate::plugins::activation::TestPolicyGuard,
+}
+impl HostMcpDispatch {
+    fn boxed(setup: DispatchSetup) -> Box<dyn McpDispatchUnderTest> {
+        let node = crate::extension_host::tests::node_for_tests("recorded MCP Host SDK parity")
+            .expect("recorded Host SDK parity requires a supported local Node runtime");
+        let root =
+            PathBuf::from(std::env::var_os("CODEWHALE_HOME").expect("sealed conformance home"));
+        let manager = Arc::new(crate::extension_host::ExtensionHostManager::new(
+            crate::extension_host::ExtensionHostOptions {
+                node_override: Some(node),
+                root: Some(root),
+                ..Default::default()
+            },
+        ));
+        let policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+        let manager_guard = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+        let (tx_event, rx_event) = mpsc::channel(64);
+        let pool = McpPool::new(setup.config)
+            .with_disallowed_tools(setup.disallowed_tools.clone())
+            .with_backend(crate::mcp::McpBackend::Host);
+        Box::new(Self {
+            inner: McpPoolDispatch {
+                pool: Arc::new(AsyncMutex::new(pool)),
+                tx_event,
+                disallowed_tools: setup.disallowed_tools,
+                _rx_event: Mutex::new(rx_event),
+            },
+            manager,
+            _manager: manager_guard,
+            _policy: policy,
+        })
+    }
+}
+#[async_trait::async_trait]
+impl McpDispatchUnderTest for HostMcpDispatch {
+    async fn boot(&self) -> Result<(), String> {
+        self.inner.boot().await
+    }
+    async fn catalog(&self) -> Vec<codewhale_models::Tool> {
+        self.inner.catalog().await
+    }
+    async fn call(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Result<RichToolResult, ToolError> {
+        self.inner.call(name, input, cancel).await
+    }
+    async fn approval_hint(&self, name: &str) -> Option<&'static str> {
+        self.inner.approval_hint(name).await
+    }
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
+        self.manager.shutdown().await;
     }
 }
 

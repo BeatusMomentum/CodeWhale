@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { SkillRoots, normalizeSkillRoot } from '../src/shims/skills.ts'
+import { SkillRoots, normalizeSkillRoot } from '../dist/skills.mjs'
 
 function fixture({ deferred = false, refused } = {}) {
   const calls = [], pending = []

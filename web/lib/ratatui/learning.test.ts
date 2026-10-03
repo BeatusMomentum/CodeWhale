@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { readCatalogue } from "./catalogue";
-import { FAMILY_GUIDANCE, TASKS, discoveryText, filterByTask, getGuidance, normalizeSearch } from "./learning";
+import { FAMILY_GUIDANCE, TASKS, discoveryText, displayApi, filterByTask, getGuidance, normalizeSearch } from "./learning";
 
 const catalogue = readCatalogue();
 const names = new Map(catalogue.entries.map((entry) => [entry.name, entry]));
@@ -78,5 +78,14 @@ describe("Ratatui learning routes", () => {
     expect(getGuidance(whale, "fr")).toEqual(getGuidance(whale, "en"));
     expect(getGuidance(whale, "zh").hostNote).toContain("WhaleState");
     expect(getGuidance(whale, "zh").description).not.toBe(getGuidance(whale, "en").description);
+  });
+
+  it("shows each studio scene's composed components instead of the shared frame's imports", () => {
+    expect(displayApi(names.get("showcase-work")!)).toContain("TerminalShell");
+    expect(displayApi(names.get("showcase-work")!)).toContain("NativeComposer");
+    expect(displayApi(names.get("showcase-decision")!)).toContain("ApprovalCard");
+    expect(displayApi(names.get("showcase-color")!)).toContain("Ombre");
+    expect(displayApi(names.get("showcase-life")!)).toContain("Whale");
+    expect(displayApi(names.get("composer")!)).toEqual(names.get("composer")!.api);
   });
 });

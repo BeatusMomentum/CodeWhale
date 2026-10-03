@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::commands;
 #[cfg(test)]
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 #[cfg(test)]
 use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, ComposerDensity, ViewportState};
@@ -24,7 +24,9 @@ use crate::tui::approval::{
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::menu_style;
 use crate::tui::scrolling::TranscriptLineMeta;
-use crate::tui::ui_text::{grapheme_display_width, text_display_width};
+use crate::tui::ui_text::grapheme_display_width;
+#[cfg(test)]
+use crate::tui::ui_text::text_display_width;
 use crate::tui::underwater::ShellPhase;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
@@ -32,24 +34,22 @@ use codewhale_ratatui::{
     DecisionBand, DecisionBandAction, DecisionBandSave,
     decision_wrapped_rows as measure_wrapped_rows,
 };
+#[cfg(test)]
+use ratatui::widgets::BorderType;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, StatefulWidget, Widget, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap},
 };
+#[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SEND_FLASH_DURATION: Duration = Duration::from_millis(500);
 #[cfg(test)]
 const COMPOSER_PANEL_HEIGHT: u16 = 2;
-const JUMP_TO_LATEST_BUTTON_WIDTH: u16 = 3;
-const JUMP_TO_LATEST_BUTTON_HEIGHT: u16 = 3;
 pub struct ChatWidget {
     content_area: Rect,
     /// Scrollable/selectable transcript geometry. When the last prompt is
@@ -58,10 +58,12 @@ pub struct ChatWidget {
     transcript_area: Rect,
     lines: Vec<Line<'static>>,
     line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
-    scrollbar: Option<TranscriptScrollbar>,
+    scrollbar: Option<codewhale_ratatui::TranscriptScrollFacts>,
     jump_to_latest_button: Option<Rect>,
     background: Color,
     ocean_column: Option<crate::tui::ocean::OceanColumn>,
+    ocean_paint_theme: palette::UiTheme,
+    ocean_protected: Vec<Rect>,
     /// Live-activity shape of the ambient scene (thinking/tools/subagents).
     ocean_activity: crate::tui::ambient_life::AmbientActivity,
     /// Ink for the selected underwater scene's idle fish/bubbles.
@@ -76,13 +78,6 @@ pub struct ChatWidget {
     scroll_thumb: Color,
     jump_border: Color,
     jump_arrow: Color,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TranscriptScrollbar {
-    top: usize,
-    visible: usize,
-    total: usize,
 }
 
 /// A `todo_write` result is a full replacement snapshot, not an incremental
@@ -254,6 +249,7 @@ impl ChatWidget {
                 life_presence_fixed,
                 context_percent,
             )
+            .with_paint_caps(app.viewport.ocean_caps)
         });
         let fish_flee_elapsed_ms = underwater_motion_enabled
             .then_some(())
@@ -276,7 +272,19 @@ impl ChatWidget {
             app.viewport.last_transcript_total = 0;
             app.viewport.last_transcript_padding_top = 0;
             app.viewport.jump_to_latest_button_area = None;
+            app.viewport.pinned_prompt_area = None;
+            app.viewport.pinned_prompt_message = None;
+            let ocean_protected = codewhale_ratatui::ocean::ocean_semantic_surfaces(
+                &lines,
+                content_area,
+                grapheme_display_width,
+            );
+            app.viewport
+                .ocean_semantic_surfaces
+                .clone_from(&ocean_protected);
             return Self {
+                ocean_paint_theme: app.ui_theme,
+                ocean_protected,
                 content_area,
                 transcript_area: content_area,
                 lines,
@@ -511,7 +519,7 @@ impl ChatWidget {
         // only when the prompt has actually scrolled above it. Resolving once
         // more with the smaller body keeps the newest tail line visible.
         let mut transcript_area = content_area;
-        let pinned_prompt = (app.pin_last_prompt && content_area.height > 1)
+        let mut pinned_prompt = (app.pin_last_prompt && content_area.height > 1)
             .then(|| {
                 scrolled_user_prompt_pin(
                     &app.history,
@@ -528,6 +536,19 @@ impl ChatWidget {
             let visible = usize::from(transcript_area.height);
             (total_lines, top, was_explicit_tail) =
                 resolve_transcript_viewport_after_layout(&mut app.viewport, visible);
+            // Reserving the row moved `top` down by one on the tail, so
+            // re-resolve the header against the final viewport: a prompt
+            // whose first line was exactly the old top row must now head the
+            // header instead of being hidden behind it. The previous
+            // candidate's first line is still above the new `top`, so this
+            // always re-selects a message.
+            pinned_prompt = scrolled_user_prompt_pin(
+                &app.history,
+                app.viewport.transcript_cache.line_meta(),
+                &app.collapsed_cell_map,
+                top,
+                content_area.width,
+            );
             visible
         } else {
             visible_lines
@@ -622,9 +643,26 @@ impl ChatWidget {
         // (Underwater, Shoreline): the cell's text sat on the terminal's own
         // background, and CJK trailing columns left black remnants when the
         // cell scrolled (#6704). The footer's `Alt+V:details` hint names it.
+        //
+        // The pinned header is clickable: a click jumps the viewport to the
+        // user message it describes. Record the hit box and target line in
+        // the same frame that paints the header, so the coordinates the
+        // mouse handler tests are the coordinates the user saw.
+        app.viewport.pinned_prompt_area = (pinned_prompt.is_some() && app.use_mouse_capture)
+            .then_some(Rect {
+                x: content_area.x,
+                y: content_area.y,
+                width: content_area.width,
+                height: 1,
+            });
+        // Record the message, not a line offset: offsets are frame-bound, and
+        // a rewrite between paint and click would land the jump on whatever
+        // now sits on the stale offset.
+        app.viewport.pinned_prompt_message = pinned_prompt.as_ref().map(|(_, message)| *message);
+
         apply_selection(&mut lines, top, app);
 
-        if let Some(pin) = pinned_prompt {
+        if let Some((pin, _)) = pinned_prompt {
             lines.insert(0, pin);
             line_links.insert(0, Vec::new());
         }
@@ -638,7 +676,7 @@ impl ChatWidget {
         app.viewport.last_transcript_padding_top = 0;
 
         let scrollbar = (total_lines > visible_lines && transcript_area.width > 1).then_some(
-            TranscriptScrollbar {
+            codewhale_ratatui::TranscriptScrollFacts {
                 top,
                 visible: visible_lines,
                 total: total_lines,
@@ -646,13 +684,23 @@ impl ChatWidget {
         );
         let jump_to_latest_button =
             if app.use_mouse_capture && !app.viewport.transcript_scroll.is_at_tail() {
-                jump_to_latest_button_rect(transcript_area, scrollbar.is_some())
+                codewhale_ratatui::transcript_jump_rect(transcript_area, scrollbar.is_some())
             } else {
                 None
             };
         app.viewport.jump_to_latest_button_area = jump_to_latest_button;
 
+        let ocean_protected = codewhale_ratatui::ocean::ocean_semantic_surfaces(
+            &lines,
+            content_area,
+            grapheme_display_width,
+        );
+        app.viewport
+            .ocean_semantic_surfaces
+            .clone_from(&ocean_protected);
         Self {
+            ocean_paint_theme: app.ui_theme,
+            ocean_protected,
             content_area,
             transcript_area,
             lines,
@@ -807,50 +855,69 @@ pub(crate) fn active_entry_revision(active_rev: u64, salt: u64) -> u64 {
     revision_in_domain(mixed, true)
 }
 
-/// Build the last-user-prompt header when that message is above the resolved
-/// transcript viewport. The caller owns the one-row layout reservation so
-/// the header never masquerades as `top` or displaces the newest tail line.
+/// Build the pinned user-prompt header for the content at the top of the
+/// resolved transcript viewport.
+///
+/// The header belongs to whichever user message owns the content the
+/// viewport starts on: the newest user message whose first rendered line
+/// sits above `top`. The instant a newer prompt's first line reaches the top
+/// viewport row — scrolling up, or the tail sitting short — the header hands
+/// over to the previous turn's prompt, so it never blinks out while the user
+/// scrolls across a turn boundary. The returned message index lets a click
+/// on the header jump the viewport back to that message (resolved against
+/// the click frame's layout, so a rewrite between paint and click cannot
+/// land the jump on a stale offset), and the caller owns the one-row layout
+/// reservation so the header never masquerades as `top` or displaces the
+/// newest tail line.
 fn scrolled_user_prompt_pin(
     history: &[HistoryCell],
     line_meta: &[TranscriptLineMeta],
     collapsed_cell_map: &[usize],
     top: usize,
     width: u16,
-) -> Option<Line<'static>> {
-    if width == 0 {
+) -> Option<(Line<'static>, usize)> {
+    if width == 0 || top == 0 {
         return None;
     }
-    let (orig_idx, content) =
-        history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, cell)| match cell {
-                HistoryCell::User { content } if !content.trim().is_empty() => {
-                    Some((idx, content.as_str()))
-                }
-                _ => None,
-            })?;
-    // The newest prompt sits near the tail, so search backward; a forward
-    // scan cost O(transcript) on every frame of a long session (#6652).
-    let first_line = line_meta.iter().rposition(|meta| match meta {
-        TranscriptLineMeta::CellLine {
+    // First rendered line of a non-blank user cell, as an original history
+    // index. Only `line_in_cell == 0` matches: later lines of a long prompt
+    // are its body, not the message start.
+    let user_first_line = |meta: &TranscriptLineMeta| -> Option<usize> {
+        let TranscriptLineMeta::CellLine {
             cell_index,
-            line_in_cell,
+            line_in_cell: 0,
             ..
-        } => {
-            let original = collapsed_cell_map
-                .get(*cell_index)
-                .copied()
-                .unwrap_or(*cell_index);
-            original == orig_idx && *line_in_cell == 0
+        } = meta
+        else {
+            return None;
+        };
+        let original = collapsed_cell_map
+            .get(*cell_index)
+            .copied()
+            .unwrap_or(*cell_index);
+        // Only a prompt with renderable first-line text can head the pin. A
+        // message that opens on a blank line is skipped here, not rejected
+        // later, so the scan keeps walking to an older message that can head
+        // the header instead of dropping out (review follow-up).
+        let content = match history.get(original) {
+            Some(HistoryCell::User { content }) => content,
+            _ => return None,
+        };
+        if content.lines().next().unwrap_or("").trim().is_empty() {
+            return None;
         }
-        _ => false,
-    });
-    let first_line = first_line?;
-    if first_line >= top {
-        return None;
-    }
+        Some(original)
+    };
+    // Newest user message whose start sits above the viewport's top row,
+    // scanned newest-first so a long prompt that began several screens up
+    // still resolves to its own first line. A prompt whose first line is
+    // exactly the top row belongs to the screen, not the header, so the
+    // hand-over happens the instant it enters.
+    let orig_idx = line_meta.iter().take(top).rev().find_map(user_first_line)?;
+    let content = match history.get(orig_idx) {
+        Some(HistoryCell::User { content }) => content,
+        _ => return None,
+    };
 
     let first = content.lines().next().unwrap_or("").trim();
     if first.is_empty() {
@@ -871,109 +938,74 @@ fn scrolled_user_prompt_pin(
         shown.push('…');
     }
 
-    Some(Line::from(vec![
-        Span::styled(
-            format!("{} ", crate::tui::glyphs::USER),
-            Style::default()
-                .fg(palette::WHALE_HUMAN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(shown, Style::default().fg(palette::TEXT_PRIMARY)),
-    ]))
+    Some((
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", crate::tui::glyphs::USER),
+                Style::default()
+                    .fg(palette::WHALE_HUMAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(shown, Style::default().fg(palette::TEXT_PRIMARY)),
+        ]),
+        orig_idx,
+    ))
+}
+
+impl ChatWidget {
+    fn viewport(&self) -> codewhale_ratatui::TranscriptViewport<'_> {
+        use codewhale_ratatui::{TranscriptViewport, TranscriptViewportStyles};
+        let background = Style::default().bg(self.background);
+        TranscriptViewport {
+            rows: &self.lines,
+            pinned_rows: self.transcript_area.y.saturating_sub(self.content_area.y),
+            style: background,
+            fill: true,
+            ascii: crate::tui::color_compat::ascii_safe_enabled(),
+            scrollbar: self.scrollbar,
+            jump_to_latest: self.jump_to_latest_button.is_some(),
+            styles: TranscriptViewportStyles {
+                background,
+                track: Style::default().fg(self.scroll_track),
+                thumb: Style::default().fg(self.scroll_thumb),
+                jump_border: Style::default().fg(self.jump_border),
+                jump_arrow: Style::default().fg(self.jump_arrow),
+            },
+            ..TranscriptViewport::new(&self.lines)
+        }
+    }
 }
 
 impl Renderable for ChatWidget {
-    fn render(&self, _area: Rect, buf: &mut Buffer) {
-        // Use the passed render area, not self.content_area — those can
-        // drift when layout changes (e.g. file-tree pane toggle), and
-        // using the stale self.content_area is the root cause of text
-        // bleed-through (#400). In debug builds, assert the two match to
-        // catch future drift early.
+    fn render(&self, area: Rect, buf: &mut Buffer) {
         debug_assert_eq!(
-            _area, self.content_area,
-            "ChatWidget content_area drifted from render area: \
-             content_area={:?} render_area={:?}",
-            self.content_area, _area
+            area, self.content_area,
+            "ChatWidget content_area drifted from render area"
         );
-
-        let area = _area;
-        // Repaint the full chat area with the codewhale-ink background each
-        // frame. Ratatui's `Paragraph` only writes cells that contain text,
-        // so cells the current frame's paragraph doesn't touch would
-        // otherwise hold the *previous* frame's contents (the `:24Z`
-        // timestamp-tail bleed-through reported in v0.8.5 testing). Using
-        // `Clear` reset cells to terminal default, which read as a brown-
-        // gray on most user setups; an explicit ink fill keeps the chat
-        // area on-brand.
-        Block::default()
-            .style(Style::default().bg(self.background))
-            .render(area, buf);
-
-        let paragraph =
-            Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
-        paragraph.render(area, buf);
-
-        self.render_underwater_field(area, buf);
-
-        // Link targets travel beside the wrapped lines, never inside Span
-        // content. Convert relative line columns to absolute viewport regions
-        // for the backend; clip the final column when a scrollbar owns it.
-        let link_area = Rect {
-            width: area
-                .width
-                .saturating_sub(u16::from(self.scrollbar.is_some())),
-            ..area
-        };
-        let regions = crate::tui::osc8::link_regions_for_lines(link_area, &self.line_links);
-        crate::tui::osc8::set_frame_links(regions);
-
-        if let Some(scrollbar) = self.scrollbar {
-            let scrollable_range = scrollbar.total.saturating_sub(scrollbar.visible);
-            let mut state = ScrollbarState::new(scrollable_range)
-                .position(scrollbar.top.min(scrollable_range))
-                .viewport_content_length(scrollbar.visible);
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_symbol(Some("│"))
-                .track_style(Style::default().fg(self.scroll_track))
-                .thumb_symbol("┃")
-                .thumb_style(Style::default().fg(self.scroll_thumb))
-                .render(self.transcript_area, buf, &mut state);
-        }
-
-        if let Some(button_area) = self.jump_to_latest_button {
-            render_jump_to_latest_button(
-                button_area,
-                buf,
-                self.background,
-                self.jump_border,
-                self.jump_arrow,
+        let plan = self.viewport().render_content(area, buf);
+        // The kit guarded background pass stays between content and chrome.
+        self.render_underwater_field(plan.area, buf);
+        plan.paint_chrome(buf);
+        let regions = crate::tui::osc8::link_regions_for_plan(&plan, &self.line_links);
+        for region in &regions {
+            let hit = Rect::new(
+                region.col_start,
+                region.row,
+                region
+                    .col_end
+                    .saturating_sub(region.col_start)
+                    .saturating_add(1),
+                1,
             );
-        }
-
-        // Hover: register OSC-8 link regions (copyable), then apply aura.
-        let link_area = Rect {
-            width: area
-                .width
-                .saturating_sub(u16::from(self.scrollbar.is_some())),
-            ..area
-        };
-        for region in crate::tui::osc8::link_regions_for_lines(link_area, &self.line_links) {
-            let width = region
-                .col_end
-                .saturating_sub(region.col_start)
-                .saturating_add(1);
-            let hit = Rect::new(region.col_start, region.row, width, 1);
             crate::tui::hover_layer::register_rect(
                 crate::tui::hover_hit::HoverTargetKind::Link,
                 hit,
-                region.target,
+                region.target.clone(),
                 true,
             );
         }
+        crate::tui::osc8::set_frame_links(regions);
     }
-
     fn desired_height(&self, _width: u16) -> u16 {
         1
     }
@@ -996,28 +1028,13 @@ impl ChatWidget {
                 phase_tag,
                 fingerprint,
             );
-            for local_y in 0..area.height {
-                let protected = self
-                    .lines
-                    .get(usize::from(local_y))
-                    .and_then(occupied_text_bounds);
-                let row_bg = ramp
-                    .get(usize::from(local_y))
-                    .copied()
-                    .unwrap_or_else(|| column.color_at_y(area.y.saturating_add(local_y)));
-                for local_x in 0..area.width {
-                    let is_protected = protected.is_some_and(|(start, end)| {
-                        usize::from(local_x) >= start && usize::from(local_x) < end
-                    });
-                    let cell = &mut buf[(area.x + local_x, area.y + local_y)];
-                    // Plain transcript text participates in the water column;
-                    // explicit semantic surfaces (selection, code, warnings)
-                    // retain their own background.
-                    if !is_protected || cell.bg == self.background {
-                        cell.set_bg(row_bg);
-                    }
-                }
-            }
+            let facts = codewhale_ratatui::ocean::OceanPaintFacts {
+                ground: self.background,
+                sample_top: area.y,
+                samples: &ramp,
+                protected: &self.ocean_protected,
+            };
+            column.paint_native(area, buf, &self.ocean_paint_theme, &facts);
         }
 
         if self.ambient_life
@@ -1079,10 +1096,6 @@ impl ChatWidget {
     }
 }
 
-fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
-    crate::tui::ambient_life::occupied_text_bounds(line)
-}
-
 #[cfg(test)]
 fn fish_flee_offset(elapsed_ms: u128) -> u16 {
     crate::tui::ambient_life::fish_flee_offset(elapsed_ms)
@@ -1104,200 +1117,51 @@ fn fish_heading(previous_x: u16, current_x: u16, next_x: u16, fallback_right: bo
     }
 }
 
-fn jump_to_latest_button_rect(area: Rect, has_scrollbar: bool) -> Option<Rect> {
-    if area.width < JUMP_TO_LATEST_BUTTON_WIDTH + u16::from(has_scrollbar)
-        || area.height < JUMP_TO_LATEST_BUTTON_HEIGHT
-    {
-        return None;
-    }
+#[cfg(test)]
+const COMPOSER_PANEL_MIN_WIDTH: u16 = codewhale_ratatui::NATIVE_COMPOSER_PANEL_MIN_WIDTH;
 
-    let scrollbar_gutter = u16::from(has_scrollbar);
-    Some(Rect {
-        x: area
-            .x
-            .saturating_add(area.width)
-            .saturating_sub(scrollbar_gutter)
-            .saturating_sub(JUMP_TO_LATEST_BUTTON_WIDTH),
-        y: area
-            .y
-            .saturating_add(area.height)
-            .saturating_sub(JUMP_TO_LATEST_BUTTON_HEIGHT),
-        width: JUMP_TO_LATEST_BUTTON_WIDTH,
-        height: JUMP_TO_LATEST_BUTTON_HEIGHT,
-    })
-}
-
-fn render_jump_to_latest_button(
-    area: Rect,
-    buf: &mut Buffer,
-    background: Color,
-    border: Color,
-    arrow: Color,
-) {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(background))
-        .render(area, buf);
-
-    let arrow_x = area.x.saturating_add(1);
-    let arrow_y = area.y.saturating_add(1);
-    buf[(arrow_x, arrow_y)]
-        .set_symbol("↓")
-        .set_style(Style::default().fg(arrow).add_modifier(Modifier::BOLD));
-}
-
-const COMPOSER_PROMPT_GUTTER_WIDTH: u16 = 2;
-const COMPOSER_PANEL_MIN_WIDTH: u16 = 12;
-
-/// Whether the active composer should use its full rounded enclosure.
-///
-/// `composer_border` is a legacy configuration name, but its compatibility
-/// policy is deliberate: the default `true` means the Tideline enclosure;
-/// `false` is an explicit compact/quiet opt-out. Keep every layout consumer
-/// behind this helper so the reserved floor, measured height, and rendered
-/// geometry cannot drift apart.
-#[must_use]
+/// Existing configuration remains host authority; all geometry is kit-owned.
 pub(crate) fn composer_enclosure_enabled(app: &App) -> bool {
     app.composer_border
 }
-
-/// Shared `[↵]` submit rect for the live composer, or `None` when the
-/// enclosure cannot host the three-cell affordance.
-///
-/// The gate is the same `enclosed_composer_panel_fits` predicate the painter
-/// uses: a hitbox without the painted panel would be an invisible click
-/// target (widths 6–11 rendered a borderless rule while still accepting
-/// clicks).
-#[must_use]
 pub(crate) fn active_composer_submit_rect(app: &App, area: Rect) -> Option<Rect> {
-    if !enclosed_composer_panel_fits(composer_enclosure_enabled(app), area.width, area.height) {
-        return None;
-    }
-    Some(crate::tui::composer_chrome::tideline_composer_geometry(area).submit)
+    codewhale_ratatui::native_composer_geometry(area, composer_enclosure_enabled(app), false).submit
 }
-
-/// Restore rounded corners after the title-bearing top/bottom passes.
-///
-/// Ratatui renders a `TOP`-only (or `BOTTOM`-only) block through the corner
-/// cells as horizontal line glyphs. The live composer needs those passes for
-/// its localized titles and shared focus outline, so put
-/// the four rounded joins back afterward rather than replacing its mature
-/// input widget with the unfinished translation scaffold.
-fn render_composer_panel_corners(
-    area: Rect,
-    buf: &mut Buffer,
-    background: Style,
-    permission_color: Color,
-    mode_color: Color,
-) {
-    let top_style = background.fg(permission_color);
-    let bottom_style = background.fg(mode_color);
-    let left = area.left();
-    let right = area.right().saturating_sub(1);
-    let top = area.top();
-    let bottom = area.bottom().saturating_sub(1);
-
-    buf[(left, top)].set_symbol("╭").set_style(top_style);
-    buf[(right, top)].set_symbol("╮").set_style(top_style);
-    buf[(left, bottom)].set_symbol("╰").set_style(bottom_style);
-    buf[(right, bottom)].set_symbol("╯").set_style(bottom_style);
+#[cfg(test)]
+fn enclosed_composer_panel_fits(enclosed: bool, width: u16, height: u16) -> bool {
+    codewhale_ratatui::native_composer_geometry(Rect::new(0, 0, width, height), enclosed, false)
+        .submit
+        .is_some()
 }
-
-/// Whether the outer composer rect can carry both semantic border rows.
-///
-/// Keep this policy in outer-area coordinates. Input wrapping subtracts the
-/// prompt gutter later; using that narrower text width here made 12- and
-/// 13-column composers render as panels after reserving only the quiet rule.
-fn enclosed_composer_panel_fits(show_panel: bool, area_width: u16, area_height: u16) -> bool {
-    show_panel && area_height >= 3 && area_width >= COMPOSER_PANEL_MIN_WIDTH
+#[cfg(test)]
+fn composer_inner_area(area: Rect, panel: bool) -> Rect {
+    codewhale_ratatui::native_composer_geometry(area, panel, false).inner
 }
-
-/// Border-aware input plane for the active composer.
-///
-/// The shared shell's `[↵]` control occupies three cells on the inner row.
-/// Keep the text plane to its left, with one blank cell in between, so input
-/// wrapping, cursor placement, and pointer mapping cannot claim painted send
-/// cells. The outer block still owns the trailing breathing cell before its
-/// right rail.
-fn composer_inner_area(area: Rect, has_panel: bool) -> Rect {
-    let inner = if has_panel {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .inner(area)
-    } else if area.height >= 2 {
-        Block::default().borders(Borders::TOP).inner(area)
-    } else {
-        area
-    };
-    if !has_panel {
-        return inner;
-    }
-
-    let shell = crate::tui::composer_chrome::tideline_composer_geometry(area);
-    Rect {
-        width: shell.content.right().saturating_sub(inner.x),
-        ..inner
-    }
-}
-
-/// Canonical horizontal geometry for composer input text.
-///
-/// The prompt glyph occupies the first gutter column and the second column is
-/// breathing room. Every consumer that wraps or maps input must use
-/// `text_area`: rendering and cursor placement, viewport scroll bookkeeping,
-/// and mouse hit-to-character conversion. Keeping the inset here prevents the
-/// first typed character and exact wrap boundaries from using different
-/// effective widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ComposerContentGeometry {
     pub(crate) text_area: Rect,
+    #[cfg(test)]
     pub(crate) prompt_inset: u16,
 }
-
 impl ComposerContentGeometry {
-    #[must_use]
     pub(crate) fn text_width(self) -> usize {
         usize::from(self.text_area.width.max(1))
     }
-
-    #[must_use]
-    fn prompt_padding(self) -> &'static str {
-        if self.prompt_inset == COMPOSER_PROMPT_GUTTER_WIDTH {
-            "  "
-        } else {
-            ""
-        }
-    }
-
-    #[must_use]
-    fn prompt_x(self) -> Option<u16> {
-        (self.prompt_inset > 0).then(|| self.text_area.x.saturating_sub(self.prompt_inset))
+}
+pub(crate) fn composer_content_geometry(inner: Rect, history: bool) -> ComposerContentGeometry {
+    let (text_area, _prompt_inset) =
+        codewhale_ratatui::native_composer_content_geometry(inner, history);
+    ComposerContentGeometry {
+        text_area,
+        #[cfg(test)]
+        prompt_inset: _prompt_inset,
     }
 }
-
-#[must_use]
-pub(crate) fn composer_content_geometry(
-    inner_area: Rect,
-    history_search_active: bool,
-) -> ComposerContentGeometry {
-    let prompt_inset = if !history_search_active
-        && inner_area.width >= COMPOSER_PROMPT_GUTTER_WIDTH.saturating_add(1)
-    {
-        COMPOSER_PROMPT_GUTTER_WIDTH
-    } else {
-        0
-    };
-    ComposerContentGeometry {
-        text_area: Rect {
-            x: inner_area.x.saturating_add(prompt_inset),
-            y: inner_area.y,
-            width: inner_area.width.saturating_sub(prompt_inset),
-            height: inner_area.height,
-        },
-        prompt_inset,
+fn composer_native_density(density: ComposerDensity) -> codewhale_ratatui::NativeComposerDensity {
+    match density {
+        ComposerDensity::Compact => codewhale_ratatui::NativeComposerDensity::Compact,
+        ComposerDensity::Comfortable => codewhale_ratatui::NativeComposerDensity::Comfortable,
+        ComposerDensity::Spacious => codewhale_ratatui::NativeComposerDensity::Spacious,
     }
 }
 
@@ -1367,12 +1231,14 @@ impl<'a> ComposerWidget<'a> {
         composer_enclosure_enabled(self.app)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_panel(&self, area: Rect) -> bool {
         enclosed_composer_panel_fits(self.wants_enclosed_panel(), area.width, area.height)
     }
 
     /// The border- and submit-aware input rectangle shared by rendering,
     /// cursor mapping, and the frame's persistent mouse geometry.
+    #[cfg(test)]
     pub(crate) fn inner_area(&self, area: Rect) -> Rect {
         composer_inner_area(area, self.has_panel(area))
     }
@@ -1394,580 +1260,233 @@ impl<'a> ComposerWidget<'a> {
     fn max_height_cap(&self) -> u16 {
         composer_max_height(self.app.composer_density)
     }
-}
-
-impl Renderable for ComposerWidget<'_> {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        // Slash rows are re-recorded below; clear first so a closed or
-        // resized menu cannot keep stale hitboxes from the prior frame.
-        self.app
-            .viewport
-            .last_slash_menu_hitboxes
-            .borrow_mut()
-            .clear();
-        let background = Style::default().bg(self.app.ui_theme.composer_bg);
-        let has_panel = self.has_panel(area);
-        let inner_area = self.inner_area(area);
-        let input_text = self.app.composer_display_input();
-        let input_cursor = self.app.composer_display_cursor();
-        let history_search_matches = if self.app.is_history_search_active() {
-            self.app.history_search_matches()
-        } else {
-            Vec::new()
+    /// Project host semantics, menu filtering and styles; the kit owns every
+    /// row, source index, caret, viewport and pointer rectangle below them.
+    fn frame(&self) -> codewhale_ratatui::NativeComposerFrame<'_> {
+        use codewhale_ratatui::{
+            NativeComposerFrame, NativeComposerMenu, NativeComposerMenuItem, NativeComposerStyles,
         };
-        let menu_lines = self.active_menu_row_count();
-        // For the layout-budget calculation, treat the menu as if it were
-        // already at its locked, worst-case height (see
-        // `active_menu_reserved_rows`). Without this, when the matched-entry
-        // count drops mid-typing, `top_padding` grows and the input visually
-        // jumps down inside the panel even though the panel rect stayed put.
-        let menu_lines_for_budget = self.active_menu_reserved_rows().max(menu_lines);
-        let input_rows_budget =
-            composer_input_rows_budget(inner_area.height, menu_lines_for_budget);
-        // Menu rows span the full inner panel. Input text alone uses the
-        // prompt-adjusted geometry below.
-        let content_width = usize::from(inner_area.width.max(1));
-        let content_geometry =
-            composer_content_geometry(inner_area, self.app.is_history_search_active());
-        let input_content_width = content_geometry.text_width();
-
-        // Use the extended version that also returns character indices to avoid
-        // redundant wrapping when rendering text selections (issue #3909).
-        let (visible_lines, _cursor_row, _cursor_col, _scroll_offset, visible_char_indices) =
-            layout_input_with_scroll_and_char_indices(
-                input_text,
-                input_cursor,
-                input_content_width,
-                input_rows_budget,
-            );
-        if has_panel {
-            let hint_line = if self.app.is_history_search_active() {
-                Some(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            " {}  ",
-                            self.app
-                                .tr(codewhale_localization::MessageId::HistoryHintMove)
-                        ),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                    Span::styled(
-                        format!(
-                            "{}  ",
-                            self.app
-                                .tr(codewhale_localization::MessageId::HistoryHintAccept)
-                        ),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                    Span::styled(
-                        self.app
-                            .tr(codewhale_localization::MessageId::HistoryHintRestore),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                ]))
-            } else if !self.slash_menu_entries.is_empty() {
-                Some(Line::from(Span::styled(
-                    self.app
-                        .tr(codewhale_localization::MessageId::ComposerSlashMenuHint),
-                    Style::default().fg(self.app.ui_theme.text_hint),
+        let history = self.app.is_history_search_active();
+        let input = self.app.composer_display_input();
+        let placeholder = if let Some(suggestion) = &self.app.prompt_suggestion
+            && !history
+        {
+            Line::styled(suggestion.clone(), Style::default().fg(palette::TEXT_HINT))
+        } else {
+            Line::styled(
+                composer_empty_hint_text(self.app),
+                Style::default().fg(self.app.ui_theme.text_soft),
+            )
+        };
+        let hint = if history {
+            Some(Line::from(vec![
+                Span::styled(
+                    format!(" {}  ", self.app.tr(MessageId::HistoryHintMove)),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+                Span::styled(
+                    format!("{}  ", self.app.tr(MessageId::HistoryHintAccept)),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+                Span::styled(
+                    self.app.tr(MessageId::HistoryHintRestore),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+            ]))
+        } else if !self.slash_menu_entries.is_empty() {
+            Some(Line::styled(
+                self.app.tr(MessageId::ComposerSlashMenuHint),
+                Style::default().fg(self.app.ui_theme.text_hint),
+            ))
+        } else if !input.trim().is_empty() {
+            composer_submit_hint(self.app).map(|hint| {
+                Line::styled(format!(" {} ", hint.text), Style::default().fg(hint.color))
+            })
+        } else {
+            None
+        };
+        let top_title = history.then(|| {
+            Line::styled(
+                format!(" {} ", self.app.tr(MessageId::HistorySearchTitle)),
+                Style::default().fg(palette::TEXT_MUTED),
+            )
+        });
+        let top_right = crate::tui::agent_focus::composer_chip_text(self.app).map(|chip| {
+            Line::styled(
+                format!(" {chip} "),
+                Style::default()
+                    .fg(self.app.ui_theme.accent_action)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+        let mut menu = NativeComposerMenu {
+            reserved_rows: self.active_menu_reserved_rows(),
+            ..Default::default()
+        };
+        let menu_line = |label: String, selected: bool| {
+            let style = if selected {
+                menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
+            } else {
+                Style::default().fg(palette::TEXT_MUTED)
+            };
+            NativeComposerMenuItem::Line(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(crate::tui::glyphs::selection_marker(selected), style),
+                Span::styled(" ", style),
+                Span::styled(label, style),
+            ]))
+        };
+        if history {
+            let entries = self.app.history_search_matches();
+            menu.selected = self
+                .app
+                .history_search_selected_index()
+                .min(entries.len().saturating_sub(1));
+            if entries.is_empty() {
+                menu.items.push(NativeComposerMenuItem::Line(Line::styled(
+                    self.app.tr(MessageId::HistoryNoMatches),
+                    Style::default().fg(palette::TEXT_MUTED),
                 )))
-            } else if !input_text.trim().is_empty() {
-                composer_submit_hint(self.app).map(|hint| {
-                    Line::from(vec![Span::styled(
-                        format!(" {} ", hint.text),
-                        Style::default().fg(hint.color),
-                    )])
-                })
             } else {
-                None
-            };
-
-            // Focus has one outline. Permission and mode remain explicit in
-            // their footer; repeating both around the input competes with it.
-            let focus_color = self.focus_color();
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(focus_color))
-                .style(background)
-                .render(area, buf);
-            let mut top_border = Block::default()
-                .borders(Borders::TOP)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(focus_color))
-                .style(background);
-            if self.app.is_history_search_active() {
-                top_border = top_border.title(Line::from(Span::styled(
-                    format!(
-                        " {} ",
-                        self.app
-                            .tr(codewhale_localization::MessageId::HistorySearchTitle)
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-            // Agent focus chip: the composer names the fork it addresses so
-            // a message never goes to a worker by surprise.
-            if let Some(chip) = crate::tui::agent_focus::composer_chip_text(self.app) {
-                top_border = top_border.title_top(
-                    Line::from(Span::styled(
-                        format!(" {chip} "),
-                        Style::default()
-                            .fg(self.app.ui_theme.accent_action)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .right_aligned(),
-                );
-            }
-            top_border.render(area, buf);
-
-            let mut bottom_border = Block::default()
-                .borders(Borders::BOTTOM)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(focus_color))
-                .style(background);
-            if let Some(hint_line) = hint_line {
-                bottom_border = bottom_border.title_bottom(hint_line);
-            }
-            bottom_border.render(area, buf);
-            render_composer_panel_corners(area, buf, background, focus_color, focus_color);
-        } else if area.height >= 2 {
-            let mut block = Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(self.app.ui_theme.border))
-                .style(background);
-            if !input_text.trim().is_empty()
-                && let Some(hint) = composer_submit_hint(self.app)
-            {
-                block = block.title(Line::from(Span::styled(
-                    format!(" {} ", hint.text),
-                    Style::default().fg(hint.color),
-                )));
-            }
-            if let Some(chip) = crate::tui::agent_focus::composer_chip_text(self.app) {
-                block = block.title_top(
-                    Line::from(Span::styled(
-                        format!(" {chip} "),
-                        Style::default()
-                            .fg(self.app.ui_theme.accent_action)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .right_aligned(),
-                );
-            }
-            block.render(area, buf);
-        } else {
-            Block::default().style(background).render(area, buf);
-        }
-
-        let mut input_lines = Vec::new();
-        if input_text.is_empty() {
-            let (placeholder, style): (Cow<'_, str>, Style) = if let Some(ref suggestion) =
-                self.app.prompt_suggestion
-                && !self.app.is_history_search_active()
-            {
-                (
-                    Cow::Borrowed(suggestion.as_str()),
-                    Style::default().fg(palette::TEXT_HINT),
-                )
-            } else {
-                (
-                    composer_empty_hint_text(self.app),
-                    Style::default().fg(self.app.ui_theme.text_soft),
-                )
-            };
-            input_lines.push(Line::from(vec![
-                Span::raw(content_geometry.prompt_padding()),
-                Span::styled(placeholder, style),
-            ]));
-        } else if let Some((sel_start, sel_end)) = self.app.selection_range() {
-            // Use the character indices we already computed during layout
-            // to avoid redundant wrapping (issue #3909).
-            let line_ranges: Vec<(usize, usize)> = visible_char_indices
-                .iter()
-                .map(|(start, text)| (*start, *start + text.chars().count()))
-                .collect();
-            for (line_text, (line_start, line_end)) in visible_lines.iter().zip(line_ranges.iter())
-            {
-                let mut spans = line_spans_with_selection(
-                    line_text,
-                    *line_start,
-                    *line_end,
-                    sel_start,
-                    sel_end,
-                    self.app.ui_theme.selection_bg,
-                );
-                if content_geometry.prompt_inset > 0 {
-                    spans.insert(0, Span::raw(content_geometry.prompt_padding()));
-                }
-                input_lines.push(Line::from(spans));
-            }
-        } else {
-            for line in &visible_lines {
-                let mut spans = Vec::new();
-                if content_geometry.prompt_inset > 0 {
-                    spans.push(Span::raw(content_geometry.prompt_padding()));
-                }
-                spans.push(Span::styled(
-                    line.clone(),
-                    Style::default().fg(palette::TEXT_PRIMARY),
-                ));
-                input_lines.push(Line::from(spans));
-            }
-        }
-
-        // For non-empty input, input_lines.len() already reflects wrapping via
-        // layout_input. For empty input, keep the first row reserved for the
-        // real terminal cursor so IME preedit text has a clean surface.
-        let visual_rows = if input_text.is_empty() {
-            let hint: Option<Cow<'_, str>> = if let Some(ref suggestion) =
-                self.app.prompt_suggestion
-                && !self.app.is_history_search_active()
-            {
-                Some(Cow::Borrowed(suggestion.as_str()))
-            } else {
-                Some(composer_empty_hint_text(self.app))
-            };
-            empty_composer_visual_rows(hint.as_deref(), input_content_width, input_rows_budget)
-        } else {
-            input_lines.len()
-        };
-        let top_padding = composer_top_padding(visual_rows, input_rows_budget);
-        let mut lines = Vec::new();
-        for _ in 0..top_padding {
-            lines.push(Line::from(""));
-        }
-        lines.extend(input_lines);
-
-        if self.app.is_history_search_active() {
-            if history_search_matches.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    self.app
-                        .tr(codewhale_localization::MessageId::HistoryNoMatches),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            } else {
-                let selected = self
-                    .app
-                    .history_search_selected_index()
-                    .min(history_search_matches.len().saturating_sub(1));
-                let menu_visible_rows = inner_area
-                    .height
-                    .saturating_sub(visual_rows as u16)
-                    .saturating_sub(top_padding as u16)
-                    .saturating_sub(1)
-                    .max(1) as usize;
-                let menu_total = history_search_matches.len();
-                let menu_top = if menu_total <= menu_visible_rows {
-                    0
-                } else {
-                    let half = menu_visible_rows / 2;
-                    if selected <= half {
-                        0
-                    } else if selected + half >= menu_total {
-                        menu_total.saturating_sub(menu_visible_rows)
-                    } else {
-                        selected.saturating_sub(half)
-                    }
-                };
-                let menu_bottom = (menu_top + menu_visible_rows).min(menu_total);
-
-                for (idx, entry) in history_search_matches
+                menu.items = entries
                     .iter()
                     .enumerate()
-                    .take(menu_bottom)
-                    .skip(menu_top)
-                {
-                    let is_selected = idx == selected;
-                    let style = if is_selected {
+                    .map(|(index, label)| menu_line(label.clone(), index == menu.selected))
+                    .collect();
+            }
+        } else if !self.mention_menu_entries.is_empty() {
+            menu.selected = self
+                .app
+                .mention_menu_selected
+                .min(self.mention_menu_entries.len().saturating_sub(1));
+            menu.items = self
+                .mention_menu_entries
+                .iter()
+                .enumerate()
+                .map(|(index, label)| menu_line(format!("@{label}"), index == menu.selected))
+                .collect();
+        } else {
+            menu.pointer_rows = true;
+            menu.selected = self
+                .app
+                .slash_menu_selected
+                .min(self.slash_menu_entries.len().saturating_sub(1));
+            menu.items = self
+                .slash_menu_entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let selected = index == menu.selected;
+                    let style = if selected {
                         menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
                     } else {
                         Style::default().fg(palette::TEXT_MUTED)
                     };
-                    let marker = crate::tui::glyphs::selection_marker(is_selected);
-                    lines.push(Line::from(vec![
-                        Span::styled(" ", Style::default()),
-                        Span::styled(marker, style),
-                        Span::styled(" ", style),
-                        Span::styled(entry.clone(), style),
-                    ]));
-                }
-            }
-        } else if !self.mention_menu_entries.is_empty() {
-            let selected = self
-                .app
-                .mention_menu_selected
-                .min(self.mention_menu_entries.len().saturating_sub(1));
-            let menu_visible_rows = inner_area
-                .height
-                .saturating_sub(visual_rows as u16)
-                .saturating_sub(top_padding as u16)
-                .saturating_sub(1)
-                .max(1) as usize;
-            let menu_total = self.mention_menu_entries.len();
-            let menu_top = if menu_total <= menu_visible_rows {
-                0
-            } else {
-                let half = menu_visible_rows / 2;
-                if selected <= half {
-                    0
-                } else if selected + half >= menu_total {
-                    menu_total.saturating_sub(menu_visible_rows)
-                } else {
-                    selected.saturating_sub(half)
-                }
-            };
-            let menu_bottom = (menu_top + menu_visible_rows).min(menu_total);
-
-            for (idx, entry) in self
-                .mention_menu_entries
-                .iter()
-                .enumerate()
-                .take(menu_bottom)
-                .skip(menu_top)
-            {
-                let is_selected = idx == selected;
-                let style = if is_selected {
-                    menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
-                } else {
-                    Style::default().fg(palette::TEXT_MUTED)
-                };
-                let marker = crate::tui::glyphs::selection_marker(is_selected);
-                lines.push(Line::from(vec![
-                    Span::styled(" ", Style::default()),
-                    Span::styled(marker, style),
-                    Span::styled(" ", style),
-                    Span::styled(format!("@{entry}"), style),
-                ]));
-            }
-        } else if !self.slash_menu_entries.is_empty() {
-            let selected = self
-                .app
-                .slash_menu_selected
-                .min(self.slash_menu_entries.len().saturating_sub(1));
-            let menu_visible_rows = inner_area
-                .height
-                .saturating_sub(visual_rows as u16)
-                .saturating_sub(top_padding as u16)
-                .saturating_sub(1)
-                .max(1) as usize;
-            let menu_total = self.slash_menu_entries.len();
-            let menu_top = if menu_total <= menu_visible_rows {
-                0
-            } else {
-                let half = menu_visible_rows / 2;
-                if selected <= half {
-                    0
-                } else if selected + half >= menu_total {
-                    menu_total.saturating_sub(menu_visible_rows)
-                } else {
-                    selected.saturating_sub(half)
-                }
-            };
-            let menu_bottom = (menu_top + menu_visible_rows).min(menu_total);
-
-            // Label column width — grows to fit the widest visible name
-            // (including alias hint like " or /bangzhu") but stays bounded.
-            let label_width = self
-                .slash_menu_entries
-                .iter()
-                .take(menu_bottom)
-                .skip(menu_top)
-                .map(|e| {
-                    if let Some(ref hint) = e.alias_hint {
-                        format!("{} or /{}", e.name, hint).width()
+                    let name_style = if entry.is_skill && !selected {
+                        Style::default().fg(palette::WHALE_ACTION)
                     } else {
-                        e.name.width()
+                        style
+                    };
+                    let description_style = if selected {
+                        menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
+                    } else {
+                        Style::default().fg(palette::TEXT_DIM)
+                    };
+                    NativeComposerMenuItem::Columns {
+                        name: entry
+                            .alias_hint
+                            .as_ref()
+                            .map(|hint| format!("{} or /{hint}", entry.name))
+                            .unwrap_or_else(|| entry.name.clone()),
+                        description: entry.description.clone(),
+                        prefix: Span::styled(if entry.is_skill { "✦" } else { " " }, name_style),
+                        marker: Span::styled(crate::tui::glyphs::selection_marker(selected), style),
+                        name_style,
+                        description_style,
                     }
                 })
-                .max()
-                .unwrap_or(22)
-                .min(content_width.saturating_sub(4))
-                .max(8);
-            for (idx, entry) in self
-                .slash_menu_entries
-                .iter()
-                .enumerate()
-                .take(menu_bottom)
-                .skip(menu_top)
-            {
-                let is_selected = idx == selected;
-                let sel_style = if is_selected {
-                    menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
-                } else {
-                    Style::default().fg(palette::TEXT_MUTED)
-                };
-                let marker = crate::tui::glyphs::selection_marker(is_selected);
-
-                // Name column
-                let name_style = if entry.is_skill && !is_selected {
-                    Style::default().fg(palette::WHALE_ACTION)
-                } else {
-                    sel_style
-                };
-
-                // Description column (muted when not selected, secondary when selected)
-                let desc_style = if is_selected {
-                    menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
-                } else {
-                    Style::default().fg(palette::TEXT_DIM)
-                };
-
-                // Build display name: canonical name, with "or /alias" hint
-                // when the user typed via a pinyin alias.
-                let display_name = if let Some(ref hint) = entry.alias_hint {
-                    format!("{} or /{}", entry.name, hint)
-                } else {
-                    entry.name.clone()
-                };
-
-                let name_was_truncated = display_name.width() > label_width;
-                let mut name_display =
-                    crate::tui::ui_text::truncate_line_to_width(&display_name, label_width);
-                while name_display.width() < label_width {
-                    name_display.push(' ');
-                }
-
-                // Skill marker prefix
-                let skill_prefix = if entry.is_skill { "✦" } else { " " };
-
-                // Compute exact prefix display width to avoid Paragraph wrap:
-                // 1(" ") + 1(marker) + skill_prefix.width() + label_width + 2("  ")
-                let prefix_display_width = 1 + 1 + skill_prefix.width() + label_width + 2;
-                let desc_capacity = content_width.saturating_sub(prefix_display_width);
-                let description_was_truncated = entry.description.width() > desc_capacity;
-                let desc_display =
-                    crate::tui::ui_text::truncate_line_to_width(&entry.description, desc_capacity);
-
-                let row_line_index = lines.len();
-                lines.push(Line::from(vec![
-                    Span::styled(" ", Style::default()),
-                    Span::styled(marker, sel_style),
-                    Span::styled(skill_prefix, name_style),
-                    Span::styled(name_display, name_style),
-                    Span::styled("  ", desc_style),
-                    Span::styled(desc_display, desc_style),
-                ]));
-
-                let row_y = inner_area
-                    .y
-                    .saturating_add(u16::try_from(row_line_index).unwrap_or(u16::MAX));
-                if row_y < inner_area.bottom() && inner_area.width > 0 {
-                    self.app
-                        .viewport
-                        .last_slash_menu_hitboxes
-                        .borrow_mut()
-                        .push((idx, Rect::new(inner_area.x, row_y, inner_area.width, 1)));
-                }
-
-                if name_was_truncated || description_was_truncated {
-                    let full_text = if entry.description.trim().is_empty() {
-                        display_name
-                    } else {
-                        format!("{display_name}  {}", entry.description)
-                    };
-                    if row_y < inner_area.bottom() {
-                        crate::tui::hover_layer::register_rect(
-                            crate::tui::hover_hit::HoverTargetKind::TruncatedText,
-                            Rect::new(inner_area.x, row_y, inner_area.width, 1),
-                            full_text,
-                            false,
-                        );
-                    }
-                }
-            }
+                .collect();
         }
-
-        let paragraph = Paragraph::new(lines)
-            .style(background)
-            .wrap(Wrap { trim: false });
-        paragraph.render(inner_area, buf);
-
-        // The prompt is a persistent focus anchor, not empty-state chrome.
-        // Rendering it on every input row keeps the first character from
-        // causing a visible leftward jump.
-        if let Some(prompt_x) = content_geometry.prompt_x()
-            && let Some((cursor_x, cursor_y)) = self.cursor_pos(area)
-        {
-            debug_assert!(cursor_x >= content_geometry.text_area.x);
-            buf[(prompt_x, cursor_y)]
-                .set_symbol("❯")
-                .set_style(Style::default().fg(self.app.ui_theme.accent_primary));
+        let background = Style::default().bg(self.app.ui_theme.composer_bg);
+        let can_submit = self.app.composer_draft_is_submittable();
+        let role = if can_submit {
+            palette::ChromeInk::Info
+        } else {
+            palette::ChromeInk::MetadataDim
+        };
+        let submit = palette::chrome_style(&self.app.ui_theme, role);
+        NativeComposerFrame {
+            text: Cow::Borrowed(input),
+            cursor: self.app.composer_display_cursor(),
+            selection: self.app.selection_range(),
+            placeholder,
+            enclosed: self.wants_enclosed_panel(),
+            density: composer_native_density(self.app.composer_density),
+            history_search: history,
+            focused: true,
+            can_submit,
+            ascii: crate::tui::color_compat::ascii_safe_enabled(),
+            top_title,
+            top_right,
+            hint,
+            quiet_hint: if input.trim().is_empty() {
+                None
+            } else {
+                composer_submit_hint(self.app).map(|hint| {
+                    Line::styled(format!(" {} ", hint.text), Style::default().fg(hint.color))
+                })
+            },
+            menu,
+            styles: NativeComposerStyles {
+                background,
+                border: Style::default().fg(self.focus_color()),
+                quiet_border: Style::default().fg(self.app.ui_theme.border),
+                text: Style::default().fg(palette::TEXT_PRIMARY),
+                selection: Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(self.app.ui_theme.selection_bg),
+                prompt: Style::default().fg(self.app.ui_theme.accent_primary),
+                submit: if can_submit { submit.bold() } else { submit },
+            },
         }
+    }
 
-        // Restore the shared `[↵]` after caller-owned input so a long draft
-        // cannot erase the one cell target the mouse handler also uses.
-        if has_panel {
-            crate::tui::composer_chrome::render_tideline_composer_submit(
-                area,
-                buf,
-                &self.app.ui_theme,
-                // Display state, not key-routing state: the paste-burst
-                // window reopens on every fast keystroke, so drawing from
-                // `composer_enter_would_submit` strobed the chip while
-                // typing (#6397).
-                self.app.composer_draft_is_submittable(),
-                crate::tui::color_compat::ascii_safe_enabled(),
+    #[cfg(test)]
+    pub(crate) fn plan(&self, area: Rect) -> codewhale_ratatui::NativeComposerPlan {
+        self.frame().plan(area)
+    }
+
+    /// Publish pointer targets from the same plan that actually painted.
+    pub(crate) fn render_plan(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+    ) -> codewhale_ratatui::NativeComposerPlan {
+        let plan = self.frame().render(area, buf);
+        *self.app.viewport.last_slash_menu_hitboxes.borrow_mut() = plan.menu_rects.clone();
+        for (rect, label) in &plan.truncated {
+            crate::tui::hover_layer::register_rect(
+                crate::tui::hover_hit::HoverTargetKind::TruncatedText,
+                *rect,
+                label.clone(),
+                false,
             );
         }
+        plan
     }
+}
 
+impl Renderable for ComposerWidget<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_plan(area, buf);
+    }
     fn desired_height(&self, width: u16) -> u16 {
-        composer_height(
-            self.app.composer_display_input(),
-            width,
-            self.max_height.min(self.max_height_cap()),
-            self.active_menu_reserved_rows(),
-            self.app.composer_density,
-            self.wants_enclosed_panel(),
-        )
+        self.frame()
+            .desired_height(width, self.max_height.min(self.max_height_cap()))
     }
-
+    #[cfg(test)]
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        let inner_area = self.inner_area(area);
-        let input_text = self.app.composer_display_input();
-        let input_cursor = self.app.composer_display_cursor();
-        let content_geometry =
-            composer_content_geometry(inner_area, self.app.is_history_search_active());
-        let input_content_width = content_geometry.text_width();
-        // Match the render path's locked-budget calculation so the cursor
-        // lands on the same row the input is drawn on.
-        let input_rows_budget =
-            composer_input_rows_budget(inner_area.height, self.active_menu_reserved_rows());
-
-        let (visible_lines, cursor_row, cursor_col) = layout_input(
-            input_text,
-            input_cursor,
-            input_content_width,
-            input_rows_budget,
-        );
-        let visual_rows = if input_text.is_empty() {
-            let hint: Option<Cow<'_, str>> = if let Some(ref suggestion) =
-                self.app.prompt_suggestion
-                && !self.app.is_history_search_active()
-            {
-                Some(Cow::Borrowed(suggestion.as_str()))
-            } else {
-                Some(composer_empty_hint_text(self.app))
-            };
-            empty_composer_visual_rows(hint.as_deref(), input_content_width, input_rows_budget)
-        } else {
-            visible_lines.len()
-        };
-        let top_padding = composer_top_padding(visual_rows, input_rows_budget);
-
-        let cursor_x = content_geometry
-            .text_area
-            .x
-            .saturating_add(u16::try_from(cursor_col).unwrap_or(u16::MAX));
-        let cursor_y = inner_area
-            .y
-            .saturating_add(u16::try_from(top_padding + cursor_row).unwrap_or(u16::MAX));
-        if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
-            Some((cursor_x, cursor_y))
-        } else {
-            None
-        }
+        self.plan(area).cursor.map(|pos| (pos.x, pos.y))
     }
 }
 
@@ -3296,7 +2815,13 @@ fn apply_selection(lines: &mut [Line<'static>], top: usize, app: &App) {
             continue;
         }
 
-        line.spans = apply_selection_to_line(line, col_start, col_end, selection_style);
+        line.spans = codewhale_ratatui::transcript_selected_spans_measured(
+            line,
+            col_start,
+            col_end,
+            selection_style,
+            grapheme_display_width,
+        );
     }
 }
 
@@ -3334,62 +2859,20 @@ fn apply_send_flash(
     }
 }
 
+#[cfg(test)]
 fn apply_selection_to_line(
     line: &Line<'static>,
-    col_start: usize,
-    col_end: usize,
-    selection_style: Style,
+    start: usize,
+    end: usize,
+    style: Style,
 ) -> Vec<Span<'static>> {
-    let mut result = Vec::with_capacity(line.spans.len().saturating_add(2));
-    let mut current_col = 0usize;
-
-    for span in &line.spans {
-        let span_text: &str = span.content.as_ref();
-        let span_width = text_display_width(span_text);
-        let span_end = current_col.saturating_add(span_width);
-
-        if span_end <= col_start || current_col >= col_end {
-            result.push(span.clone());
-        } else if current_col >= col_start && span_end <= col_end {
-            result.push(Span::styled(
-                span.content.clone(),
-                span.style.patch(selection_style),
-            ));
-        } else {
-            let mut before = String::new();
-            let mut selected = String::new();
-            let mut after = String::new();
-            let mut grapheme_col = current_col;
-
-            for grapheme in span_text.graphemes(true) {
-                let grapheme_width = grapheme_display_width(grapheme);
-                let grapheme_start = grapheme_col;
-                let grapheme_end = grapheme_col.saturating_add(grapheme_width);
-                if grapheme_end <= col_start {
-                    before.push_str(grapheme);
-                } else if grapheme_start >= col_end {
-                    after.push_str(grapheme);
-                } else {
-                    selected.push_str(grapheme);
-                }
-                grapheme_col = grapheme_end;
-            }
-
-            if !before.is_empty() {
-                result.push(Span::styled(before, span.style));
-            }
-            if !selected.is_empty() {
-                result.push(Span::styled(selected, span.style.patch(selection_style)));
-            }
-            if !after.is_empty() {
-                result.push(Span::styled(after, span.style));
-            }
-        }
-
-        current_col = span_end;
-    }
-
-    result
+    codewhale_ratatui::transcript_selected_spans_measured(
+        line,
+        start,
+        end,
+        style,
+        grapheme_display_width,
+    )
 }
 
 /// The "fully idle" predicate: nothing in the transcript, nothing running,
@@ -3428,12 +2911,9 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     crate::tui::underwater::empty_state_lines(app, area)
 }
 
-pub fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usize {
-    usize::from(inner_height).saturating_sub(extra_lines).max(1)
-}
-
+#[cfg(test)]
 fn composer_top_padding(content_lines: usize, rows_budget: usize) -> usize {
-    crate::tui::composer_chrome::top_padding(content_lines, rows_budget)
+    codewhale_ratatui::native_composer_top_padding(content_lines, rows_budget)
 }
 
 /// Placeholder text shown when the composer input is empty.
@@ -3529,6 +3009,7 @@ pub(crate) fn composer_submit_hint(app: &App) -> Option<ComposerSubmitHint> {
     Some(ComposerSubmitHint { text, color })
 }
 
+#[cfg(test)]
 pub(crate) fn empty_composer_visual_rows(
     _hint: Option<&str>,
     _content_width: usize,
@@ -3538,9 +3019,10 @@ pub(crate) fn empty_composer_visual_rows(
 }
 
 fn composer_max_height(density: ComposerDensity) -> u16 {
-    crate::tui::composer_chrome::ComposerChrome::for_density(density, false).max_total_rows
+    composer_native_density(density).max_rows()
 }
 
+#[cfg(test)]
 fn composer_height(
     input: &str,
     area_width: u16,
@@ -3607,7 +3089,7 @@ pub(crate) fn slash_completion_hints(
     cached_skills: &[(String, String)],
     locale: codewhale_localization::Locale,
     workspace: Option<&std::path::Path>,
-    api_provider: ApiProvider,
+    api_provider: ProviderKind,
 ) -> Vec<SlashMenuEntry> {
     let model_candidates = all_catalog_models_for_provider(api_provider);
     slash_completion_hints_with_model_candidates(
@@ -3685,6 +3167,7 @@ fn command_argument_hints(trimmed_input: &str, limit: usize) -> Vec<SlashMenuEnt
     entries
 }
 
+#[cfg(test)]
 pub(crate) fn slash_completion_hints_with_model_candidates(
     input: &str,
     limit: usize,
@@ -3692,6 +3175,25 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
     locale: codewhale_localization::Locale,
     workspace: Option<&std::path::Path>,
     model_candidates: &[String],
+) -> Vec<SlashMenuEntry> {
+    slash_completion_hints_for_plugins(
+        input,
+        limit,
+        cached_skills,
+        locale,
+        workspace,
+        model_candidates,
+        None,
+    )
+}
+pub(crate) fn slash_completion_hints_for_plugins(
+    input: &str,
+    limit: usize,
+    cached_skills: &[(String, String)],
+    locale: codewhale_localization::Locale,
+    workspace: Option<&std::path::Path>,
+    model_candidates: &[String],
+    plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> Vec<SlashMenuEntry> {
     if !super::app::looks_like_slash_command_input(input) {
         return Vec::new();
@@ -3736,7 +3238,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
     // ── Phase 1: prefix (starts_with) matches ─────────────────────────
     // Highest priority — preserves existing exact-prefix completion.
     if completing_skill_arg.is_none() && completing_model_arg.is_none() {
-        commands::user_registry::with_registry_for_workspace(workspace, |registry| {
+        let load = |registry: &commands::user_registry::UserCommandRegistry| {
             let all_user_commands = registry.iter().collect::<Vec<_>>();
             let user_commands = all_user_commands
                 .iter()
@@ -3857,7 +3359,12 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                     );
                 }
             }
-        });
+        };
+        if let Some(plugins) = plugins {
+            commands::user_registry::with_registry_for_plugins(plugins, load);
+        } else {
+            commands::user_registry::with_registry_for_workspace(workspace, load);
+        }
     }
 
     // ── Skills (only after user has typed `/skill `) ──────────────────
@@ -4160,364 +3667,52 @@ fn push_command_entry(
     });
 }
 
+#[cfg(test)]
 fn layout_input(
     input: &str,
     cursor: usize,
     width: usize,
-    max_height: usize,
+    height: usize,
 ) -> (Vec<String>, usize, usize) {
-    let (visible, visible_cursor_row, visible_cursor_col, _) =
-        layout_input_with_scroll(input, cursor, width, max_height);
-    (visible, visible_cursor_row, visible_cursor_col)
+    let (lines, row, col, _) = layout_input_with_scroll(input, cursor, width, height);
+    (lines, row, col)
 }
-
+#[cfg(test)]
 pub fn layout_input_with_scroll(
     input: &str,
     cursor: usize,
     width: usize,
-    max_height: usize,
+    height: usize,
 ) -> (Vec<String>, usize, usize, usize) {
-    let mut lines = wrap_input_lines(input, width);
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    let (cursor_row, cursor_col) = cursor_row_col(input, cursor, width.max(1));
-
-    let max_height = max_height.max(1);
-    let mut start = 0usize;
-    if cursor_row >= max_height {
-        start = cursor_row + 1 - max_height;
-    }
-    if start + max_height > lines.len() {
-        start = lines.len().saturating_sub(max_height);
-    }
-    let visible = lines
-        .into_iter()
-        .skip(start)
-        .take(max_height)
-        .collect::<Vec<_>>();
-    let visible_cursor_row = cursor_row.saturating_sub(start);
-
+    let plan = codewhale_ratatui::native_composer_source_plan(input, cursor, width, height);
     (
-        visible,
-        visible_cursor_row,
-        cursor_col.min(width.saturating_sub(1)),
-        start,
+        plan.visible.into_iter().map(|(_, text)| text).collect(),
+        plan.cursor_row,
+        plan.cursor_col,
+        plan.scroll_offset,
     )
 }
-
-/// Extended version of `layout_input_with_scroll` that also returns character
-/// indices for each wrapped line. Used by ComposerWidget to avoid redundant
-/// wrapping when rendering text selections.
-fn layout_input_with_scroll_and_char_indices(
-    input: &str,
-    cursor: usize,
-    width: usize,
-    max_height: usize,
-) -> (Vec<String>, usize, usize, usize, Vec<(usize, String)>) {
-    let (all_lines, all_with_indices) = wrap_input_lines_internal(input, width);
-
-    let lines = if all_lines.is_empty() {
-        vec![String::new()]
-    } else {
-        all_lines
-    };
-
-    let (cursor_row, cursor_col) = cursor_row_col(input, cursor, width.max(1));
-
-    let max_height = max_height.max(1);
-    let mut start = 0usize;
-    if cursor_row >= max_height {
-        start = cursor_row + 1 - max_height;
-    }
-    if start + max_height > lines.len() {
-        start = lines.len().saturating_sub(max_height);
-    }
-    let visible = lines
-        .into_iter()
-        .skip(start)
-        .take(max_height)
-        .collect::<Vec<_>>();
-    let visible_cursor_row = cursor_row.saturating_sub(start);
-
-    // Also slice the char indices to match visible lines
-    let visible_with_indices = all_with_indices
-        .into_iter()
-        .skip(start)
-        .take(max_height)
-        .collect();
-
-    (
-        visible,
-        visible_cursor_row,
-        cursor_col.min(width.saturating_sub(1)),
-        start,
-        visible_with_indices,
-    )
-}
-
+#[cfg(test)]
 fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
-    // Derive the cursor's row/col from the SAME wrapped lines the renderer
-    // draws. An earlier version recomputed wrapping here with hard margin
-    // breaks while wrap_text broke on word boundaries, so the two disagreed on
-    // row count: a long paste landed one row short of its marker, and the
-    // caret drifted behind fast typing. Walking the actual wrapped lines makes
-    // a desync impossible by construction (regression introduced in ff97641b7).
-    let (_, lines_with_indices) = wrap_input_lines_internal(input, width.max(1));
-    cursor_row_col_in_lines(&lines_with_indices, cursor)
+    codewhale_ratatui::native_composer_source_cursor(
+        &codewhale_ratatui::native_composer_source_rows(input, width.max(1)),
+        cursor,
+    )
 }
-
-/// Map a char-index cursor onto wrapped lines tagged with their starting char
-/// index, as produced by wrap_input_lines_internal. The row is the line whose
-/// char range contains the cursor; the column is the display width of that
-/// line up to the cursor. Because wrap_text emits a trailing empty line when a
-/// line fills exactly to the width, a cursor at the end of a full line lands
-/// on that empty line (row+1, col 0), the display convention callers rely on,
-/// without any special case here.
-fn cursor_row_col_in_lines(
-    lines_with_indices: &[(usize, String)],
-    cursor: usize,
-) -> (usize, usize) {
-    let mut row = 0usize;
-    let mut line_start = 0usize;
-    let mut line: &str = "";
-    let mut found = false;
-    for (i, (start, l)) in lines_with_indices.iter().enumerate() {
-        if *start <= cursor {
-            row = i;
-            line_start = *start;
-            line = l.as_str();
-            found = true;
-        } else {
-            break;
-        }
-    }
-    if !found {
-        return (0, 0);
-    }
-    let offset = cursor.saturating_sub(line_start);
-    let byte_end = line
-        .char_indices()
-        .nth(offset)
-        .map(|(b, _)| b)
-        .unwrap_or(line.len());
-    let col = visible_str_width(&line[..byte_end]);
-    (row, col)
-}
-
-/// Internal helper that returns both wrapped lines and character indices.
-/// Used by `wrap_input_lines`, `wrap_input_lines_for_mouse`, and
-/// `layout_input_with_scroll` to avoid redundant wrapping computations.
-fn wrap_input_lines_internal(input: &str, width: usize) -> (Vec<String>, Vec<(usize, String)>) {
-    let mut lines = Vec::new();
-    let mut lines_with_indices = Vec::new();
-    let mut char_idx = 0usize;
-
-    if input.is_empty() {
-        lines_with_indices.push((0, String::new()));
-        return (lines, lines_with_indices);
-    }
-
-    for raw_line in input.split('\n') {
-        if raw_line.is_empty() {
-            lines.push(String::new());
-            if width != 0 {
-                lines_with_indices.push((char_idx, String::new()));
-            }
-            char_idx += 1; // the '\n'
-            continue;
-        }
-
-        let wrapped = wrap_text(raw_line, width);
-        if wrapped.is_empty() {
-            lines.push(String::new());
-            if width != 0 {
-                lines_with_indices.push((char_idx, String::new()));
-            }
-        } else {
-            for wrapped_line in &wrapped {
-                let line_char_len: usize = wrapped_line.chars().count();
-                lines.push(wrapped_line.clone());
-                if width != 0 {
-                    lines_with_indices.push((char_idx, wrapped_line.clone()));
-                }
-                char_idx += line_char_len;
-            }
-        }
-        char_idx += 1; // the '\n'
-    }
-
-    (lines, lines_with_indices)
-}
-
+#[cfg(test)]
 fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
-    let (lines, _) = wrap_input_lines_internal(input, width);
-    lines
-}
-
-/// For mouse coordinate mapping: returns (char_start_of_line, line_text) pairs
-/// matching the wrapping produced by `wrap_input_lines`.
-pub fn wrap_input_lines_for_mouse(input: &str, width: usize) -> Vec<(usize, String)> {
-    if input.is_empty() || width == 0 {
-        return vec![(0, String::new())];
-    }
-
-    let (_, lines_with_indices) = wrap_input_lines_internal(input, width);
-    lines_with_indices
-}
-
-/// Wrap composer text to `width` display columns, breaking at word boundaries
-/// where one is available.
-///
-/// This used to break strictly on the grapheme that crossed the margin, so a
-/// wrapped sentence split mid-word — `…Write the file onl` / `y after the…`.
-/// The text was never lost, but a line ending in a severed word reads exactly
-/// like content that was cut off, which is what it was reported as.
-///
-/// Two invariants the callers depend on and this must not break:
-///
-/// * **Nothing is added or removed.** Concatenating the returned lines
-///   reproduces `text` exactly. `wrap_input_lines_internal` walks the wrapped
-///   lines accumulating `chars().count()` to map cursor and mouse positions
-///   back into the raw buffer, so a dropped break character would silently
-///   desynchronise the caret. The space a line breaks on therefore stays at
-///   the end of the preceding line rather than being swallowed.
-/// * **Every line fits.** A word longer than `width` — a URL, a path, a
-///   base64 blob — has no usable break point and still breaks hard.
-///
-/// Display width as painted: ratatui strips control characters, so they
-/// occupy no cells. Non-control graphemes keep plain unicode width, matching
-/// the long-standing wrap/click/caret contract.
-pub(crate) fn visible_grapheme_width(grapheme: &str) -> usize {
-    if grapheme.chars().any(|c| c.is_control()) {
-        0
+    if input.is_empty() {
+        Vec::new()
     } else {
-        grapheme.width()
+        codewhale_ratatui::native_composer_source_rows(input, width.max(1))
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
     }
 }
-
-/// Plain unicode width with painted control handling: strip control
-/// graphemes first so emoji and wide-glyph measurement keeps the exact
-/// [`UnicodeWidthStr`] semantics on the remainder.
-fn visible_str_width(text: &str) -> usize {
-    text.graphemes(true)
-        .filter(|grapheme| !grapheme.chars().any(|c| c.is_control()))
-        .collect::<String>()
-        .width()
-}
-
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0;
-    // Byte offset in `current` just past the most recent space, and the
-    // display width up to that point. `None` while the line holds no usable
-    // break point — a leading space is not one, since breaking there would
-    // emit an empty line and make no progress.
-    let mut break_at: Option<(usize, usize)> = None;
-
-    // Flush `current` up to its break point (if any), carrying the remainder
-    // onto the next line.
-    macro_rules! flush {
-        () => {{
-            match break_at.take() {
-                Some((byte, _)) if byte < current.len() => {
-                    let remainder = current.split_off(byte);
-                    lines.push(std::mem::replace(&mut current, remainder));
-                    current_width = visible_str_width(&current);
-                }
-                _ => {
-                    lines.push(std::mem::take(&mut current));
-                    current_width = 0;
-                }
-            }
-        }};
-    }
-
-    for grapheme in text.graphemes(true) {
-        if grapheme == "\n" {
-            break_at = None;
-            lines.push(std::mem::take(&mut current));
-            current_width = 0;
-            continue;
-        }
-
-        let grapheme_width = visible_grapheme_width(grapheme);
-        if current_width + grapheme_width > width && current_width != 0 {
-            flush!();
-        }
-
-        current.push_str(grapheme);
-        current_width += grapheme_width;
-        if grapheme == " " && !current.trim_start().is_empty() {
-            break_at = Some((current.len(), current_width));
-        }
-
-        if current_width >= width {
-            flush!();
-        }
-    }
-
-    lines.push(current);
-    lines
-}
-
-fn line_spans_with_selection<'a>(
-    line: &'a str,
-    line_start: usize,
-    line_end: usize,
-    sel_start: usize,
-    sel_end: usize,
-    highlight_bg: Color,
-) -> Vec<Span<'a>> {
-    let normal_style = Style::default().fg(palette::TEXT_PRIMARY);
-    let sel_style = Style::default().fg(palette::TEXT_PRIMARY).bg(highlight_bg);
-
-    // No overlap between this line and the selection
-    if line_end <= sel_start || line_start >= sel_end {
-        return vec![Span::styled(line, normal_style)];
-    }
-
-    let local_sel_start = sel_start.saturating_sub(line_start);
-    let local_sel_end = sel_end.min(line_end).saturating_sub(line_start);
-
-    // Build a Vec of byte offsets for each char boundary, plus one past the end.
-    let mut byte_offsets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
-    byte_offsets.push(line.len());
-
-    let b0 = byte_offsets
-        .get(local_sel_start)
-        .copied()
-        .unwrap_or(line.len());
-    let b1 = byte_offsets
-        .get(local_sel_end)
-        .copied()
-        .unwrap_or(line.len());
-
-    let mut spans = Vec::with_capacity(3);
-
-    // Text before selection
-    if b0 > 0 {
-        spans.push(Span::styled(&line[..b0], normal_style));
-    }
-    // Selected text
-    if b1 > b0 {
-        spans.push(Span::styled(&line[b0..b1], sel_style));
-    }
-    // Text after selection
-    if b1 < line.len() {
-        spans.push(Span::styled(&line[b1..], normal_style));
-    }
-
-    spans
-}
+#[cfg(test)]
+pub use codewhale_ratatui::native_composer_source_rows as wrap_input_lines_for_mouse;
+use codewhale_ratatui::native_composer_wrap_text as wrap_text;
 
 #[cfg(test)]
 mod tests {
@@ -4531,10 +3726,10 @@ mod tests {
         enclosed_composer_panel_fits, fish_flee_offset, fish_heading, fish_mark,
         history_entry_revision, layout_input, layout_input_with_scroll, placeholder_visual_lines,
         push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
-        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
-        wrap_input_lines_for_mouse, wrap_text,
+        slash_completion_hints, test_native_ocean_caps, tool_run_summary_revision,
+        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tui::active_cell::ActiveCell;
     use crate::tui::app::{
         App, ComposerDensity, QueuedMessage, TaskPanelEntry, TaskPanelEntryKind, ToolCollapseMode,
@@ -4573,6 +3768,7 @@ mod tests {
         // and caustics intentional rather than coupled to that choice.
         app.theme_id = codewhale_palette::ThemeId::Underwater;
         app.ui_theme = palette::UNDERWATER_UI_THEME;
+        app.viewport.ocean_caps = Some(test_native_ocean_caps());
         app
     }
 
@@ -4829,6 +4025,7 @@ mod tests {
         let mut app = create_test_app();
         app.theme_id = codewhale_palette::ThemeId::Underwater;
         app.ui_theme = palette::UNDERWATER_UI_THEME;
+        app.viewport.ocean_caps = Some(test_native_ocean_caps());
         app.add_message(HistoryCell::User {
             content: "run the check".to_string(),
         });
@@ -5418,7 +4615,7 @@ mod tests {
 
     #[test]
     fn bare_slash_menu_leads_with_the_small_set_and_reaches_the_long_tail() {
-        let hints = slash_completion_hints("/", 512, &[], Locale::En, None, ApiProvider::Deepseek);
+        let hints = slash_completion_hints("/", 512, &[], Locale::En, None, ProviderKind::Deepseek);
         let names: Vec<&str> = hints.iter().map(|hint| hint.name.as_str()).collect();
         assert_eq!(
             names.iter().take(6).copied().collect::<Vec<_>>(),
@@ -5432,22 +4629,22 @@ mod tests {
             "the long tail follows the starting set: {names:?}"
         );
         assert!(
-            slash_completion_hints("/wor", 128, &[], Locale::En, None, ApiProvider::Deepseek)
+            slash_completion_hints("/wor", 128, &[], Locale::En, None, ProviderKind::Deepseek)
                 .iter()
                 .any(|hint| hint.name == "/workflow")
         );
         assert!(
-            slash_completion_hints("/conf", 128, &[], Locale::En, None, ApiProvider::Deepseek)
+            slash_completion_hints("/conf", 128, &[], Locale::En, None, ProviderKind::Deepseek)
                 .iter()
                 .any(|hint| hint.name == "/config")
         );
         assert!(
-            slash_completion_hints("/age", 128, &[], Locale::En, None, ApiProvider::Deepseek)
+            slash_completion_hints("/age", 128, &[], Locale::En, None, ProviderKind::Deepseek)
                 .iter()
                 .any(|hint| hint.name == "/subagents")
         );
         assert!(
-            slash_completion_hints("/comp", 128, &[], Locale::En, None, ApiProvider::Deepseek)
+            slash_completion_hints("/comp", 128, &[], Locale::En, None, ProviderKind::Deepseek)
                 .iter()
                 .any(|hint| hint.name == "/compact")
         );
@@ -5459,7 +4656,8 @@ mod tests {
         // `qingping` only matches by prefix). Before #1811 the entries were
         // sorted alphabetically, so `/clear` shadowed `/exit` even though
         // the user typed the exact alias for `/exit`.
-        let hints = slash_completion_hints("/q", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let hints =
+            slash_completion_hints("/q", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         let names: Vec<&str> = hints.iter().map(|h| h.name.as_str()).collect();
         let exit_pos = names
             .iter()
@@ -5480,7 +4678,8 @@ mod tests {
         // Typing `/p` matches `/clear` via alias `qingping`, so the label
         // shows `/clear or /qingping`. The description must not also append
         // `(aliases: /qingping)` (#3990).
-        let hints = slash_completion_hints("/p", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let hints =
+            slash_completion_hints("/p", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         let clear = hints
             .iter()
             .find(|h| h.name == "/clear")
@@ -5508,7 +4707,7 @@ mod tests {
         // should still be able to find all of them." The curated six stay at
         // the head; the rest follow instead of being filtered away, and the
         // popup scrolls around the selection to reach them.
-        let hints = slash_completion_hints("/", 512, &[], Locale::En, None, ApiProvider::Deepseek);
+        let hints = slash_completion_hints("/", 512, &[], Locale::En, None, ProviderKind::Deepseek);
         let names: Vec<String> = hints.iter().map(|h| h.name.clone()).collect();
 
         let head: Vec<String> = crate::commands::traits::BARE_SLASH_DISCOVERY_COMMANDS
@@ -5537,7 +4736,7 @@ mod tests {
         // Within the same rank tier (no exact-alias match), entries fall
         // back to alphabetical name order, same as the prior behavior.
         let hints =
-            slash_completion_hints("/co", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/co", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         let names: Vec<&str> = hints
             .iter()
             .map(|h| h.name.as_str())
@@ -5556,14 +4755,14 @@ mod tests {
 
     #[test]
     fn slash_completion_hints_exclude_set_and_deepseek_commands() {
-        let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert!(!hints.iter().any(|hint| hint.name == "/set"));
         assert!(!hints.iter().any(|hint| hint.name == "/codewhale"));
     }
 
     #[test]
     fn slash_completion_hints_rank_toolbox_commands_below_the_starting_set() {
-        let root = slash_completion_hints("/", 512, &[], Locale::En, None, ApiProvider::Deepseek);
+        let root = slash_completion_hints("/", 512, &[], Locale::En, None, ProviderKind::Deepseek);
         let position = |name: &str| root.iter().position(|hint| hint.name == name);
         // The task-oriented set leads; the toolbox is reachable behind it
         // rather than hidden until guessed at.
@@ -5587,19 +4786,25 @@ mod tests {
         assert!(position("/subagents").is_none());
         assert!(position("/agents").is_some());
 
-        let rlm = slash_completion_hints("/rl", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let rlm = slash_completion_hints("/rl", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert!(rlm.iter().any(|hint| hint.name == "/rlm"));
 
-        let modeldb =
-            slash_completion_hints("/modeld", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let modeldb = slash_completion_hints(
+            "/modeld",
+            128,
+            &[],
+            Locale::En,
+            None,
+            ProviderKind::Deepseek,
+        );
         assert!(modeldb.iter().any(|hint| hint.name == "/modeldb"));
 
         let plugin =
-            slash_completion_hints("/pl", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/pl", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert!(plugin.iter().any(|hint| hint.name == "/plugin"));
 
         let subagents =
-            slash_completion_hints("/sub", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/sub", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert!(subagents.iter().any(|hint| hint.name == "/subagents"));
     }
 
@@ -5621,7 +4826,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         let entry = hints
             .iter()
@@ -5648,7 +4853,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         let entry = hints
             .iter()
@@ -5675,7 +4880,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         let entry = hints
             .iter()
@@ -5704,7 +4909,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         let entry = hints
             .iter()
@@ -5724,7 +4929,7 @@ mod tests {
             &[],
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         let head = hints.first().expect("usage row");
@@ -5742,7 +4947,7 @@ mod tests {
     #[test]
     fn a_command_alias_states_the_canonical_usage() {
         let hints =
-            slash_completion_hints("/cwd ", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/cwd ", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert_eq!(hints[0].name, "/workspace");
         assert_eq!(hints[0].description, "/workspace [path|worktrees]");
     }
@@ -5757,7 +4962,7 @@ mod tests {
             &[],
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert_eq!(
             hints
@@ -5773,7 +4978,7 @@ mod tests {
             &[],
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert!(
             none.is_empty(),
@@ -5787,7 +4992,7 @@ mod tests {
     #[test]
     fn a_command_that_takes_no_arguments_still_closes_the_menu() {
         let hints =
-            slash_completion_hints("/copy ", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/copy ", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert!(hints.is_empty());
     }
 
@@ -5800,7 +5005,7 @@ mod tests {
                 &[],
                 Locale::En,
                 None,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
             )
             .is_empty()
         );
@@ -5811,7 +5016,7 @@ mod tests {
                 &[],
                 Locale::En,
                 None,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
             )
             .is_empty()
         );
@@ -5828,7 +5033,7 @@ mod tests {
             &skills,
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert!(hints.iter().any(|hint| hint.name == "/skill codereview"));
         assert!(hints.iter().all(|hint| hint.name != "/skill"));
@@ -5852,7 +5057,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         assert!(!hints.iter().any(|hint| hint.name == "/secret"));
@@ -5876,7 +5081,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         assert!(!hints.iter().any(|hint| hint.name == "/help"));
@@ -5900,7 +5105,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         let entry = hints
             .iter()
@@ -5914,7 +5119,7 @@ mod tests {
     #[test]
     fn slash_completion_offers_no_retired_pod_entry() {
         let hints =
-            slash_completion_hints("/pod", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/pod", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         assert!(
             !hints.iter().any(|hint| hint.name == "/pod"),
             "the retired /pod spelling must not complete"
@@ -5950,7 +5155,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         assert!(hints.iter().any(|hint| hint.name == "/beta"));
@@ -5978,7 +5183,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         let attach = canonical_hints
@@ -5998,7 +5203,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         assert!(
@@ -6032,7 +5237,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
 
         assert!(
@@ -6063,7 +5268,7 @@ mod tests {
             &[],
             Locale::En,
             Some(tmp.path()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         let help_entries: Vec<_> = hints.iter().filter(|hint| hint.name == "/help").collect();
 
@@ -6106,7 +5311,7 @@ mod tests {
             &cached_skills,
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         // Individual skills stay out of the root: they are user content with
         // their own triggers (`$name`, `/skill`) and there can be hundreds.
@@ -6128,7 +5333,7 @@ mod tests {
             &cached_skills,
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert!(!hints.iter().any(|hint| hint.name == "/skill search-files"));
         assert!(!hints.iter().any(|hint| hint.name == "/skill my-review"));
@@ -6146,7 +5351,7 @@ mod tests {
             &cached_skills,
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert_eq!(hints.len(), 2);
         assert!(hints.iter().any(|hint| hint.name == "/skill search-files"));
@@ -6166,7 +5371,7 @@ mod tests {
             &cached_skills,
             Locale::En,
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].name, "/skill my-review");
@@ -6176,7 +5381,7 @@ mod tests {
     #[test]
     fn slash_completion_hints_model_deepseek_provider_uses_bare_ids() {
         let hints =
-            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+            slash_completion_hints("/model", 128, &[], Locale::En, None, ProviderKind::Deepseek);
         let names = hints
             .iter()
             .map(|hint| hint.name.as_str())
@@ -6190,8 +5395,14 @@ mod tests {
 
     #[test]
     fn slash_completion_hints_model_provider_uses_provider_specific_ids() {
-        let hints =
-            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::NvidiaNim);
+        let hints = slash_completion_hints(
+            "/model",
+            128,
+            &[],
+            Locale::En,
+            None,
+            ProviderKind::NvidiaNim,
+        );
         let names = hints
             .iter()
             .map(|hint| hint.name.as_str())
@@ -6204,7 +5415,7 @@ mod tests {
     #[test]
     fn slash_completion_hints_model_ollama_has_no_static_remote_models() {
         let hints =
-            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::Ollama);
+            slash_completion_hints("/model", 128, &[], Locale::En, None, ProviderKind::Ollama);
         let names = hints
             .iter()
             .map(|hint| hint.name.as_str())
@@ -7424,6 +6635,7 @@ mod tests {
         // non-underwater choice from the process.
         app.theme_id = codewhale_palette::ThemeId::Underwater;
         app.ui_theme = palette::UNDERWATER_UI_THEME;
+        app.viewport.ocean_caps = Some(test_native_ocean_caps());
         app.low_motion = false;
         app.fancy_animations = true;
         app.workspace = PathBuf::from("codewhale-test-workspace");
@@ -7533,6 +6745,7 @@ mod tests {
         let custom = Color::Rgb(0x1a, 0x1b, 0x26);
         app.theme_id = codewhale_palette::ThemeId::Underwater;
         app.ui_theme = palette::UNDERWATER_UI_THEME.with_background_color(custom);
+        app.viewport.ocean_caps = Some(test_native_ocean_caps());
 
         let area = Rect::new(0, 0, 100, 30);
         let mut buf = Buffer::empty(area);
@@ -7643,6 +6856,7 @@ mod tests {
         let mut app = create_test_app();
         app.theme_id = codewhale_palette::ThemeId::Underwater;
         app.ui_theme = palette::UNDERWATER_UI_THEME;
+        app.viewport.ocean_caps = Some(test_native_ocean_caps());
         app.low_motion = true;
         app.fancy_animations = true;
         let area = Rect::new(0, 0, 100, 20);
@@ -7659,6 +6873,26 @@ mod tests {
         assert_eq!(first[(11, 14)].symbol(), second[(11, 14)].symbol());
     }
 
+    /// Rendered line metadata for pin tests: `(cell_index, line_in_cell)`.
+    fn pin_meta(entries: &[(usize, usize)]) -> Vec<TranscriptLineMeta> {
+        entries
+            .iter()
+            .map(|(cell_index, line_in_cell)| TranscriptLineMeta::CellLine {
+                cell_index: *cell_index,
+                line_in_cell: *line_in_cell,
+                copy_prefix_width: 0,
+                copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
+            })
+            .collect()
+    }
+
+    fn pin_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn pin_helper_returns_header_when_user_line_is_above_viewport() {
         let history = vec![
@@ -7670,28 +6904,16 @@ mod tests {
                 streaming: false,
             },
         ];
-        let meta = vec![
-            TranscriptLineMeta::CellLine {
-                cell_index: 0,
-                line_in_cell: 0,
-                copy_prefix_width: 0,
-                copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
-            },
-            TranscriptLineMeta::CellLine {
-                cell_index: 1,
-                line_in_cell: 0,
-                copy_prefix_width: 0,
-                copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
-            },
-        ];
+        let meta = pin_meta(&[(0, 0), (1, 0)]);
         let map = vec![0, 1];
-        let pin = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
             .expect("scrolled user prompt should yield a pinned header");
-        let text: String = pin.spans.iter().map(|span| span.content.as_ref()).collect();
+        let text = pin_text(&pin);
         assert!(
             text.contains("remember this prompt"),
             "expected pinned user text, got {text:?}"
         );
+        assert_eq!(message, 0, "the pin must name the user message it heads");
     }
 
     #[test]
@@ -7699,14 +6921,193 @@ mod tests {
         let history = vec![HistoryCell::User {
             content: "still on screen".into(),
         }];
-        let meta = vec![TranscriptLineMeta::CellLine {
-            cell_index: 0,
-            line_in_cell: 0,
-            copy_prefix_width: 0,
-            copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
-        }];
+        let meta = pin_meta(&[(0, 0)]);
         let map = vec![0];
         assert!(super::scrolled_user_prompt_pin(&history, &meta, &map, 0, 40).is_none());
+    }
+
+    /// Scrolling up a turn keeps the header alive: it re-pins to the previous
+    /// turn's prompt instead of dropping out once the newest prompt leaves the
+    /// viewport.
+    #[test]
+    fn pin_helper_follows_the_viewport_up_to_the_previous_turn() {
+        let history = vec![
+            HistoryCell::User {
+                content: "first prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "a1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "a2".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "a3".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "second prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "b1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "b2".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "b3".into(),
+                streaming: false,
+            },
+        ];
+        let meta = pin_meta(&[
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (5, 0),
+            (6, 0),
+            (7, 0),
+        ]);
+        let map: Vec<usize> = (0..8).collect();
+
+        // Viewport over the newest replies: the newest prompt owns the top.
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 5, 40)
+            .expect("newest prompt pins while its line is above the viewport");
+        assert!(pin_text(&pin).contains("second prompt"));
+        assert_eq!(message, 4, "the second prompt is history cell 4");
+
+        // Viewport scrolled up past the newest prompt: the header re-pins to
+        // the previous turn instead of disappearing.
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
+            .expect("a turn above the viewport must keep a pinned header");
+        assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(message, 0);
+    }
+
+    /// The scan keys off a message's *first* rendered line and the filtered→
+    /// original cell mapping: a later line of a multi-line prompt must not
+    /// stand in for the message start, and filtered indices must resolve to
+    /// the original cell.
+    #[test]
+    fn pin_helper_uses_first_rendered_line_and_resolves_filtered_cells() {
+        let history = vec![
+            HistoryCell::Assistant {
+                content: "collapsed away".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "wrapped prompt line one\nline two".into(),
+            },
+            HistoryCell::Assistant {
+                content: "c1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "c2".into(),
+                streaming: false,
+            },
+        ];
+        // Original cell 0 is collapsed away, so the rendered (filtered) index
+        // 0 maps back to original 1 — the user message — across its two
+        // lines.
+        let meta = pin_meta(&[(0, 0), (0, 1), (1, 0), (2, 0)]);
+        let map = vec![1, 2, 3];
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 3, 40)
+            .expect("multi-line prompt pins at its first rendered line");
+        assert!(pin_text(&pin).contains("wrapped prompt line one"));
+        assert!(
+            !pin_text(&pin).contains("line two"),
+            "the pin must show the first line, not a body line"
+        );
+        assert_eq!(
+            message, 1,
+            "the pin names the user message, resolved through the filtered map"
+        );
+    }
+
+    /// A prompt whose first line is blank cannot head the header, and it must
+    /// not suppress an older message that can: the header keeps handing over
+    /// instead of dropping out (SpikeBot 003 review follow-up).
+    #[test]
+    fn pin_helper_skips_blank_first_line_prompts_and_keeps_handing_over() {
+        let history = vec![
+            HistoryCell::User {
+                content: "older prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "a1".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "\nblank first line".into(),
+            },
+            HistoryCell::Assistant {
+                content: "b1".into(),
+                streaming: false,
+            },
+        ];
+        let meta = pin_meta(&[(0, 0), (1, 0), (2, 0), (3, 0)]);
+        let map: Vec<usize> = (0..4).collect();
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 4, 40)
+            .expect("a blank-led prompt must not blank out the header");
+        assert!(pin_text(&pin).contains("older prompt"));
+        assert_eq!(message, 0);
+    }
+
+    /// The header hands over the instant a newer prompt's first line reaches
+    /// the viewport's top row: no window where it blinks out while the user
+    /// scrolls across a turn boundary.
+    #[test]
+    fn pin_helper_hands_over_the_instant_the_newer_prompt_enters() {
+        let history = vec![
+            HistoryCell::User {
+                content: "first prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "a1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "a2".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "second prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "b1".into(),
+                streaming: false,
+            },
+        ];
+        let meta = pin_meta(&[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+        let map: Vec<usize> = (0..5).collect();
+
+        // One row before the newest prompt reaches the screen: still pinned
+        // to the newest prompt (its first line sits above a viewport starting
+        // at 4).
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 4, 40)
+            .expect("the newest prompt is still pinned one row above the viewport");
+        assert!(pin_text(&pin).contains("second prompt"));
+        assert_eq!(message, 3);
+
+        // The newest prompt's first line is now the top row itself: hand over
+        // to the previous turn immediately, with no gap in between.
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 3, 40)
+            .expect("the header must hand over instead of blinking out");
+        assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(message, 0);
+
+        // Scrolling further keeps the previous turn pinned while its content
+        // fills the top of the screen.
+        let (pin, message) = super::scrolled_user_prompt_pin(&history, &meta, &map, 2, 40)
+            .expect("the previous turn stays pinned");
+        assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(message, 0);
     }
 
     #[test]
@@ -7786,6 +7187,172 @@ mod tests {
             Some(expected_cell),
             "click, drag, selection, and right-click must share the actual body geometry"
         );
+    }
+
+    /// The pinned header records its own hit box and jump target on the frame
+    /// that paints it, so a click can return to the message it names.
+    #[test]
+    fn pinned_prompt_records_its_click_target_on_the_header_row() {
+        let mut app = create_test_app();
+        app.pin_last_prompt = true;
+        app.use_mouse_capture = true;
+        app.add_message(HistoryCell::User {
+            content: "keep this goal visible".into(),
+        });
+        for index in 0..8 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("answer {index}"),
+                streaming: false,
+            });
+        }
+
+        let area = Rect::new(2, 5, 48, 5);
+        let widget = ChatWidget::new_with_ocean_elapsed(&mut app, area, 0);
+
+        assert_eq!(
+            widget.transcript_area,
+            Rect::new(2, 6, 48, 4),
+            "the header takes the first content row"
+        );
+        assert_eq!(
+            app.viewport.pinned_prompt_area,
+            Some(Rect {
+                x: 2,
+                y: 5,
+                width: 48,
+                height: 1,
+            }),
+            "the hit box must cover the painted header row"
+        );
+        assert_eq!(
+            app.viewport.pinned_prompt_message,
+            Some(0),
+            "the header must record the user message it names"
+        );
+
+        // Without mouse capture the header stays decorative: no hit box.
+        app.use_mouse_capture = false;
+        let _ = ChatWidget::new_with_ocean_elapsed(&mut app, area, 0);
+        assert!(app.viewport.pinned_prompt_area.is_none());
+    }
+
+    /// Reserving the header row must re-resolve against the final viewport:
+    /// when the newest prompt's first line is exactly the full-height top row
+    /// (a turn that fills the screen), the reserved viewport moves that line
+    /// above the body, and the header must name the newest prompt instead of
+    /// hiding it behind an older prompt's header.
+    #[test]
+    fn pin_helper_repins_against_the_reserved_viewport() {
+        let mut app = create_test_app();
+        app.pin_last_prompt = true;
+        app.use_mouse_capture = true;
+        app.add_message(HistoryCell::User {
+            content: "older prompt".into(),
+        });
+        app.add_message(HistoryCell::Assistant {
+            content: "older reply".into(),
+            streaming: false,
+        });
+        app.add_message(HistoryCell::User {
+            content: "newest prompt".into(),
+        });
+        app.add_message(HistoryCell::Assistant {
+            content: "newest reply".into(),
+            streaming: false,
+        });
+
+        // Learn the layout at a roomy height: total rendered lines and the
+        // newest prompt's first line.
+        let roomy = Rect::new(0, 0, 80, 40);
+        let _ = ChatWidget::new_with_ocean_elapsed(&mut app, roomy, 0);
+        let meta = app.viewport.transcript_cache.line_meta();
+        let newest_message = app.history.len() - 2;
+        let newest_first = meta
+            .iter()
+            .position(|meta| {
+                matches!(
+                    meta,
+                    TranscriptLineMeta::CellLine {
+                        cell_index,
+                        line_in_cell: 0,
+                        ..
+                    } if *cell_index == newest_message
+                )
+            })
+            .expect("newest prompt rendered");
+        let total = meta.len();
+        assert!(total > newest_first, "the newest turn has body lines");
+        let height = u16::try_from(total - newest_first).expect("fits");
+        assert!(height > 1, "need at least one body row under the header");
+
+        // Re-render at exactly that height so the tail viewport starts on the
+        // newest prompt's first line.
+        let tight = Rect::new(0, 0, 80, height);
+        let widget = ChatWidget::new_with_ocean_elapsed(&mut app, tight, 0);
+        let pinned_text: String = widget.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            pinned_text.contains("newest prompt"),
+            "the header must re-resolve for the reserved viewport, got {pinned_text:?}"
+        );
+    }
+
+    /// Render → click the header → the viewport lands on the named message:
+    /// the recorder and the mouse handler are exercised together, not each
+    /// half against a hand-written fixture.
+    #[test]
+    fn pinned_prompt_click_lands_on_the_named_message_end_to_end() {
+        let mut app = create_test_app();
+        app.pin_last_prompt = true;
+        app.use_mouse_capture = true;
+        app.add_message(HistoryCell::User {
+            content: "target prompt".into(),
+        });
+        for index in 0..8 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("answer {index}"),
+                streaming: false,
+            });
+        }
+        app.add_message(HistoryCell::User {
+            content: "newest prompt".into(),
+        });
+        for index in 0..8 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("latest {index}"),
+                streaming: false,
+            });
+        }
+
+        let area = Rect::new(0, 0, 60, 8);
+        let _ = ChatWidget::new_with_ocean_elapsed(&mut app, area, 0);
+        let header = app
+            .viewport
+            .pinned_prompt_area
+            .expect("header painted above the scrolled viewport");
+        let expected = app
+            .pinned_prompt_target_line()
+            .expect("the named message is rendered");
+
+        let events = crate::tui::mouse_ui::handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: header.x + 1,
+                row: header.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(events.is_empty());
+        assert_eq!(
+            app.viewport.transcript_scroll,
+            TranscriptScroll::at_line(expected)
+        );
+        assert_eq!(app.viewport.pending_scroll_delta, 0);
     }
 
     #[test]
@@ -9675,4 +9242,29 @@ diff --git a/src/b.rs b/src/b.rs\n\
             );
         }
     }
+}
+
+#[cfg(test)]
+#[path = "composer_legacy.rs"]
+mod legacy_composer;
+#[cfg(test)]
+#[path = "mounted_composer_tests.rs"]
+mod mounted_composer_tests;
+
+#[cfg(test)]
+#[path = "transcript_legacy.rs"]
+mod legacy_transcript;
+
+#[cfg(test)]
+#[path = "mounted_transcript_tests.rs"]
+mod mounted_transcript_tests;
+
+#[cfg(test)]
+fn test_native_ocean_caps() -> codewhale_ratatui::Caps {
+    crate::tui::color_compat::ColorCompatBackend::new(
+        std::io::sink(),
+        palette::ColorDepth::TrueColor,
+        palette::PaletteMode::Dark,
+    )
+    .native_ocean_caps()
 }

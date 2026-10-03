@@ -21,8 +21,8 @@ note below before upgrading.
   default: turn it on with `[features] extension_host = true`. A plugin that
   declares a `native` TypeScript or JavaScript entry (the Cordis / DeepSeek
   Harness plugin model) can contribute tools, slash commands, pre-execution
-  policy hooks, additive prompt sections and plugin-local JSON state. Skills
-  and MCP are not host services yet. Its code runs in a separate
+  policy hooks, additive prompt sections, reviewed skill roots and plugin-local
+  JSON state. Its code runs in a separate
   Node process, never inside Codewhale (Bun is an opt-in through
   `[extension_host] runtime`), and every call goes through Codewhale's own gate:
   an extension tool is never treated as read-only, so it always meets the
@@ -72,9 +72,12 @@ note below before upgrading.
 - Extension host identity is checked at startup: its reported trust tier and
   built-in module digests must match the process Rust launched. Built-in host
   code and third-party plugins have separate process and owner namespaces;
-  the built-in module table is still empty. MCP remains in Rust in 0.10.1;
-  moving it to the TypeScript host requires recorded parity and a rollout
-  release before the Rust implementation can be removed.
+  the table pins the MCP protocol module and the execution harness. The
+  optional Host MCP backend uses the official TypeScript SDK for framing,
+  with Rust retaining credentials, network/process access, approval and exact
+  operation tickets. All 30 existing recorded comparisons pass locally.
+  The Rust backend stays the default until platform and rollout gates pass;
+  its protocol adapters remain through the compatibility window.
 - A plugin can declare several `native` entries (`native.paths`, up to 64). They
   activate in order as one plugin, so one disable, review change or crash takes
   all of them down, and if one entry fails to activate, nothing from the entries
@@ -1144,9 +1147,10 @@ note below before upgrading.
 
 ### Contributors
 
-Fifteen contributors and issue reporters are credited below, including
+Sixteen contributors and issue reporters are credited below, including
 @cenab's provider report.
 
+- **[@Guan0923](https://github.com/Guan0923)** — accepted case-insensitive HTTP(S) schemes in `config doctor` without rewriting the configured URL ([#6819](https://github.com/Hmbown/Codewhale/pull/6819)).
 - **[@harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host, starting on the vendor's recommended `qwen3.8-flash` model ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
 - **[@asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving their original contributor commits ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)); made context rule and chain-segment source labels repository-relative ([#6739](https://github.com/Hmbown/Codewhale/pull/6739)).
 - **[@qiuYliangM](https://github.com/qiuYliangM)** — made provider-bound project instruction and constitution labels stable across directory moves and kept their absolute paths in operator reports ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).

@@ -66,8 +66,9 @@
 //! * One host per engine process and trust tier ([`tier`]): the plugin tier
 //!   hosts reviewed third-party plugins, the builtin tier (tier 0) is for
 //!   Codewhale's own host code and starts only for a row of
-//!   [`tier::BUILTIN_MODULES`], which is empty, so only the plugin host ever
-//!   runs. Under its OS sandbox
+//!   [`tier::BUILTIN_MODULES`]. The MCP SDK backend starts its pinned module
+//!   only when explicitly selected; plugin attachment does not start it.
+//!   Under its OS sandbox
 //!   (Seatbelt on macOS; bubblewrap on Linux when a launch-time probe shows it
 //!   works) the host has no direct network, and cannot read the Codewhale
 //!   home (except the bundle, its data dir and plugin code), the Codex and
@@ -75,9 +76,9 @@
 //!   (`supervisor::plan_launch`, whose module docs list what bubblewrap does
 //!   not cover). Other files the user can read — including project `.env`
 //!   files — stay readable, and Mach services are not restricted. On Windows,
-//!   and on Linux where bwrap is missing or cannot start, it runs unsandboxed
-//!   with the user's permissions, and `/plugin`, doctor and the start
-//!   diagnostic say why. Either way the flag is Experimental.
+//!   and on Linux where bwrap is missing or cannot start, Native launch is
+//!   refused. The pinned Builtin exception is explicitly diagnosed and still
+//!   ticket-bound. The flag remains Experimental.
 //! * The runtime (`[extension_host] runtime`) defaults to Node. Bun is an
 //!   opt-in (`bun`, or `auto`, which prefers a Bun >= 1.4.0 and uses Node
 //!   when none is found) and is qualified on macOS only. The runtime is
@@ -95,7 +96,7 @@
 //!   (`extension-host/src/runtime.ts`), for the entry points found so far; a
 //!   native-code entry point a newer runtime adds is not covered until it is
 //!   added there. A process a plugin starts is outside that policy and runs
-//!   under the same OS sandbox (none on Windows, or where bwrap fails).
+//!   under the same verified OS sandbox required for Native admission.
 //! * The owner token is a bug/staleness guard, not a boundary between
 //!   plugins that share the process: one plugin can alter another's
 //!   behaviour, which the approval card discloses.
@@ -119,8 +120,14 @@
 //!   check, not re-hashed by the host.
 
 pub(crate) mod command;
+pub(crate) mod composition_review;
+pub mod composition_scope;
 pub(crate) mod core_call;
+pub(crate) mod execution;
+pub(crate) use execution::StockOperation;
 mod hooks;
+pub(crate) mod mcp;
+pub(crate) mod native_mcp;
 pub(crate) mod plugin_config;
 pub(crate) mod prompt;
 pub(crate) mod protocol;
@@ -130,6 +137,8 @@ pub(crate) mod supervisor;
 pub(crate) mod ticket;
 pub(crate) mod tier;
 pub(crate) mod tool;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(test)]
 mod core_call_tests;
@@ -145,6 +154,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use self::protocol::{
     ActivateParams, ActivateResult, CoreRequest, DeactivateParams, DeactivateResult, EntryRef,
@@ -210,6 +220,16 @@ fn materialize_bundle(root: &Path) -> Result<PathBuf, String> {
     let dir = supervisor::bundle_dir(root, bundle_sha256());
     let bundle = materialize_file(&dir, BUNDLE_FILE_NAME, BUNDLE)?;
     materialize_file(&dir, NOTICES_FILE_NAME, NOTICES)?;
+    materialize_file(
+        &dir.join("builtin"),
+        "mcp.mjs",
+        include_bytes!("../../extension-host/dist/builtin/mcp.mjs"),
+    )?;
+    materialize_file(
+        &dir.join("builtin"),
+        "harness.mjs",
+        include_bytes!("../../extension-host/dist/builtin/harness.mjs"),
+    )?;
     Ok(bundle)
 }
 
@@ -518,6 +538,11 @@ struct Activation {
 struct AttachmentState {
     plugins: Arc<PluginRegistry>,
     desired: BTreeMap<String, String>,
+    selection: composition_scope::CompositionSelection,
+    revision: u64,
+    selection_cancel: CancellationToken,
+    session_id: Option<String>,
+    agent_id: Option<String>,
 }
 
 /// Lock order, outermost first, everywhere in this module:
@@ -536,7 +561,7 @@ struct AttachmentState {
 pub(crate) struct ManagerShared {
     options: ExtensionHostOptions,
     /// The built-in host modules this manager may start the builtin tier for:
-    /// [`tier::BUILTIN_MODULES`] (empty) in production; a test substitutes its
+    /// [`tier::BUILTIN_MODULES`] in production; a test substitutes its
     /// own through [`ExtensionHostManager::with_builtin_modules`].
     builtin_modules: &'static [BuiltinModule],
     attachments: Mutex<BTreeMap<u64, AttachmentState>>,
@@ -546,6 +571,12 @@ pub(crate) struct ManagerShared {
     /// Capability tickets and the invocations they belong to (`core/call`).
     /// A leaf lock domain: its mutexes are never held with another lock.
     core_calls: Arc<core_call::CoreCalls>,
+    engine_handle: OnceLock<tokio::runtime::Handle>,
+    execution_broker: execution::Broker,
+    harness_users: AtomicU64,
+    stock_users: AtomicU64,
+    mcp_broker: mcp::Broker,
+    mcp_users: AtomicU64,
     /// Tier 1: reviewed third-party plugins.
     plugin: TierRuntime,
     /// Tier 0: Codewhale's own host code. Starts only for a built-in module.
@@ -633,18 +664,21 @@ fn host_root(options: &ExtensionHostOptions) -> Result<PathBuf, String> {
     }
 }
 
-/// The OS sandbox the plugin host started now on `runtime` would run under,
-/// planned — and on Linux probed — exactly as a launch does (for doctor). The
-/// plugin tier is the one that runs in production. Blocking; creates the
-/// host's data dir, as a launch would.
+/// The selected tier's sandbox, planned exactly as a launch does (for doctor).
+/// Blocking; creates the host's data dir and probes bubblewrap on Linux.
 pub(crate) fn planned_sandbox(
     options: &ExtensionHostOptions,
     runtime: &crate::dependencies::HostRuntime,
+    tier: HostTier,
 ) -> Result<supervisor::HostSandbox, String> {
-    supervisor::planned_sandbox(HostTier::Plugin, runtime, &host_root(options)?)
+    supervisor::planned_sandbox(tier, runtime, &host_root(options)?)
 }
 
 impl ManagerShared {
+    pub(crate) fn engine_handle(&self) -> Result<tokio::runtime::Handle, String> {
+        self.engine_handle.get().cloned().ok_or_else(|| "enabled execution requires the Engine scheduler; no new runtime or legacy fallback is allowed".to_string())
+    }
+
     /// The supervision state of `tier`'s host.
     fn tier_runtime(&self, tier: HostTier) -> &TierRuntime {
         match tier {
@@ -654,9 +688,20 @@ impl ManagerShared {
     }
 
     async fn deactivate_owner(&self, host: &Arc<HostProcess>, owner: &OwnerRef) {
+        self.deactivate_entry(host, owner, None).await;
+    }
+    /// A failed or retired Native entry must produce the same bounded teardown
+    /// receipt as a whole owner, while its other selected entries stay live.
+    async fn deactivate_entry(
+        &self,
+        host: &Arc<HostProcess>,
+        owner: &OwnerRef,
+        entry: Option<EntryRef>,
+    ) {
         let diagnostic = match host
             .call(
                 CoreRequest::Deactivate(DeactivateParams {
+                    entry,
                     owner: owner.clone(),
                 }),
                 None,
@@ -738,7 +783,8 @@ impl ManagerShared {
         tier: HostTier,
         owner_if_live: impl FnOnce(&OwnerRegistry) -> Result<OwnerRef, String>,
     ) -> Result<Option<PluginAuthority>, String> {
-        if !activation::extension_host_policy_enabled() {
+        let native_policy = activation::extension_host_policy_enabled();
+        if tier == HostTier::Plugin && !native_policy {
             return Err(host_down(tier, &HostStatus::Disabled));
         }
         self.ready_host(tier)
@@ -746,6 +792,13 @@ impl ManagerShared {
         {
             let registry = self.registry.lock().expect("registry lock");
             let owner = owner_if_live(&registry)?;
+            // Independent Core demand admits only the exact pinned module.
+            // Script/hook jobs still require Native policy in Caller::check.
+            let core_stock =
+                owner.plugin_id == "host:harness" && self.stock_users.load(Ordering::SeqCst) > 0;
+            if !native_policy && owner.plugin_id != "host:mcp" && !core_stock {
+                return Err(host_down(tier, &HostStatus::Disabled));
+            }
             let owner_tier = registry
                 .tier_of(&owner)
                 .ok_or_else(|| "extension owner has no authority".to_string())?;
@@ -850,6 +903,15 @@ struct Events {
 
 #[async_trait]
 impl HostEvents for Events {
+    fn responded(&self) {
+        if let Some(shared) = self.shared.upgrade() {
+            // Completing a live request is evidence of recovery before its
+            // caller's post-await liveness checks. The pending ping retains
+            // its original hang deadline; this creates no new health clock.
+            set_host_health(&shared, self.tier, self.generation, false);
+        }
+    }
+
     async fn host_request(
         &self,
         request: protocol::HostRequest,
@@ -861,6 +923,19 @@ impl HostEvents for Events {
             data: None,
         };
         match request {
+            protocol::HostRequest::ExecutionRedeem(params) => {
+                let shared = self
+                    .shared
+                    .upgrade()
+                    .ok_or_else(|| refuse("extension host manager is gone"))?;
+                if self.tier != HostTier::Builtin {
+                    return Err(refuse("execution broker is builtin-only"));
+                }
+                shared
+                    .execution_broker
+                    .serve(&shared, self.generation, params, cx)
+                    .await
+            }
             protocol::HostRequest::CoreCall(params) => {
                 let Some(shared) = self.shared.upgrade() else {
                     return Err(refuse("extension host manager is gone"));
@@ -878,6 +953,15 @@ impl HostEvents for Events {
                     .serve(&shared, self.tier, self.generation, params, cx)
                     .await
             }
+            protocol::HostRequest::Register(params) if params.kind == RegisterKind::McpServer => {
+                let shared = self
+                    .shared
+                    .upgrade()
+                    .ok_or_else(|| refuse("extension host manager is gone"))?;
+                let result =
+                    native_mcp::admit(&shared, self.tier, self.generation, params, &cx).await;
+                Ok(serde_json::to_value(result).expect("registration result is JSON"))
+            }
             protocol::HostRequest::Register(params) if params.kind == RegisterKind::SkillRoot => {
                 let Some(shared) = self.shared.upgrade() else {
                     return Err(refuse("extension host manager is gone"));
@@ -885,6 +969,27 @@ impl HostEvents for Events {
                 let result =
                     skills::admit_root(&shared, self.tier, self.generation, params, &cx).await;
                 Ok(serde_json::to_value(result).expect("registration result is JSON"))
+            }
+            request @ (protocol::HostRequest::ProcLaunch(_)
+            | protocol::HostRequest::ProcRead(_)
+            | protocol::HostRequest::ProcWrite(_)
+            | protocol::HostRequest::ProcClose(_)
+            | protocol::HostRequest::NetStart(_)
+            | protocol::HostRequest::NetFetch(_)
+            | protocol::HostRequest::NetRead(_)
+            | protocol::HostRequest::NetRelease(_)
+            | protocol::HostRequest::NetClose(_)) => {
+                let shared = self
+                    .shared
+                    .upgrade()
+                    .ok_or_else(|| refuse("extension host manager is gone"))?;
+                if self.tier != HostTier::Builtin {
+                    return Err(refuse("MCP broker is builtin-only"));
+                }
+                shared
+                    .mcp_broker
+                    .serve(&shared, self.generation, request, cx)
+                    .await
             }
             other => supervisor::registry_host_request(self, other, &cx),
         }
@@ -931,7 +1036,10 @@ impl HostEvents for Events {
                     RegisterKind::Command => "command",
                     RegisterKind::Hook => "hook",
                     RegisterKind::PromptSection => "prompt section",
+                    RegisterKind::PromptTemplate => "prompt template",
                     RegisterKind::SkillRoot => "skill root",
+                    RegisterKind::ShellHook => "shell hook",
+                    RegisterKind::McpServer => "MCP server",
                 };
                 let message = format!(
                     "extension `{}` {kind} `{}` refused: {reason}",
@@ -981,6 +1089,13 @@ impl HostEvents for Events {
         }
         drop(slot);
         shared.core_calls.revoke_owner(&params.owner.plugin_id);
+        shared
+            .execution_broker
+            .revoke_owner(&params.owner.plugin_id);
+        shared.mcp_users.fetch_sub(
+            shared.mcp_broker.revoke_owner(&params.owner.plugin_id),
+            Ordering::SeqCst,
+        );
         shared.plugin_diagnostic(
             &params.owner.plugin_id,
             format!(
@@ -996,6 +1111,13 @@ impl HostEvents for Events {
         };
         // Whatever this process was asked for, nothing it held is good again.
         shared.core_calls.revoke_host(self.tier, host_generation);
+        shared
+            .execution_broker
+            .revoke_host(self.tier, host_generation);
+        shared.mcp_users.fetch_sub(
+            shared.mcp_broker.revoke_host(self.tier, host_generation),
+            Ordering::SeqCst,
+        );
         let runtime = shared.tier_runtime(self.tier);
         let retry = {
             let mut slot = runtime.host.lock().expect("host lock");
@@ -1263,7 +1385,7 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
 /// process: the plugin tier's, and the builtin tier's once a built-in module
 /// asks for it (none does yet).
 pub struct ExtensionHostManager {
-    shared: Arc<ManagerShared>,
+    pub(crate) shared: Arc<ManagerShared>,
 }
 
 impl ExtensionHostManager {
@@ -1287,6 +1409,12 @@ impl ExtensionHostManager {
                 next_attachment: AtomicU64::new(0),
                 registry: Mutex::new(OwnerRegistry::new()),
                 core_calls: Arc::default(),
+                engine_handle: OnceLock::new(),
+                execution_broker: execution::Broker::default(),
+                harness_users: AtomicU64::new(0),
+                stock_users: AtomicU64::new(0),
+                mcp_broker: mcp::Broker::default(),
+                mcp_users: AtomicU64::new(0),
                 plugin: TierRuntime::new(),
                 builtin: TierRuntime::new(),
                 sync_lock: tokio::sync::Mutex::new(()),
@@ -1296,6 +1424,11 @@ impl ExtensionHostManager {
                 plugin_configs: Mutex::new(plugin_config::PluginConfigs::default()),
             }),
         }
+    }
+
+    /// Reuse the Engine's existing runtime; structural commands may leave it unbound.
+    pub(crate) fn bind_engine_handle(&self, handle: tokio::runtime::Handle) {
+        let _ = self.shared.engine_handle.set(handle);
     }
 
     /// The plugin host's state: what `/plugin` and the error a plugin's tool
@@ -1422,18 +1555,6 @@ impl ExtensionHostManager {
             .into_iter()
             .map(|command| command.name)
             .collect()
-    }
-
-    /// The command registrations currently admitted, for tests on the commands
-    /// side that drive the real command table.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn live_command_registrations(&self) -> Vec<CommandRegistration> {
-        self.shared
-            .registry
-            .lock()
-            .expect("registry lock")
-            .live_commands()
     }
 
     #[cfg(test)]
@@ -1572,8 +1693,16 @@ impl ExtensionHostManager {
             .insert(
                 id,
                 AttachmentState {
-                    plugins,
+                    plugins: Arc::new(plugins.bind_caller(composition_scope::SelectionRevision {
+                        attachment_id: id,
+                        revision: 1,
+                    })),
                     desired: BTreeMap::new(),
+                    selection: composition_scope::CompositionSelection::default(),
+                    revision: 1,
+                    selection_cancel: CancellationToken::new(),
+                    session_id: None,
+                    agent_id: None,
                 },
             );
         command::bump_epoch();
@@ -1596,6 +1725,18 @@ impl ExtensionHostManager {
     /// Replace the snapshot of every engine attached to `plugins`'s
     /// workspace: a plugin was enabled, disabled, trusted or revoked there.
     fn refresh_workspace(&self, plugins: &Arc<PluginRegistry>) {
+        let ids: Vec<_> = self
+            .shared
+            .attachments
+            .lock()
+            .expect("attachments lock")
+            .iter()
+            .filter(|(_, state)| state.plugins.workspace() == plugins.workspace())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.shared.core_calls.revoke_attachment(id);
+        }
         for state in self
             .shared
             .attachments
@@ -1604,8 +1745,21 @@ impl ExtensionHostManager {
             .values_mut()
         {
             if state.plugins.workspace() == plugins.workspace() {
-                state.plugins = Arc::clone(plugins);
+                state.selection_cancel.cancel();
+                state.selection_cancel = CancellationToken::new();
+                state.revision += 1;
+                let view = plugins.retain_native_selection_from(state.plugins.as_ref());
+                let id = state
+                    .plugins
+                    .caller_selection()
+                    .expect("attached caller")
+                    .attachment_id;
+                state.plugins = Arc::new(view.bind_caller(composition_scope::SelectionRevision {
+                    attachment_id: id,
+                    revision: state.revision,
+                }));
                 state.desired.clear();
+                state.selection = Default::default();
             }
         }
         command::bump_epoch();
@@ -1627,9 +1781,9 @@ impl ExtensionHostManager {
             .lock()
             .expect("attachments lock")
             .get(&id)
-            .map(|state| state.desired.clone())
+            .map(|state| state.selection.clone())
             .unwrap_or_default();
-        if desired.is_empty() {
+        if desired.desired.is_empty() {
             return Vec::new();
         }
         let tools: Vec<ToolRegistration> = self
@@ -1639,7 +1793,13 @@ impl ExtensionHostManager {
             .expect("registry lock")
             .live_tools()
             .into_iter()
-            .filter(|tool| desired.get(&tool.owner.plugin_id) == Some(&tool.content_hash))
+            .filter(|tool| {
+                desired.includes(
+                    &tool.owner.plugin_id,
+                    &tool.content_hash,
+                    tool.scope.as_ref(),
+                )
+            })
             .collect();
         if tools.is_empty() {
             return Vec::new();
@@ -1650,7 +1810,17 @@ impl ExtensionHostManager {
             .map(str::to_ascii_lowercase)
             .collect();
         let mut installed = Vec::new();
+        let mut counts = BTreeMap::new();
+        for tool in &tools {
+            *counts
+                .entry(tool.name.to_ascii_lowercase())
+                .or_insert(0usize) += 1;
+        }
         for registration in tools {
+            if counts[&registration.name.to_ascii_lowercase()] != 1 {
+                self.shared.plugin_diagnostic(&registration.owner.plugin_id,format!("Native tool `{}` is ambiguous in this caller; rename the selected definitions",registration.name));
+                continue;
+            }
             if taken.contains(&registration.name.to_ascii_lowercase()) {
                 let origin = tool_registry
                     .get(&registration.name)
@@ -1663,9 +1833,10 @@ impl ExtensionHostManager {
                 continue;
             }
             installed.push(registration.name.clone());
-            tool_registry.register(Arc::new(tool::HostToolSpec::new(
+            tool_registry.register(Arc::new(tool::HostToolSpec::for_selection(
                 registration,
                 Arc::clone(&self.shared),
+                desired.revision,
             )));
         }
         installed
@@ -1703,10 +1874,11 @@ impl ExtensionHostManager {
             .live_commands()
             .into_iter()
             .filter(|command| {
-                desired.contains(&(
-                    command.owner.plugin_id.clone(),
-                    command.content_hash.clone(),
-                ))
+                command.scope.is_none()
+                    && desired.contains(&(
+                        command.owner.plugin_id.clone(),
+                        command.content_hash.clone(),
+                    ))
             })
             .filter_map(|registration| {
                 let authority = registry.authority_for(&registration.owner)?;
@@ -1714,6 +1886,48 @@ impl ExtensionHostManager {
                     registration,
                     authority,
                     workspace: workspace.to_path_buf(),
+                    selection: None,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn commands_for_plugins(
+        &self,
+        plugins: &PluginRegistry,
+    ) -> Vec<command::ExtensionCommandEntry> {
+        let Some(revision) = plugins.caller_selection() else {
+            return self.commands_for_workspace(plugins.workspace());
+        };
+        let selected = self.shared.selection(revision.attachment_id);
+        if selected.revision != Some(revision) {
+            return Vec::new();
+        }
+        let registry = self.shared.registry.lock().expect("registry lock");
+        let commands: Vec<_> = registry
+            .live_commands()
+            .into_iter()
+            .filter(|command| {
+                selected.includes(
+                    &command.owner.plugin_id,
+                    &command.content_hash,
+                    command.scope.as_ref(),
+                )
+            })
+            .collect();
+        let mut counts = BTreeMap::new();
+        for command in &commands {
+            *counts.entry(command.name.clone()).or_insert(0usize) += 1;
+        }
+        commands
+            .into_iter()
+            .filter(|command| counts[&command.name] == 1)
+            .filter_map(|registration| {
+                Some(command::ExtensionCommandEntry {
+                    authority: registry.authority_for(&registration.owner)?,
+                    registration,
+                    workspace: plugins.workspace().to_path_buf(),
+                    selection: Some(revision),
                 })
             })
             .collect()
@@ -1754,7 +1968,6 @@ impl ExtensionHostManager {
     /// `native` entries in any attached engine's snapshot: revoke what no
     /// attachment desires any more or what changed (synchronously, then ask
     /// the host to tear down), spawn the host if needed, activate the rest.
-    #[cfg(test)]
     pub async fn reconcile(&self) -> Result<(), String> {
         self.reconcile_with_policy(activation::extension_host_policy_enabled())
             .await
@@ -1849,7 +2062,10 @@ impl ExtensionHostManager {
                 // A failed or faulted activation of these exact bytes is not
                 // retried every turn; changed authority or an explicit
                 // plugin mutation/reload permits another attempt.
-                if registry.owner(&plugin_id).is_none() {
+                if registry
+                    .owner(&plugin_id)
+                    .is_none_or(|owner| owner.state == OwnerState::Active)
+                {
                     to_activate.push((plugin_id, want));
                 }
             }
@@ -1857,6 +2073,11 @@ impl ExtensionHostManager {
         let host = shared.ready_host(HostTier::Plugin).ok();
         for owner in revoked {
             shared.core_calls.revoke_owner(&owner.plugin_id);
+            shared.execution_broker.revoke_owner(&owner.plugin_id);
+            shared.mcp_users.fetch_sub(
+                shared.mcp_broker.revoke_owner(&owner.plugin_id),
+                Ordering::SeqCst,
+            );
             shared.plugin_diagnostic(
                 &owner.plugin_id,
                 format!("extension `{}` revoked", owner.plugin_id),
@@ -1896,7 +2117,12 @@ impl ExtensionHostManager {
             Ok(())
         }
         .await;
-        let builtin = if policy {
+        // MCP selection admits tier-0 demand independently of Native plugins.
+        // Harness demand still requires the captured Native policy below.
+        let builtin = if policy
+            || shared.mcp_users.load(Ordering::SeqCst) > 0
+            || shared.stock_users.load(Ordering::SeqCst) > 0
+        {
             self.reconcile_builtin(policy).await
         } else {
             Ok(())
@@ -1911,12 +2137,84 @@ impl ExtensionHostManager {
         }
     }
 
-    /// Tier 0: activate every row of the built-in module table that is not
-    /// yet an owner, starting the builtin host if there is one to activate.
-    /// With the production table (empty) this does nothing and starts
-    /// nothing. A module whose source is missing, or whose SHA-256 is not the
-    /// one the table pins, is recorded as a failed owner with the reason, and
-    /// is not retried until an explicit plugin change.
+    /// One real host consumer asks for the pinned MCP module. Rust mode never
+    /// starts tier 0. This uses the same manager, supervision and owner registry.
+    async fn ensure_mcp_builtin(
+        &self,
+    ) -> Result<(Arc<HostProcess>, protocol::OwnerRef, u64), String> {
+        self.ensure_demand_builtin("host:mcp", activation::extension_host_policy_enabled())
+            .await
+    }
+    /// Pure Core adapters demand the same pinned harness without enabling Native plugins.
+    async fn ensure_stock_builtin(
+        &self,
+    ) -> Result<(Arc<HostProcess>, protocol::OwnerRef, u64), String> {
+        self.ensure_demand_builtin("host:harness", activation::extension_host_policy_enabled())
+            .await
+    }
+    async fn ensure_harness_builtin(
+        &self,
+    ) -> Result<(Arc<HostProcess>, protocol::OwnerRef, u64), String> {
+        let native_policy = activation::extension_host_policy_enabled();
+        if !native_policy {
+            return Err(
+                "Builtin backend requires features.extension_host; no Rust fallback is allowed"
+                    .to_string(),
+            );
+        }
+        self.ensure_demand_builtin("host:harness", native_policy)
+            .await
+    }
+    async fn ensure_demand_builtin(
+        &self,
+        owner_id: &str,
+        native_policy: bool,
+    ) -> Result<(Arc<HostProcess>, protocol::OwnerRef, u64), String> {
+        let _serial = self.shared.sync_lock.lock().await;
+        let root = host_root(&self.shared.options)?;
+        materialize_bundle(&root)?;
+        // A crashed tier-0 process cannot carry its old owner into a new
+        // process. Retire only this builtin before minting a fresh generation.
+        let stale = self
+            .shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .owner(owner_id)
+            .is_some_and(|entry| entry.state != OwnerState::Active);
+        if stale {
+            self.shared.core_calls.revoke_owner(owner_id);
+            self.shared.execution_broker.revoke_owner(owner_id);
+            self.shared.mcp_users.fetch_sub(
+                self.shared.mcp_broker.revoke_owner(owner_id),
+                Ordering::SeqCst,
+            );
+            self.shared
+                .registry
+                .lock()
+                .expect("registry lock")
+                .forget_owner(owner_id);
+        }
+        // Replay the actual Native policy after a Builtin crash. MCP demand
+        // must never switch optional third-party activation on.
+        self.reconcile_builtin(native_policy).await?;
+        let host = self
+            .shared
+            .ready_host(HostTier::Builtin)
+            .map_err(|status| host_down(HostTier::Builtin, &status))?;
+        let owner = self
+            .shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .owner(owner_id)
+            .filter(|entry| entry.state == OwnerState::Active)
+            .map(|entry| entry.owner.clone())
+            .ok_or_else(|| "demanded builtin failed to activate".to_string())?;
+        let generation = self.shared.builtin.host_generation.load(Ordering::SeqCst);
+        Ok((host, owner, generation))
+    }
+
     async fn reconcile_builtin(&self, policy: bool) -> Result<(), String> {
         let shared = &self.shared;
         let wanted: Vec<&'static BuiltinModule> = {
@@ -1924,7 +2222,13 @@ impl ExtensionHostManager {
             shared
                 .builtin_modules
                 .iter()
-                .filter(|module| registry.owner(&module.owner_id()).is_none())
+                .filter(|module| {
+                    (module.id != "mcp" || shared.mcp_users.load(Ordering::SeqCst) > 0)
+                        && (module.id != "harness"
+                            || (policy && shared.harness_users.load(Ordering::SeqCst) > 0)
+                            || shared.stock_users.load(Ordering::SeqCst) > 0)
+                        && registry.owner(&module.owner_id()).is_none()
+                })
                 .collect()
         };
         if wanted.is_empty() {
@@ -2008,13 +2312,23 @@ impl ExtensionHostManager {
     async fn activate_owner(&self, host: &Arc<HostProcess>, want: Activation) {
         let shared = &self.shared;
         let plugin_id = want.owner_id.as_str();
-        let begun = shared.registry.lock().expect("registry lock").begin_owner(
-            want.tier,
-            plugin_id,
-            &want.name,
-            want.authority.clone(),
-            &want.content_hash,
-        );
+        let begun = {
+            let mut registry = shared.registry.lock().expect("registry lock");
+            if let Some(owner) = registry
+                .owner(plugin_id)
+                .filter(|entry| entry.state == OwnerState::Active)
+            {
+                Ok(owner.owner.clone())
+            } else {
+                registry.begin_owner(
+                    want.tier,
+                    plugin_id,
+                    &want.name,
+                    want.authority.clone(),
+                    &want.content_hash,
+                )
+            }
+        };
         let owner = match begun {
             Ok(owner) => owner,
             Err(reason) => {
@@ -2066,16 +2380,86 @@ impl ExtensionHostManager {
                 return;
             }
         };
+        // Retire no-longer-wanted entry handles before awaiting host disposal.
+        if want.tier == HostTier::Plugin {
+            let scopes: Vec<_> = {
+                let registry = shared.registry.lock().expect("registry lock");
+                registry
+                    .owner(plugin_id)
+                    .map(|entry| {
+                        entry
+                            .scopes
+                            .keys()
+                            .filter(|scope| {
+                                !want.entries.iter().any(|(path, hash)| {
+                                    scope.path == path.to_string_lossy() && scope.sha256 == *hash
+                                })
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for scope in scopes {
+                let handles = shared
+                    .registry
+                    .lock()
+                    .expect("registry lock")
+                    .revoke_scope(&owner, &scope);
+                shared.core_calls.revoke_scope(plugin_id, &scope);
+                shared.execution_broker.revoke_scope(plugin_id, &scope);
+                host.revoke_calls_for_handles(plugin_id, &handles);
+                shared.deactivate_entry(host, &owner, Some(scope)).await;
+            }
+        }
+        #[cfg(windows)]
+        if want.tier == HostTier::Plugin {
+            let admission = match want.authority.clone() {
+                Some(authority) => host.admit_windows_root(authority).await,
+                None => Err("Native owner has no reviewed bundle authority".into()),
+            };
+            if let Err(reason) = admission {
+                shared
+                    .registry
+                    .lock()
+                    .expect("registry lock")
+                    .mark_failed(&owner, OwnerState::Failed(reason.clone()));
+                shared.plugin_diagnostic(
+                    plugin_id,
+                    format!(
+                        "extension `{}` failed Windows admission: {reason}",
+                        want.name
+                    ),
+                );
+                shared.deactivate_owner(host, &owner).await;
+                return;
+            }
+        }
         let mut failure = None;
+        let mut native_failure = None;
         // A plugin may declare several `native` entries. Each is activated in
-        // declaration order under this one owner; every answer lists all the
-        // owner has registered so far, so the names are merged, not appended.
-        // The first entry that fails fails the owner, and the host disposes
-        // the earlier entries with it (all-or-nothing).
+        // declaration order under one owner. Each entry has an independent
+        // scope: a failing entry withdraws its own handles and cleanup, while
+        // already-active sibling entries remain usable.
         let mut tools = BTreeSet::new();
         let mut commands = BTreeSet::new();
         for (path, sha256) in &want.entries {
+            let scope = (want.tier == HostTier::Plugin).then(|| EntryRef {
+                path: path.to_string_lossy().into_owned(),
+                sha256: sha256.clone(),
+            });
+            if let Some(scope) = &scope {
+                let admitted = shared
+                    .registry
+                    .lock()
+                    .expect("registry lock")
+                    .begin_scope(&owner, scope.clone());
+                if admitted.is_err() {
+                    continue;
+                }
+            }
             let request = CoreRequest::Activate(ActivateParams {
+                scope: scope.clone(),
                 owner: owner.clone(),
                 plugin_name: want.name.clone(),
                 entry: EntryRef {
@@ -2085,28 +2469,77 @@ impl ExtensionHostManager {
                 config: config.value.clone(),
                 data_dir: Some(data_dir.clone()),
             });
-            let outcome = host.call(request, Some(plugin_id.to_string())).await;
-            match outcome.map(serde_json::from_value::<ActivateResult>) {
-                Ok(Ok(ActivateResult::Ok {
-                    tools: names,
-                    commands: slash,
-                })) => {
+            let outcome = host
+                .call(request, Some(plugin_id.to_string()))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<ActivateResult>(value)
+                        .map_err(|error| format!("malformed activation answer: {error}"))
+                })
+                .and_then(|result| match result {
+                    ActivateResult::Ok { tools, commands } => Ok((tools, commands)),
+                    ActivateResult::Failed { diagnostic } => Err(diagnostic),
+                });
+            match outcome {
+                Ok((names, slash)) => {
                     tools.extend(names);
                     commands.extend(slash);
+                    if let Some(scope) = &scope {
+                        shared
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .mark_scope_active(&owner, scope);
+                    }
                 }
-                Ok(Ok(ActivateResult::Failed { diagnostic })) => {
-                    failure = Some(diagnostic);
-                    break;
-                }
-                Ok(Err(error)) => {
-                    failure = Some(format!("malformed activation answer: {error}"));
-                    break;
-                }
-                Err(error) => {
-                    failure = Some(error.to_string());
-                    break;
+                Err(reason) => {
+                    if let Some(scope) = scope {
+                        shared
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .fail_scope(&owner, &scope);
+                        shared.core_calls.revoke_scope(plugin_id, &scope);
+                        shared.execution_broker.revoke_scope(plugin_id, &scope);
+                        native_failure.get_or_insert_with(|| reason.clone());
+                        shared.plugin_diagnostic(plugin_id, format!("Native entry failed to activate: {reason}; other selected entries remain live"));
+                        shared.deactivate_entry(host, &owner, Some(scope)).await;
+                    } else {
+                        failure = Some(reason);
+                        break;
+                    }
                 }
             }
+        }
+        if want.tier == HostTier::Plugin
+            && shared
+                .registry
+                .lock()
+                .expect("registry lock")
+                .owner(plugin_id)
+                .is_none_or(|entry| {
+                    !entry
+                        .scopes
+                        .values()
+                        .any(|state| *state == OwnerState::Active)
+                })
+        {
+            let reason =
+                native_failure.unwrap_or_else(|| "No selected Native entry became active".into());
+            shared
+                .registry
+                .lock()
+                .expect("registry lock")
+                .mark_failed(&owner, OwnerState::Failed(reason.clone()));
+            shared.plugin_diagnostic(
+                plugin_id,
+                format!("extension `{}` failed to activate: {reason}", want.name),
+            );
+            // Per-entry acknowledgements above account for incomplete cleanup.
+            // Also retire the now-empty parent so its owner record cannot linger.
+            shared.deactivate_owner(host, &owner).await;
+            return;
         }
         match failure {
             None => {
@@ -2542,13 +2975,37 @@ pub(crate) fn live_commands_for(workspace: &Path) -> Vec<command::ExtensionComma
     manager().commands_for_workspace(workspace)
 }
 
+pub(crate) fn live_commands_for_plugins(
+    plugins: &PluginRegistry,
+) -> Vec<command::ExtensionCommandEntry> {
+    if !activation::extension_host_policy_enabled() {
+        return Vec::new();
+    }
+    manager().commands_for_plugins(plugins)
+}
+
 /// Run an extension command the user invoked; see [`command::run`]. Errors
 /// are the text to show.
+#[cfg(test)]
 pub async fn run_command(
     command: &command::ExtensionCommandRef,
     raw_input: &str,
     session_id: Option<&str>,
 ) -> Result<command::CommandOutcome, String> {
+    command::run(&manager().shared, command, raw_input, session_id).await
+}
+
+/// The command the current UI caller selected. A stale focus cannot consume a
+/// command reference captured from another agent's palette.
+pub async fn run_command_for_plugins(
+    command: &command::ExtensionCommandRef,
+    raw_input: &str,
+    session_id: Option<&str>,
+    plugins: &PluginRegistry,
+) -> Result<command::CommandOutcome, String> {
+    if command.scope.is_some() && command.selection != plugins.caller_selection() {
+        return Err("Native command belongs to a different caller; select it again".into());
+    }
     command::run(&manager().shared, command, raw_input, session_id).await
 }
 
@@ -2594,8 +3051,15 @@ fn desired_owners(plugins: &PluginRegistry) -> (BTreeMap<String, DesiredOwner>, 
     );
     let mut desired: BTreeMap<String, DesiredOwner> = BTreeMap::new();
     let mut broken: BTreeSet<String> = BTreeSet::new();
+    let mut needs_selection: BTreeSet<String> = BTreeSet::new();
     for source in sources {
         let plugin_id = source.authority.plugin_id.as_str().to_string();
+        if plugins.native_catalog_requires_selection(&plugin_id) {
+            if needs_selection.insert(plugin_id.clone()) {
+                errors.push(format!("Plugin `{}` raw agent-presets has no default; select a reviewed roster preset before activation", source.plugin_name));
+            }
+            continue;
+        }
         // A plugin id can never be a tier-0 owner id. Discovery builds ids as
         // `<scope>/<hex>/<name>` and a manifest name cannot hold `:`, so this
         // cannot fire; it is the last check before an id reaches the host.
@@ -2616,6 +3080,14 @@ fn desired_owners(plugins: &PluginRegistry) -> (BTreeMap<String, DesiredOwner>, 
         };
         match bytes {
             Ok(bytes) => {
+                let digest = hex(Sha256::digest(&bytes));
+                if !plugins.native_entry_selected(
+                    &plugin_id,
+                    &source.path.to_string_lossy(),
+                    &digest,
+                ) {
+                    continue;
+                }
                 let owner = desired.entry(plugin_id).or_insert_with(|| DesiredOwner {
                     plugin_name: source.plugin_name.clone(),
                     authority: source.authority.clone(),
@@ -2668,7 +3140,36 @@ impl DesiredScan {
             return None;
         }
         for (id, _, desired) in self.attachments {
-            current.get_mut(&id).expect("validated attachment").desired = desired;
+            let state = current.get_mut(&id).expect("validated attachment");
+            let entries = self
+                .owners
+                .iter()
+                .flat_map(|(plugin_id, want)| {
+                    want.entries.iter().filter_map(|(path, sha256)| {
+                        let entry = EntryRef {
+                            path: path.to_string_lossy().into_owned(),
+                            sha256: sha256.clone(),
+                        };
+                        (desired.get(plugin_id) == Some(&want.authority.content_hash)
+                            && state.plugins.native_entry_selected(
+                                plugin_id,
+                                &entry.path,
+                                &entry.sha256,
+                            ))
+                        .then(|| composition_scope::NativePresetRef {
+                            plugin_id: plugin_id.clone(),
+                            content_hash: want.authority.content_hash.clone(),
+                            entry,
+                        })
+                    })
+                })
+                .collect();
+            state.selection = composition_scope::CompositionSelection {
+                revision: state.plugins.caller_selection(),
+                desired: desired.clone(),
+                entries,
+            };
+            state.desired = desired;
         }
         command::bump_epoch();
         Some((self.owners, self.errors))
@@ -2703,7 +3204,18 @@ fn union_of_desired_owners(snapshots: Vec<(u64, Arc<PluginRegistry>)>) -> Desire
             .map(|(plugin_id, want)| (plugin_id.clone(), want.authority.content_hash.clone()))
             .collect();
         for (plugin_id, want) in desired {
-            union.entry(plugin_id).or_insert(want);
+            match union.entry(plugin_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(want);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    for native in want.entries {
+                        if !entry.get().entries.contains(&native) {
+                            entry.get_mut().entries.push(native);
+                        }
+                    }
+                }
+            }
         }
         per_attachment.push((id, Arc::clone(&plugins), hashes.clone()));
         scanned.push((plugins, hashes));
@@ -2735,6 +3247,11 @@ impl HostAttachment {
 
     /// The engine switched workspace: publish the new snapshot.
     pub fn set_plugins(&self, plugins: Arc<PluginRegistry>) {
+        self.manager.shared.core_calls.revoke_attachment(self.id);
+        self.manager
+            .shared
+            .execution_broker
+            .revoke_attachment(self.id);
         if let Some(state) = self
             .manager
             .shared
@@ -2743,10 +3260,44 @@ impl HostAttachment {
             .expect("attachments lock")
             .get_mut(&self.id)
         {
-            state.plugins = plugins;
+            state.selection_cancel.cancel();
+            state.selection_cancel = CancellationToken::new();
+            state.revision += 1;
+            state.plugins = Arc::new(plugins.bind_caller(composition_scope::SelectionRevision {
+                attachment_id: self.id,
+                revision: state.revision,
+            }));
             state.desired.clear();
+            state.selection = Default::default();
         }
         command::bump_epoch();
+    }
+
+    pub fn set_identity(&self, session_id: Option<String>, agent_id: Option<String>) {
+        if let Some(state) = self
+            .manager
+            .shared
+            .attachments
+            .lock()
+            .expect("attachments lock")
+            .get_mut(&self.id)
+        {
+            state.session_id = session_id;
+            state.agent_id = agent_id;
+        }
+    }
+    pub fn plugin_view(&self) -> Arc<PluginRegistry> {
+        self.manager
+            .shared
+            .attachments
+            .lock()
+            .expect("attachments lock")
+            .get(&self.id)
+            .map(|state| Arc::clone(&state.plugins))
+            .unwrap_or_else(|| Arc::new(PluginRegistry::new()))
+    }
+    pub async fn reconcile(&self) -> Result<(), String> {
+        self.manager.reconcile().await
     }
 
     /// Reconcile the host against every attachment, waiting for it.
@@ -2766,10 +3317,173 @@ impl HostAttachment {
     }
 }
 
+impl ManagerShared {
+    pub(crate) fn plugins_for_selection(
+        &self,
+        revision: composition_scope::SelectionRevision,
+        session_id: Option<&str>,
+    ) -> Option<(Arc<PluginRegistry>, Option<String>)> {
+        self.attachments
+            .lock()
+            .expect("attachments lock")
+            .get(&revision.attachment_id)
+            .filter(|state| {
+                state.revision == revision.revision && state.session_id.as_deref() == session_id
+            })
+            .map(|state| (Arc::clone(&state.plugins), state.agent_id.clone()))
+    }
+    pub(super) fn selection_cancellation(
+        &self,
+        revision: composition_scope::SelectionRevision,
+    ) -> Option<CancellationToken> {
+        self.attachments
+            .lock()
+            .expect("attachments lock")
+            .get(&revision.attachment_id)
+            .filter(|state| state.revision == revision.revision)
+            .map(|state| state.selection_cancel.clone())
+    }
+    pub(crate) fn selection(&self, id: u64) -> composition_scope::CompositionSelection {
+        self.attachments
+            .lock()
+            .expect("attachments lock")
+            .get(&id)
+            .map(|state| state.selection.clone())
+            .unwrap_or_default()
+    }
+    pub(crate) fn selection_current(
+        &self,
+        selection: composition_scope::SelectionRevision,
+        plugin_id: &str,
+        hash: &str,
+        scope: Option<&EntryRef>,
+    ) -> bool {
+        self.attachments
+            .lock()
+            .expect("attachments lock")
+            .get(&selection.attachment_id)
+            .is_some_and(|state| {
+                state.revision == selection.revision
+                    && state.selection.includes(plugin_id, hash, scope)
+            })
+    }
+    pub(crate) fn check_selection(
+        &self,
+        selection: Option<composition_scope::SelectionRevision>,
+        plugins: Option<&PluginRegistry>,
+        plugin_id: &str,
+        hash: &str,
+        scope: Option<&EntryRef>,
+    ) -> Result<(), String> {
+        if scope.is_none() {
+            return Ok(());
+        }
+        let selection = selection.ok_or("Native contribution has no caller selection")?;
+        if plugins.and_then(PluginRegistry::caller_selection) != Some(selection)
+            || !self.selection_current(selection, plugin_id, hash, scope)
+        {
+            return Err("Native contribution is no longer selected for this caller".into());
+        }
+        Ok(())
+    }
+}
+/// Last-consumer guard for any tool executed under a caller-bound composition.
+pub(crate) fn validate_caller_plugins(plugins: Option<&PluginRegistry>) -> Result<(), String> {
+    let Some(revision) = plugins.and_then(PluginRegistry::caller_selection) else {
+        return Ok(());
+    };
+    let manager = manager();
+    let attachments = manager.shared.attachments.lock().expect("attachments lock");
+    if attachments
+        .get(&revision.attachment_id)
+        .is_some_and(|state| state.revision == revision.revision)
+    {
+        Ok(())
+    } else {
+        Err("Native caller composition changed or was detached; prepare the call again".into())
+    }
+}
+/// Raw catalog choices are revalidated against the reviewed staged bundle;
+/// discovery never activates them. Generic Native entries retain active-scope
+/// discovery. Child preparation revalidates before attaching the chosen entry.
+pub(crate) fn native_presets_for_plugins(
+    plugins: &PluginRegistry,
+) -> Vec<(composition_scope::NativePresetRef, PluginAuthority)> {
+    if !activation::extension_host_policy_enabled() {
+        return Vec::new();
+    }
+    let manager = manager();
+    let mut presets: Vec<_> = crate::plugins::native_presets::admitted_entries(plugins)
+        .into_iter()
+        .map(|(preset, _, authority)| (preset, authority))
+        .collect();
+    if manager.shared.ready_host(HostTier::Plugin).is_err() {
+        return presets;
+    }
+    let registry = manager.shared.registry.lock().expect("registry lock");
+    for owner in registry.owners() {
+        let Some(authority) = owner.authority.as_ref() else {
+            continue;
+        };
+        if owner.tier != HostTier::Plugin
+            || owner.state != OwnerState::Active
+            || authority.workspace != plugins.workspace()
+            || !plugins.get(&owner.owner.plugin_id).is_some_and(|plugin| {
+                plugin.component_active(PluginActivationCapability::Native)
+                    && plugin.content_hash == owner.content_hash
+                    && plugin.state_generation == authority.state_generation
+            })
+        {
+            continue;
+        }
+        for (entry, state) in &owner.scopes {
+            if *state == OwnerState::Active
+                && !presets.iter().any(|(preset, _)| {
+                    preset.plugin_id == owner.owner.plugin_id && preset.entry == *entry
+                })
+            {
+                presets.push((
+                    composition_scope::NativePresetRef {
+                        plugin_id: owner.owner.plugin_id.clone(),
+                        content_hash: owner.content_hash.clone(),
+                        entry: entry.clone(),
+                    },
+                    authority.clone(),
+                ));
+            }
+        }
+    }
+    presets.sort_by(|(left, _), (right, _)| {
+        left.plugin_id
+            .cmp(&right.plugin_id)
+            .then_with(|| left.entry.path.cmp(&right.entry.path))
+    });
+    presets
+}
+
+pub(crate) fn caller_view(
+    workspace: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Option<Arc<PluginRegistry>> {
+    let manager = manager();
+    let attachments = manager.shared.attachments.lock().expect("attachments lock");
+    let mut found = attachments.values().filter(|state| {
+        state.plugins.workspace() == workspace
+            && state.session_id.as_deref() == session_id
+            && state.agent_id.as_deref() == agent_id
+    });
+    let view = found.next().map(|state| Arc::clone(&state.plugins));
+    if found.next().is_some() { None } else { view }
+}
+
 impl Drop for HostAttachment {
     fn drop(&mut self) {
-        if let Ok(mut attachments) = self.manager.shared.attachments.lock() {
-            attachments.remove(&self.id);
+        self.manager.shared.core_calls.revoke_attachment(self.id);
+        if let Ok(mut attachments) = self.manager.shared.attachments.lock()
+            && let Some(state) = attachments.remove(&self.id)
+        {
+            state.selection_cancel.cancel();
         }
         command::bump_epoch();
     }
@@ -2792,8 +3506,15 @@ thread_local! {
 }
 
 /// Configure the process-wide manager once, at boot, from user config.
-pub fn configure(options: ExtensionHostOptions) {
-    let _ = GLOBAL.set(Arc::new(ExtensionHostManager::new(options)));
+pub(crate) fn configure_with_handle(
+    options: ExtensionHostOptions,
+    handle: Option<tokio::runtime::Handle>,
+) {
+    let manager = Arc::new(ExtensionHostManager::new(options));
+    if let Some(handle) = handle {
+        manager.bind_engine_handle(handle);
+    }
+    let _ = GLOBAL.set(manager);
 }
 
 /// The manager for this engine process (one host per process and tier).
@@ -2823,5 +3544,62 @@ impl TestManagerGuard {
 impl Drop for TestManagerGuard {
     fn drop(&mut self) {
         TEST_MANAGER.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
+
+impl ExtensionHostManager {
+    pub(crate) fn has_shell_hooks(&self, event: crate::hooks::HookEvent) -> bool {
+        activation::extension_host_policy_enabled()
+            && self
+                .shared
+                .registry
+                .lock()
+                .expect("registry lock")
+                .live_shell_hooks()
+                .iter()
+                .any(|r| r.hook.event == event)
+    }
+    pub(crate) fn shell_hooks(
+        &self,
+        caller: &crate::hooks::HookCaller,
+        event: crate::hooks::HookEvent,
+    ) -> Vec<crate::hooks::Hook> {
+        if !activation::extension_host_policy_enabled() {
+            return Vec::new();
+        }
+        let Some(plugins) = caller.plugins.as_ref() else {
+            return Vec::new();
+        };
+        let Some(revision) = plugins.caller_selection() else {
+            return Vec::new();
+        };
+        let Some((current, agent)) = self
+            .shared
+            .plugins_for_selection(revision, caller.session_id.as_deref())
+        else {
+            return Vec::new();
+        };
+        if agent != caller.agent_id
+            || !Arc::ptr_eq(&current, plugins)
+            || caller.workspace != plugins.workspace()
+        {
+            return Vec::new();
+        }
+        self.shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .live_shell_hooks()
+            .into_iter()
+            .filter(|r| {
+                r.hook.event == event
+                    && plugins.selected_native_entries().iter().any(|entry| {
+                        entry.plugin_id == r.owner.plugin_id
+                            && entry.content_hash == r.content_hash
+                            && r.scope.as_ref().is_none_or(|scope| entry.entry == *scope)
+                    })
+            })
+            .map(|r| r.hook)
+            .collect()
     }
 }

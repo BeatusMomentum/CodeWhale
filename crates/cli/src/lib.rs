@@ -9,7 +9,6 @@ mod metrics;
 mod update;
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,10 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use codewhale_agent::ModelRegistry;
-use codewhale_app_server::daemon_socket::{DaemonSocketOptions, run_daemon_socket};
-use codewhale_app_server::{
-    AppServerOptions, run as run_app_server, run_stdio as run_app_server_stdio,
-};
+use codewhale_app_server::RuntimeControlFrontend;
 use codewhale_config::credentials::{
     clear_provider_api_key_from_config, provider_slot, set_provider_api_key,
 };
@@ -32,7 +28,6 @@ use codewhale_config::{
 };
 use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
 use codewhale_secrets::Secrets;
-use codewhale_state::{StateStore, ThreadListFilters};
 use codewhale_telemetry::{
     self as telemetry, Counters, DurationBucket, Errors, Event, ExitClass, SessionSource, Surface,
     TelemetryDecision, TurnWall,
@@ -94,12 +89,8 @@ fn parse_provider_identifier(value: &str) -> std::result::Result<String, String>
     override_usage = "codewhale [OPTIONS] [PROMPT]\n       codewhale [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct Cli {
-    /// Path to the config file to load instead of the default.
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Config profile to apply (a `[profiles.<name>]` table).
-    #[arg(long)]
-    profile: Option<String>,
+    #[command(flatten)]
+    runtime_options: codewhale_tui::RuntimeOptions,
     #[arg(
         long,
         value_name = "PROVIDER",
@@ -146,39 +137,6 @@ struct Cli {
     /// Provider base URL for this run (not saved).
     #[arg(long)]
     base_url: Option<String>,
-    /// Workspace directory for Codewhale file tools.
-    #[arg(short = 'C', long = "workspace", alias = "cd", value_name = "DIR")]
-    workspace: Option<PathBuf>,
-    /// Enable terminal mouse capture for internal scrolling, transcript
-    /// selection, and scrollbar dragging (default off in legacy Windows consoles).
-    #[arg(long = "mouse-capture", conflicts_with = "no_mouse_capture")]
-    mouse_capture: bool,
-    /// Disable terminal mouse capture so terminal-native text selection works.
-    #[arg(long = "no-mouse-capture", conflicts_with = "mouse_capture")]
-    no_mouse_capture: bool,
-    /// Skip onboarding screens.
-    #[arg(long = "skip-onboarding")]
-    skip_onboarding: bool,
-    /// Start a fresh session without automatic resume or crash recovery.
-    #[arg(long)]
-    fresh: bool,
-    /// Skip loading project-level config, including the workspace-specific
-    /// `[workspace]`/`[projects]` overlay from user config. Must appear before
-    /// the subcommand; it is applied before subcommand dispatch.
-    #[arg(long = "no-project-config")]
-    no_project_config: bool,
-    /// Enable a feature for this run (repeatable); equivalent to
-    /// `[features] <name> = true`. `codewhale features list` shows the names.
-    /// Must appear before the subcommand.
-    #[arg(long = "enable", value_name = "FEATURE", action = clap::ArgAction::Append)]
-    enable: Vec<String>,
-    /// Disable a feature for this run (repeatable); equivalent to
-    /// `[features] <name> = false`. Must appear before the subcommand.
-    #[arg(long = "disable", value_name = "FEATURE", action = clap::ArgAction::Append)]
-    disable: Vec<String>,
-    /// Legacy compatibility alias for Act + Full Access.
-    #[arg(long, hide = true)]
-    yolo: bool,
     /// Continue the most recent interactive session for this workspace.
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
@@ -218,12 +176,28 @@ struct Cli {
     command: Option<Commands>,
 }
 
+impl std::ops::Deref for Cli {
+    type Target = codewhale_tui::RuntimeOptions;
+    fn deref(&self) -> &Self::Target {
+        &self.runtime_options
+    }
+}
+impl std::ops::DerefMut for Cli {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.runtime_options
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Run an interactive or non-interactive task.
     Run(RunArgs),
     /// Run Codewhale diagnostics.
     Doctor(TuiPassthroughArgs),
+    /// Summarize local session failure signals without raw content.
+    SessionDiagnostics(TuiPassthroughArgs),
+    /// Score recorded turn metrics against an optional baseline.
+    Scorecard(TuiPassthroughArgs),
     /// List cached models; use --update to refresh configured provider catalogs.
     #[command(
         after_help = "Examples:\n  codewhale models --update\n  codewhale models --update --provider openai\n  codewhale models --provider openai-codex --json\n\n--update (alias: --refresh) refreshes configured provider catalogs. --provider ID limits the scope."
@@ -396,8 +370,8 @@ New integrations should prefer `codewhale app-server`.")]
 Transports:
   codewhale app-server --http              Full HTTP/SSE runtime API (/v1/*) on 127.0.0.1:7878
   codewhale app-server --mobile            Runtime API + phone control page (127.0.0.1 only)
-  codewhale app-server --stdio             JSON-RPC control transport over stdio (no listener)
-  codewhale app-server                     Legacy in-process app-server HTTP on 127.0.0.1:8787
+  codewhale app-server --stdio             JSON-RPC control transport over stdio
+  codewhale app-server                     Compatibility HTTP routes on the canonical owner at 127.0.0.1:8787
 
 `--http` and `--mobile` serve the same mature runtime API as `codewhale serve
 --http`/`--mobile`, which remain as compatibility aliases. The runtime API token
@@ -565,13 +539,22 @@ fn top_level_provider_override(
     if let Some(provider) = builtin_provider_arg(provider) {
         return Ok(Some(provider));
     }
-    if command_accepts_raw_provider(command) {
+    if command_accepts_raw_provider(command)
+        || matches!(
+            command,
+            Some(Commands::Thread(ThreadArgs {
+                command: ThreadCommand::Resume { .. } | ThreadCommand::Fork { .. },
+            }))
+        )
+    {
+        // Thread history controls hand the configured identity to the held
+        // owner's existing admission; no local client/credential is built.
         return Ok(None);
     }
 
     let expected = ProviderKind::names_hint();
     bail!(
-        "invalid value '{provider}' for '--provider <PROVIDER>': expected one of {expected}; configured custom providers are accepted only by exec and fleet"
+        "invalid value '{provider}' for '--provider <PROVIDER>': expected one of {expected}; configured custom providers are accepted by exec, fleet and thread resume/fork"
     )
 }
 
@@ -1865,11 +1848,19 @@ enum ThreadCommand {
     Read {
         thread_id: String,
     },
+    /// Resume through the acknowledged owner and print its durable receipt.
     Resume {
         thread_id: String,
+        /// Retry an uncertain control with its original intent key.
+        #[arg(long)]
+        operation_key: Option<String>,
     },
+    /// Fork complete history through the owner and print the new receipt.
     Fork {
         thread_id: String,
+        /// Retry an uncertain control with its original intent key.
+        #[arg(long)]
+        operation_key: Option<String>,
     },
     Archive {
         thread_id: String,
@@ -1933,14 +1924,14 @@ struct AppServerArgs {
     /// Equivalent to the legacy `codewhale serve --mobile`.
     #[arg(long, conflicts_with = "stdio")]
     mobile: bool,
-    /// Run the app-server JSON-RPC control transport over stdio (no listener).
+    /// Run the app-server JSON-RPC control transport over stdio.
     /// Used by local SDKs and JSON-RPC integrations.
     #[arg(long, default_value_t = false)]
     stdio: bool,
     /// Run as the desktop daemon: the same JSON-RPC control transport as
-    /// `--stdio`, served on a user-private unix domain socket under the
-    /// Codewhale runtime directory. Clients must `daemon/attach` first.
-    /// Not yet supported on Windows (fails with a typed error).
+    /// `--stdio`, served on a user-private local endpoint under the Codewhale
+    /// runtime directory (Unix socket or Windows named pipe). Clients must
+    /// authenticate and `daemon/attach` first.
     #[arg(long, default_value_t = false, conflicts_with_all = ["stdio", "http", "mobile"])]
     socket: bool,
     /// Socket path override for --socket. Defaults to
@@ -2360,17 +2351,30 @@ fn run() -> Result<()> {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             run_tui_in_process(&cli, &resolved_runtime, tui_args("eval", args))
         }
+        Some(Commands::SessionDiagnostics(args)) => {
+            let resolved_runtime =
+                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
+            run_tui_in_process(
+                &cli,
+                &resolved_runtime,
+                tui_args("session-diagnostics", args),
+            )
+        }
+        Some(Commands::Scorecard(args)) => {
+            let resolved_runtime =
+                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
+            run_tui_in_process(&cli, &resolved_runtime, tui_args("scorecard", args))
+        }
         Some(Commands::Mcp(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             run_tui_in_process(&cli, &resolved_runtime, tui_args("mcp", args))
         }
         Some(Commands::Pet(args)) => {
-            // `pet` must reach run_with_args at argv[1]; the TUI passthrough
-            // builder would inject global flags ahead of it and the trailing
-            // PROMPT positional would otherwise swallow `pet serve`.
-            let mut argv = vec!["codewhale".to_string(), "pet".to_string()];
+            // The pet owner is a delegated Engine service, with no separate
+            // process or argument owner. Keep its narrow command contract.
+            let mut argv = vec!["pet".to_string()];
             argv.extend(args.args);
-            let code = codewhale_tui::run(argv);
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0
             } else {
@@ -2513,7 +2517,7 @@ fn run() -> Result<()> {
         Some(Commands::AppServer(args)) => {
             // Every transport loads the same file: the subcommand's --config,
             // else the global one. The HTTP/mobile runtime API is delegated to
-            // the `serve` path in the TUI binary, which reads only the *global*
+            // the `serve` path in the Engine library, which reads the captured
             // --config, and runtime options (provider/keyring) resolve from it
             // too, so bridge the choice there before resolving them.
             let config_path = app_server_config_path(&cli, &args);
@@ -4524,12 +4528,8 @@ fn run_auth_command_with_secrets_and_runtime(
 ) -> Result<()> {
     match command {
         AuthCommand::XaiDevice => {
-            let argv = vec![
-                "codewhale".to_string(),
-                "auth".to_string(),
-                "xai-device".to_string(),
-            ];
-            let code = codewhale_tui::run(argv);
+            let argv = vec!["auth".to_string(), "xai-device".to_string()];
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0
             } else {
@@ -4537,12 +4537,8 @@ fn run_auth_command_with_secrets_and_runtime(
             })
         }
         AuthCommand::Chatgpt => {
-            let argv = vec![
-                "codewhale".to_string(),
-                "auth".to_string(),
-                "chatgpt".to_string(),
-            ];
-            let code = codewhale_tui::run(argv);
+            let argv = vec!["auth".to_string(), "chatgpt".to_string()];
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0
             } else {
@@ -4550,12 +4546,8 @@ fn run_auth_command_with_secrets_and_runtime(
             })
         }
         AuthCommand::ChatgptRevoke => {
-            let argv = vec![
-                "codewhale".to_string(),
-                "auth".to_string(),
-                "chatgpt-revoke".to_string(),
-            ];
-            let code = codewhale_tui::run(argv);
+            let argv = vec!["auth".to_string(), "chatgpt-revoke".to_string()];
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0
             } else {
@@ -5399,11 +5391,11 @@ fn run_config_doctor(store: &ConfigStore) -> Result<()> {
         }
     }
     for (name, endpoint) in endpoints {
-        if let Some(url) = endpoint.as_deref()
-            && !url.starts_with("http://")
-            && !url.starts_with("https://")
-        {
-            errors.push(format!("`{name}` is not an http(s) URL: {url}"));
+        if let Some(url) = endpoint.as_deref() {
+            let url_for_check = url.to_ascii_lowercase();
+            if !url_for_check.starts_with("http://") && !url_for_check.starts_with("https://") {
+                errors.push(format!("`{name}` is not an http(s) URL: {url}"));
+            }
         }
     }
 
@@ -5643,111 +5635,278 @@ fn run_model_command(
     }
 }
 
-/// The TUI passthrough a thread subcommand delegates as, if it delegates.
-///
-/// Exhaustive on purpose: a future `ThreadCommand` variant that starts a
-/// session has to state its passthrough here, where the caller below routes it
-/// through the one command builder that applies the telemetry floor.
-fn thread_delegation(command: &ThreadCommand) -> Option<Vec<String>> {
-    match command {
-        ThreadCommand::Resume { thread_id } => Some(vec!["resume".to_string(), thread_id.clone()]),
-        ThreadCommand::Fork { thread_id } => Some(vec!["fork".to_string(), thread_id.clone()]),
-        ThreadCommand::List { .. }
-        | ThreadCommand::Read { .. }
-        | ThreadCommand::Archive { .. }
-        | ThreadCommand::Unarchive { .. }
-        | ThreadCommand::SetName { .. }
-        | ThreadCommand::ClearName { .. } => None,
-    }
-}
-
+/// These controls attach to the actual canonical owner. The IO reactor
+/// forwards requests only; it constructs no Engine or history writer.
 fn run_thread_command(
     cli: &Cli,
-    store: &mut ConfigStore,
-    runtime_overrides: &CliRuntimeOverrides,
+    _store: &mut ConfigStore,
+    _runtime_overrides: &CliRuntimeOverrides,
     command: ThreadCommand,
 ) -> Result<()> {
-    // `thread resume`/`thread fork` start a full interactive session in the TUI
-    // binary, so they delegate exactly like the top-level `resume` does —
-    // through dispatcher, which forwards `--config` and states the
-    // resolved telemetry value in the child's environment. They used to take a
-    // bare command invocation that forwarded neither, so a session
-    // launched this way re-resolved from `$CODEWHALE_HOME/config.toml` with no
-    // overrides and armed telemetry even when the user had passed
-    // `--telemetry false` or pointed `--config` at a file that said
-    // `telemetry = false`.
-    if let Some(passthrough) = thread_delegation(&command) {
-        let resolved_runtime = resolve_runtime_for_dispatch(store, runtime_overrides);
-        return run_tui_in_process(cli, &resolved_runtime, passthrough);
-    }
-    run_thread_store_command(&StateStore::open(None)?, command)
+    let mutation_options = thread_control_mutation_options(cli, &command)?;
+    // Resolve only explicit startup paths before any attachment await. An
+    // absent workspace is supplied by the acknowledged owner, never cwd.
+    let selection = if cli.workspace.is_some() || cli.profile.is_some() || cli.config.is_some() {
+        let startup = if cli
+            .workspace
+            .as_ref()
+            .is_some_and(|path| path.is_relative())
+            || cli.config.as_ref().is_some_and(|path| path.is_relative())
+        {
+            std::env::current_dir().context("capture thread-control startup directory")?
+        } else {
+            PathBuf::new()
+        };
+        thread_control_selection(cli, &startup)
+    } else {
+        None
+    };
+    let config_path = selection
+        .as_ref()
+        .and_then(|selection| selection.config_source.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize canonical control IO")?;
+    run_thread_control_command_with(command, |request| {
+        let request = apply_thread_control_mutation_options(request, &mutation_options)?;
+        runtime.block_on(codewhale_app_server::request_thread_control(
+            config_path,
+            None,
+            selection,
+            request,
+        ))
+    })
 }
 
-fn run_thread_store_command(state: &StateStore, command: ThreadCommand) -> Result<()> {
-    let require_thread = |thread_id: &str| -> Result<codewhale_state::ThreadMetadata> {
-        state
-            .get_thread(thread_id)?
-            .with_context(|| format!("thread not found: {thread_id}"))
+/// Only explicit normalized history proposals cross this boundary. The held
+/// owner's existing typed decoder and route/posture checks admit them.
+fn thread_control_mutation_options(
+    cli: &Cli,
+    command: &ThreadCommand,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let retained_key = match command {
+        ThreadCommand::Resume { operation_key, .. } | ThreadCommand::Fork { operation_key, .. } => {
+            operation_key
+        }
+        _ => return Ok(serde_json::Map::new()),
     };
+    anyhow::ensure!(
+        cli.api_key.is_none() && cli.base_url.is_none(),
+        "thread history controls cannot import --api-key or --base-url; configure/authenticate the owning Runtime, then select its config/profile (values omitted)"
+    );
+    anyhow::ensure!(
+        !cli.yolo && cli.verbosity.is_none() && cli.telemetry.is_none(),
+        "unsupported per-run thread setting; configure the owning Runtime instead (values omitted)"
+    );
+    for spec in &cli.overrides {
+        let (key, _) = spec
+            .split_once('=')
+            .context("invalid --set: expected KEY=VALUE (value omitted)")?;
+        anyhow::ensure!(
+            matches!(
+                key.trim(),
+                "provider" | "model" | "default_text_model" | "approval_policy" | "sandbox_mode"
+            ),
+            "unsupported per-run thread --set key; use the owning Runtime config/profile (key and value omitted)"
+        );
+    }
+    let mut fields = serde_json::Map::new();
+    if let Some(model) = cli.model.as_ref() {
+        fields.insert("model".into(), serde_json::json!(model));
+    }
+    if let Some(provider) = cli.provider.as_ref() {
+        let identity = builtin_provider_arg(provider)
+            .map_or_else(|| provider.clone(), |provider| provider.as_str().to_owned());
+        fields.insert("model_provider".into(), serde_json::json!(identity));
+    }
+    if let Some(policy) = cli.approval_policy.as_ref() {
+        fields.insert("approval_policy".into(), serde_json::json!(policy));
+    }
+    if let Some(sandbox) = cli.sandbox_mode.as_ref() {
+        fields.insert("sandbox".into(), serde_json::json!(sandbox));
+    }
+    anyhow::ensure!(
+        retained_key.is_none() || fields.is_empty(),
+        "--operation-key recovers the original admitted intent; omit newly supplied model/provider/policy/sandbox options, inspect its receipt, or start a fresh control without the retained key"
+    );
+    Ok(fields)
+}
+
+fn apply_thread_control_mutation_options(
+    request: codewhale_app_server::ThreadRequest,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<codewhale_app_server::ThreadRequest> {
+    if options.is_empty() {
+        return Ok(request);
+    }
+    anyhow::ensure!(
+        matches!(
+            &request,
+            codewhale_app_server::ThreadRequest::Resume(_)
+                | codewhale_app_server::ThreadRequest::Fork(_)
+        ),
+        "history proposal requires Resume/Fork"
+    );
+    let mut value = serde_json::to_value(request)?;
+    value
+        .as_object_mut()
+        .context("typed history control must be an object")?
+        .extend(options.clone());
+    serde_json::from_value(value)
+        .context("invalid explicit typed history proposal (values omitted)")
+}
+
+fn thread_control_selection(
+    cli: &Cli,
+    startup: &Path,
+) -> Option<codewhale_app_server::ThreadControlSelection> {
+    (cli.workspace.is_some() || cli.profile.is_some() || cli.config.is_some()).then(|| {
+        codewhale_app_server::ThreadControlSelection {
+            workspace: cli
+                .workspace
+                .as_ref()
+                .map(|path| resolve_against_workspace(path, startup)),
+            config_profile: cli.profile.clone(),
+            config_source: cli
+                .config
+                .as_ref()
+                .map(|path| resolve_against_workspace(path, startup)),
+        }
+    })
+}
+
+fn thread_control_request(command: &ThreadCommand) -> Result<codewhale_app_server::ThreadRequest> {
+    use codewhale_app_server::{
+        ThreadListParams, ThreadReadParams, ThreadRequest, ThreadSetNameParams,
+    };
+    Ok(match command {
+        ThreadCommand::List { all, limit } => ThreadRequest::List(ThreadListParams {
+            include_archived: *all,
+            limit: *limit,
+        }),
+        ThreadCommand::Read { thread_id } => ThreadRequest::Read(ThreadReadParams {
+            thread_id: thread_id.clone(),
+        }),
+        ThreadCommand::Archive { thread_id } => ThreadRequest::Archive {
+            thread_id: thread_id.clone(),
+        },
+        ThreadCommand::Unarchive { thread_id } => ThreadRequest::Unarchive {
+            thread_id: thread_id.clone(),
+        },
+        ThreadCommand::SetName { thread_id, name } => ThreadRequest::SetName(ThreadSetNameParams {
+            thread_id: thread_id.clone(),
+            name: name.clone(),
+        }),
+        ThreadCommand::ClearName { thread_id } => ThreadRequest::SetName(ThreadSetNameParams {
+            thread_id: thread_id.clone(),
+            name: String::new(),
+        }),
+        ThreadCommand::Resume {
+            thread_id,
+            operation_key,
+        } => serde_json::from_value(
+            serde_json::json!({"kind":"resume","thread_id":thread_id,"operation_key":operation_key}),
+        )?,
+        ThreadCommand::Fork {
+            thread_id,
+            operation_key,
+        } => serde_json::from_value(
+            serde_json::json!({"kind":"fork","thread_id":thread_id,"operation_key":operation_key}),
+        )?,
+    })
+}
+
+fn run_thread_control_command_with<F>(mut command: ThreadCommand, control: F) -> Result<()>
+where
+    F: FnOnce(codewhale_app_server::ThreadRequest) -> Result<codewhale_app_server::ThreadResponse>,
+{
+    let operation = match &mut command {
+        ThreadCommand::Resume { operation_key, .. } | ThreadCommand::Fork { operation_key, .. } => {
+            Some(
+                operation_key
+                    .get_or_insert_with(codewhale_app_server::capture_thread_operation_key)
+                    .clone(),
+            )
+        }
+        _ => None,
+    };
+    let request = thread_control_request(&command)?;
+    let response = control(request).with_context(|| {
+        operation.as_ref().map_or_else(|| "canonical thread control failed".to_owned(), |key|
+            format!("canonical control outcome may have committed; inspect or retry with --operation-key {key}, no automatic replay"))
+    })?;
+    if response.status == "missing" {
+        bail!("thread not found: {}", response.thread_id);
+    }
+    let expected = match &command {
+        ThreadCommand::List { .. } => "list",
+        ThreadCommand::Read { thread_id }
+        | ThreadCommand::Resume { thread_id, .. }
+        | ThreadCommand::Archive { thread_id }
+        | ThreadCommand::Unarchive { thread_id }
+        | ThreadCommand::SetName { thread_id, .. }
+        | ThreadCommand::ClearName { thread_id } => thread_id,
+        ThreadCommand::Fork { .. } => response
+            .data
+            .get("receipt")
+            .and_then(|value| value.get("runtime_thread_id"))
+            .and_then(serde_json::Value::as_str)
+            .context("canonical fork result has no committed target receipt")?,
+    };
+    anyhow::ensure!(
+        response.thread_id == expected,
+        "canonical control returned another thread identity"
+    );
+    if let Some(operation) = operation.as_ref() {
+        let receipt = response
+            .data
+            .get("receipt")
+            .context("canonical control has no durable receipt")?;
+        anyhow::ensure!(
+            receipt
+                .get("operation_key")
+                .and_then(serde_json::Value::as_str)
+                == Some(operation.as_str()),
+            "canonical control returned another intent receipt; retain --operation-key {operation} for inspection, no replay"
+        );
+        anyhow::ensure!(
+            receipt
+                .get("runtime_thread_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+                && receipt
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.is_empty()),
+            "canonical committed target/session identity missing; retain --operation-key {operation}"
+        );
+    }
     match command {
-        ThreadCommand::List { all, limit } => {
-            let threads = state.list_threads(ThreadListFilters {
-                include_archived: all,
-                limit,
-            })?;
-            for thread in threads {
+        ThreadCommand::List { .. } => {
+            for thread in response.threads {
                 println!(
                     "{} | {} | {} | {}",
                     thread.id,
-                    thread
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| "(unnamed)".to_string()),
+                    thread.name.as_deref().unwrap_or("(unnamed)"),
                     thread.model_provider,
                     thread.cwd.display()
                 );
             }
-            Ok(())
         }
-        ThreadCommand::Read { thread_id } => {
-            let thread = require_thread(&thread_id)?;
-            println!("{}", serde_json::to_string_pretty(&thread)?);
-            Ok(())
-        }
+        ThreadCommand::Read { .. } => println!("{}", serde_json::to_string_pretty(&response)?),
+        ThreadCommand::Archive { thread_id } => println!("archived {thread_id}"),
+        ThreadCommand::Unarchive { thread_id } => println!("unarchived {thread_id}"),
+        ThreadCommand::SetName { thread_id, .. } => println!("renamed {thread_id}"),
+        ThreadCommand::ClearName { thread_id } => println!("cleared name for {thread_id}"),
         ThreadCommand::Resume { .. } | ThreadCommand::Fork { .. } => {
-            unreachable!("thread_delegation routes resume and fork before this match")
-        }
-        // The store updates by id and reports nothing for an unknown one, so
-        // check first rather than print success for a no-op.
-        ThreadCommand::Archive { thread_id } => {
-            require_thread(&thread_id)?;
-            state.mark_archived(&thread_id)?;
-            println!("archived {thread_id}");
-            Ok(())
-        }
-        ThreadCommand::Unarchive { thread_id } => {
-            require_thread(&thread_id)?;
-            state.mark_unarchived(&thread_id)?;
-            println!("unarchived {thread_id}");
-            Ok(())
-        }
-        ThreadCommand::SetName { thread_id, name } => {
-            let mut thread = require_thread(&thread_id)?;
-            thread.name = Some(name);
-            thread.updated_at = chrono::Utc::now().timestamp();
-            state.upsert_thread(&thread)?;
-            println!("renamed {thread_id}");
-            Ok(())
-        }
-        ThreadCommand::ClearName { thread_id } => {
-            let mut thread = require_thread(&thread_id)?;
-            thread.name = None;
-            thread.updated_at = chrono::Utc::now().timestamp();
-            state.upsert_thread(&thread)?;
-            println!("cleared name for {thread_id}");
-            Ok(())
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response.data["receipt"])?
+            );
         }
     }
+    Ok(())
 }
 
 fn run_sandbox_command(command: SandboxCommand) -> Result<()> {
@@ -5774,76 +5933,40 @@ fn run_app_server_command(
     resolved_runtime: &ResolvedRuntimeOptions,
     args: AppServerArgs,
 ) -> Result<()> {
-    // The full runtime API lives in the TUI crate behind `serve --http`/`--mobile`.
-    // Rather than duplicate ~6.5k lines or add a CLI→TUI crate dependency, the
-    // canonical `app-server --http`/`--mobile` entrypoint reuses that mature server
-    // by delegating to the sibling TUI binary (the same mechanism `serve` uses).
-    if args.http || args.mobile {
-        // Delegated runtime API listener — supervise it so the child does not
-        // outlive the dispatcher (#3259).
-        return run_tui_server_in_process(
-            cli,
-            resolved_runtime,
-            app_server_serve_passthrough(&args),
-        );
-    }
-
-    // Everything below runs the app-server *in this process*, which is why the
-    // surface cannot be derived from the executable: `current_exe()` would
-    // report every one of these sessions as `cli`.
-    //
-    // `codewhale --config X app-server --stdio` must load X too: the global
-    // flag is the fallback for every in-process transport, not only telemetry.
-    let config_path = app_server_config_path(cli, &args);
-    let session = start_cli_telemetry(resolved_runtime, config_path.clone(), Surface::AppServer);
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to create tokio runtime")
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let outcome = Err(error);
-            finish_cli_telemetry(session, &outcome);
-            return outcome;
-        }
+    let mut startup = cli.runtime_options.clone();
+    startup.config = app_server_config_path(cli, &args);
+    startup.control_frontend = if args.stdio {
+        Some(RuntimeControlFrontend::Stdio)
+    } else if args.socket {
+        Some(RuntimeControlFrontend::Socket {
+            path: args.socket_path.clone(),
+        })
+    } else if !args.http && !args.mobile {
+        Some(RuntimeControlFrontend::LegacyHttp)
+    } else {
+        None
     };
-    if args.stdio {
-        let outcome = runtime.block_on(run_app_server_stdio(config_path));
-        finish_cli_telemetry(session, &outcome);
-        return outcome;
-    }
-    if args.socket {
-        let outcome = runtime.block_on(run_daemon_socket(DaemonSocketOptions {
-            socket_path: args.socket_path,
-            config_path,
-        }));
-        finish_cli_telemetry(session, &outcome);
-        return outcome;
-    }
-    // Legacy in-process app-server HTTP transport (`/healthz`, `/thread`, `/app`,
-    // `/prompt`, `/tool`, `/jobs`). Kept for backward compatibility; defaults to
-    // 127.0.0.1:8787 to avoid colliding with the runtime API default of :7878.
-    // `/prompt` and `/thread` messages are not served locally: they run a real
-    // turn by bridging to a runtime API child, and fail with an explicit
-    // `runtime_unavailable` when one cannot be started.
-    let host = args.host.as_deref().unwrap_or("127.0.0.1");
-    let port = args.port.unwrap_or(8787);
-    let outcome = format!("{host}:{port}")
-        .parse::<SocketAddr>()
-        .with_context(|| format!("invalid app-server listen address {host}:{port}"))
-        .and_then(|listen| {
-            runtime.block_on(run_app_server(AppServerOptions {
-                listen,
-                config_path,
-                auth_token: args.auth_token.or_else(app_server_token_from_env),
-                insecure_no_auth: args.insecure_no_auth,
-                cors_origins: args.cors_origin,
-            }))
+    let mut launch = args;
+    if launch.port.is_none() {
+        launch.port = Some(if launch.stdio || launch.socket {
+            0
+        } else if launch.http || launch.mobile {
+            7878
+        } else {
+            8787
         });
-    finish_cli_telemetry(session, &outcome);
-    outcome
+    }
+    if !launch.http && !launch.mobile {
+        launch.auth_token = launch.auth_token.or_else(app_server_token_from_env);
+    }
+    let argv = app_server_serve_passthrough(&launch);
+    apply_tui_env(cli, resolved_runtime, &argv);
+    let code = codewhale_tui::run(startup, argv);
+    std::process::exit(if code == std::process::ExitCode::SUCCESS {
+        0
+    } else {
+        1
+    })
 }
 
 /// The config file an in-process app-server loads: the subcommand's own
@@ -5857,8 +5980,9 @@ fn app_server_config_path(cli: &Cli, args: &AppServerArgs) -> Option<PathBuf> {
 /// matching `serve` flags (note `--insecure-no-auth` → `--insecure`). The
 /// subcommand-level `--config` is bridged through the global `--config` in the
 /// dispatcher, so it is intentionally not part of this passthrough. An auth
-/// token from the environment is deliberately *not* forwarded into child argv;
-/// the runtime API reads CODEWHALE_RUNTIME_TOKEN/DEEPSEEK_RUNTIME_TOKEN itself.
+/// token from the compatibility environment is retained in this same-process
+/// argument vector; no child process or owner discovery receipt receives it.
+/// Canonical Runtime environment resolution remains in the Runtime API.
 fn app_server_serve_passthrough(args: &AppServerArgs) -> Vec<String> {
     let mut forwarded = vec!["serve".to_string()];
     forwarded.push(if args.mobile { "--mobile" } else { "--http" }.to_string());
@@ -5906,57 +6030,6 @@ fn app_server_token_from_env() -> Option<String> {
         .or_else(|| std::env::var("DEEPSEEK_APP_SERVER_TOKEN").ok())
 }
 
-/// Delegate a long-running server command (`serve --http`/`--mobile`,
-/// `app-server --http`/`--mobile`) to the sibling TUI binary, supervising the
-/// child so its listener does not outlive the dispatcher (#3259).
-///
-/// Plain [`run_tui_in_process`] blocks on `Command::status()`, which reaps the
-/// child only on the child's own exit. If the dispatcher is terminated while
-/// the delegated server is still running, the child can be reparented and keep
-/// its listener bound. Here the child runs under a Tokio supervisor that
-/// forwards termination (Ctrl+C / SIGTERM / SIGHUP) by killing and reaping the
-/// child before the dispatcher exits, and `kill_on_drop` tears the child down
-/// if the dispatcher unwinds.
-///
-/// For an *uncatchable* dispatcher death (SIGKILL, a hard crash) the Tokio
-/// supervisor above can't run, so two OS-level safety nets are installed as
-/// well (#3259): on Linux the child sets `PR_SET_PDEATHSIG` so the kernel
-/// signals it when the dispatcher dies; on Windows the child is placed in a
-/// kill-on-job-close Job Object so closing the dispatcher's handle (which the
-/// OS does on process death) terminates it. macOS has no equivalent primitive,
-/// so an uncatchable dispatcher death there can still orphan the child.
-
-/// On Linux, ask the kernel to terminate the delegated server if the dispatcher
-/// dies before it can run the graceful shutdown supervisor. This covers the
-/// hard parent-death edge of #3259 for `SIGKILL`, OOM, or abrupt process exit.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
-
-/// Outcome of supervising a delegated server child.
-#[derive(Debug)]
-
-/// Wait for the server `child` to exit, or for `shutdown` to fire first. On
-/// shutdown, kill the child and reap it so no listener is left reparented.
-
-/// Resolve when the dispatcher should tear down a delegated server child, and
-/// the conventional `128 + signal` exit code to propagate: Ctrl+C on every
-/// platform (130), plus SIGTERM (143) and SIGHUP (129) on Unix.
-#[cfg(unix)]
-#[cfg(not(unix))]
-
-/// Assign the delegated server `child` to a kill-on-job-close Job Object so the
-/// OS terminates it when the dispatcher's handle to the job closes — which it
-/// does on any dispatcher exit, including an uncatchable kill (#3259). The
-/// returned guard must be held for the dispatcher's lifetime. Best-effort:
-/// returns `None` if the job cannot be created or assigned. Mirrors the Job
-/// Object idiom in `crates/tui/src/tools/shell.rs`.
-#[cfg(windows)]
-#[cfg(windows)]
-// SAFETY: the wrapped value is a process-wide kernel handle; moving it across
-// threads does not invalidate it, and it is only ever closed once, on drop.
-#[cfg(windows)]
-unsafe impl Send for ServerChildJob {}
-
 fn run_resume_command(
     cli: &Cli,
     resolved_runtime: &ResolvedRuntimeOptions,
@@ -5973,9 +6046,9 @@ fn run_dispatcher_resume_picker(
     cli: &Cli,
     resolved_runtime: &ResolvedRuntimeOptions,
 ) -> Result<()> {
-    let argv = tui_argv(cli, vec!["sessions".to_string()]);
+    let argv = vec!["sessions".to_string()];
     apply_tui_env(cli, resolved_runtime, &argv);
-    let code = codewhale_tui::run(argv);
+    let code = codewhale_tui::run(cli.runtime_options.clone(), argv);
     if code != std::process::ExitCode::SUCCESS {
         std::process::exit(if code == std::process::ExitCode::SUCCESS {
             0
@@ -6015,9 +6088,9 @@ fn run_tui_in_process(
     resolved_runtime: &ResolvedRuntimeOptions,
     passthrough: Vec<String>,
 ) -> Result<()> {
-    let argv = tui_argv(cli, passthrough.clone());
+    let argv = passthrough.clone();
     apply_tui_env(cli, resolved_runtime, &passthrough);
-    let code = codewhale_tui::run(argv);
+    let code = codewhale_tui::run(cli.runtime_options.clone(), argv);
     std::process::exit(if code == std::process::ExitCode::SUCCESS {
         0
     } else {
@@ -6030,56 +6103,14 @@ fn run_tui_server_in_process(
     resolved_runtime: &ResolvedRuntimeOptions,
     passthrough: Vec<String>,
 ) -> Result<()> {
-    let argv = tui_argv(cli, passthrough.clone());
+    let argv = passthrough.clone();
     apply_tui_env(cli, resolved_runtime, &passthrough);
-    let code = codewhale_tui::run(argv);
+    let code = codewhale_tui::run(cli.runtime_options.clone(), argv);
     std::process::exit(if code == std::process::ExitCode::SUCCESS {
         0
     } else {
         1
     })
-}
-
-fn tui_argv(cli: &Cli, passthrough: Vec<String>) -> Vec<String> {
-    let mut args = Vec::new();
-    args.push("codewhale".to_string());
-    if let Some(config) = cli.config.as_deref() {
-        args.push("--config".to_string());
-        args.push(config.display().to_string());
-    }
-    if let Some(profile) = cli.profile.as_ref() {
-        args.push("--profile".to_string());
-        args.push(profile.clone());
-    }
-    if let Some(workspace) = cli.workspace.as_deref() {
-        args.push("--workspace".to_string());
-        args.push(workspace.display().to_string());
-    }
-    if cli.mouse_capture {
-        args.push("--mouse-capture".to_string());
-    }
-    if cli.no_mouse_capture {
-        args.push("--no-mouse-capture".to_string());
-    }
-    if cli.skip_onboarding {
-        args.push("--skip-onboarding".to_string());
-    }
-    if cli.fresh {
-        args.push("--fresh".to_string());
-    }
-    if cli.no_project_config {
-        args.push("--no-project-config".to_string());
-    }
-    for feature in &cli.enable {
-        args.push("--enable".to_string());
-        args.push(feature.clone());
-    }
-    for feature in &cli.disable {
-        args.push("--disable".to_string());
-        args.push(feature.clone());
-    }
-    args.extend(passthrough);
-    args
 }
 
 /// Set one process environment variable for the CLI-to-TUI bridge.
@@ -7033,7 +7064,8 @@ mod tests {
         let project_bundle_scope = config_command_targets_project(&matches);
         let cli = Cli::from_arg_matches(&matches)
             .unwrap_or_else(|error| panic!("config command should decode: {error}"));
-        let selected_path = config_store_path_for_dispatch(cli.config, project_bundle_scope, cwd);
+        let selected_path =
+            config_store_path_for_dispatch(cli.config.clone(), project_bundle_scope, cwd);
         let Some(Commands::Config(ConfigArgs { command })) = cli.command else {
             panic!("expected config command");
         };
@@ -7529,8 +7561,6 @@ verbosity = "concise"
 
     #[test]
     fn thread_commands_refuse_unknown_ids_instead_of_reporting_success() {
-        let dir = tempfile::tempdir().expect("state dir");
-        let state = StateStore::open(Some(dir.path().join("state.db"))).expect("open state");
         for command in [
             ThreadCommand::Archive {
                 thread_id: "missing".into(),
@@ -7542,14 +7572,281 @@ verbosity = "concise"
                 thread_id: "missing".into(),
             },
         ] {
-            let label = format!("{command:?}");
-            let error = run_thread_store_command(&state, command)
-                .expect_err("an unknown thread id must fail");
+            let error = run_thread_control_command_with(command, |_| {
+                serde_json::from_value(serde_json::json!({
+                    "thread_id":"missing","status":"missing","threads":[],"events":[],"data":{}
+                }))
+                .map_err(Into::into)
+            })
+            .expect_err("unknown canonical thread must fail");
+            assert!(format!("{error:#}").contains("thread not found: missing"));
+        }
+    }
+
+    #[test]
+    fn thread_fork_validates_new_owner_receipt_instead_of_parent_identity() {
+        let cli = parse_ok(&[
+            "codewhale",
+            "thread",
+            "fork",
+            "parent",
+            "--operation-key",
+            "same-intent",
+        ]);
+        let Some(Commands::Thread(ThreadArgs { command })) = cli.command else {
+            panic!("thread fork")
+        };
+        let calls = std::cell::Cell::new(0usize);
+        run_thread_control_command_with(command, |request| {
+            calls.set(calls.get()+1);
+            let codewhale_app_server::ThreadRequest::Fork(params) = request else { panic!("fork request") };
+            assert_eq!(params.thread_id, "parent");
+            assert_eq!(params.operation_key.as_deref(), Some("same-intent"));
+            serde_json::from_value(serde_json::json!({"thread_id":"child","status":"forked",
+                "data":{"receipt":{"runtime_thread_id":"child","session_id":"child-session","operation_key":"same-intent"}}}))
+                .map_err(Into::into)
+        }).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn thread_resume_uncertainty_retains_one_client_key_and_never_replays() {
+        let calls = std::cell::Cell::new(0usize);
+        let captured = std::cell::RefCell::new(String::new());
+        let error = run_thread_control_command_with(
+            ThreadCommand::Resume {
+                thread_id: "parent".into(),
+                operation_key: None,
+            },
+            |request| {
+                calls.set(calls.get() + 1);
+                let codewhale_app_server::ThreadRequest::Resume(params) = request else {
+                    panic!("resume request")
+                };
+                *captured.borrow_mut() = params.operation_key.unwrap();
+                bail!("selected owner closed after admission")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(!captured.borrow().is_empty());
+        assert!(format!("{error:#}").contains(&format!("--operation-key {}", captured.borrow())));
+        assert!(format!("{error:#}").contains("no automatic replay"));
+    }
+
+    #[test]
+    fn thread_control_startup_selection_resolves_only_explicit_paths() {
+        let cli = parse_ok(&[
+            "codewhale",
+            "--workspace",
+            "selected",
+            "--profile",
+            "reviewed",
+            "--config",
+            "chosen.toml",
+            "thread",
+            "list",
+        ]);
+        let startup = Path::new("/captured-startup");
+        let selected = thread_control_selection(&cli, startup).unwrap();
+        assert_eq!(selected.workspace, Some(startup.join("selected")));
+        assert_eq!(selected.config_profile.as_deref(), Some("reviewed"));
+        assert_eq!(selected.config_source, Some(startup.join("chosen.toml")));
+        let cli = parse_ok(&["codewhale", "--profile", "reviewed", "thread", "list"]);
+        let selected = thread_control_selection(&cli, startup).unwrap();
+        assert!(selected.workspace.is_none() && selected.config_source.is_none());
+    }
+
+    #[test]
+    fn thread_history_cli_normalized_route_and_policy_reach_typed_owner_request() {
+        let mut cli = parse_ok(&[
+            "codewhale",
+            "--provider",
+            "owned-route",
+            "--model",
+            "explicit-model",
+            "--set",
+            "default_text_model=set-model",
+            "--set",
+            "approval_policy=on-request",
+            "--set",
+            "sandbox_mode=workspace-write",
+            "thread",
+            "resume",
+            "source",
+        ]);
+        apply_runtime_set_overrides(&mut cli).unwrap();
+        assert!(
+            top_level_provider_override(cli.provider.as_deref(), cli.command.as_ref())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prepare_raw_provider_tui_dispatch(
+                &cli,
+                cli.command.as_ref(),
+                &CliRuntimeOverrides::default()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let Some(Commands::Thread(args)) = cli.command.as_ref() else {
+            panic!("thread command");
+        };
+        let options = thread_control_mutation_options(&cli, &args.command).unwrap();
+        let request = apply_thread_control_mutation_options(
+            thread_control_request(&args.command).unwrap(),
+            &options,
+        )
+        .unwrap();
+        let codewhale_app_server::ThreadRequest::Resume(params) = request else {
+            panic!("typed Resume");
+        };
+        assert_eq!(params.model.as_deref(), Some("explicit-model"));
+        assert_eq!(params.model_provider.as_deref(), Some("owned-route"));
+        assert_eq!(params.approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(params.sandbox.as_deref(), Some("workspace-write"));
+        assert!(
+            params.config.is_none() && params.path.is_none(),
+            "no resolved Config or ambient path is copied"
+        );
+        let cli = parse_ok(&[
+            "codewhale",
+            "--provider",
+            "openai-codex",
+            "thread",
+            "fork",
+            "source",
+        ]);
+        let Some(Commands::Thread(args)) = cli.command.as_ref() else {
+            panic!("thread command");
+        };
+        let options = thread_control_mutation_options(&cli, &args.command).unwrap();
+        assert_eq!(
+            options["model_provider"],
+            builtin_provider_arg("openai-codex").unwrap().as_str()
+        );
+    }
+
+    #[test]
+    fn thread_history_cli_refuses_credentials_and_unsupported_settings_without_values() {
+        for argv in [
+            vec![
+                "codewhale",
+                "--api-key",
+                "private-control-sentinel",
+                "thread",
+                "resume",
+                "source",
+            ],
+            vec![
+                "codewhale",
+                "--base-url",
+                "https://private-control-sentinel.invalid",
+                "thread",
+                "fork",
+                "source",
+            ],
+            vec![
+                "codewhale",
+                "--set",
+                "api_key=private-control-sentinel",
+                "thread",
+                "resume",
+                "source",
+            ],
+            vec![
+                "codewhale",
+                "--set",
+                "telemetry=true",
+                "thread",
+                "fork",
+                "source",
+            ],
+        ] {
+            let cli = parse_ok(&argv);
+            let Some(Commands::Thread(args)) = cli.command.as_ref() else {
+                panic!("thread command");
+            };
+            let error = thread_control_mutation_options(&cli, &args.command).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("owning Runtime") && !text.contains("private-control-sentinel"));
+        }
+    }
+
+    #[test]
+    fn thread_history_cli_retained_key_refuses_new_policy_or_route_proposal() {
+        for flag in [
+            "--model",
+            "--provider",
+            "--approval-policy",
+            "--sandbox-mode",
+        ] {
+            let value = match flag {
+                "--provider" => "owned-route",
+                "--model" => "another-model",
+                "--approval-policy" => "on-request",
+                _ => "workspace-write",
+            };
+            let cli = parse_ok(&[
+                "codewhale",
+                flag,
+                value,
+                "thread",
+                "resume",
+                "source",
+                "--operation-key",
+                "retained-key",
+            ]);
+            let Some(Commands::Thread(args)) = cli.command.as_ref() else {
+                panic!("thread command");
+            };
             assert!(
-                format!("{error:#}").contains("thread not found: missing"),
-                "{label}: {error:#}"
+                format!(
+                    "{:#}",
+                    thread_control_mutation_options(&cli, &args.command).unwrap_err()
+                )
+                .contains("original admitted intent")
             );
         }
+        let cli = parse_ok(&[
+            "codewhale",
+            "thread",
+            "fork",
+            "source",
+            "--operation-key",
+            "retained-key",
+        ]);
+        let Some(Commands::Thread(args)) = cli.command.as_ref() else {
+            panic!("thread command");
+        };
+        assert!(
+            thread_control_mutation_options(&cli, &args.command)
+                .unwrap()
+                .is_empty()
+        );
+        let request = thread_control_request(&args.command).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["operation_key"],
+            "retained-key"
+        );
+    }
+
+    #[test]
+    fn thread_control_without_selection_never_mints_ambient_workspace() {
+        let cli = parse_ok(&["codewhale", "thread", "list"]);
+        assert!(thread_control_selection(&cli, Path::new("/unrelated-startup")).is_none());
+    }
+
+    #[test]
+    fn thread_control_refuses_a_receipt_from_another_intent() {
+        let error = run_thread_control_command_with(ThreadCommand::Fork {
+            thread_id:"parent".into(), operation_key:Some("expected-intent".into())
+        }, |_| serde_json::from_value(serde_json::json!({"thread_id":"child","status":"forked",
+            "data":{"receipt":{"runtime_thread_id":"child","session_id":"child-session","operation_key":"foreign-intent"}}})).map_err(Into::into))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("another intent receipt"));
+        assert!(format!("{error:#}").contains("expected-intent"));
     }
 
     #[test]
@@ -7785,7 +8082,7 @@ verbosity = "concise"
         assert!(matches!(
             cli.command,
             Some(Commands::Thread(ThreadArgs {
-                command: ThreadCommand::Resume { ref thread_id }
+                command: ThreadCommand::Resume { ref thread_id, operation_key: None }
             })) if thread_id == "thread-2"
         ));
 
@@ -7793,7 +8090,7 @@ verbosity = "concise"
         assert!(matches!(
             cli.command,
             Some(Commands::Thread(ThreadArgs {
-                command: ThreadCommand::Fork { ref thread_id }
+                command: ThreadCommand::Fork { ref thread_id, operation_key: None }
             })) if thread_id == "thread-3"
         ));
 
@@ -8558,10 +8855,9 @@ verbosity = "concise"
         let cli = parse_ok(&["codewhale", "--provider", "lm-studio", "model", "list"]);
         let err = top_level_provider_override(cli.provider.as_deref(), cli.command.as_ref())
             .expect_err("model registry commands still require a built-in provider");
-        assert!(
-            err.to_string()
-                .contains("configured custom providers are accepted only by exec and fleet")
-        );
+        assert!(err.to_string().contains(
+            "configured custom providers are accepted by exec, fleet and thread resume/fork"
+        ));
 
         let err = Cli::try_parse_from(["codewhale", "auth", "set", "--provider", "lm-studio"])
             .expect_err("auth keeps enum-only provider validation");
@@ -12177,79 +12473,34 @@ verbosity = "concise"
     }
 
     #[test]
-    fn root_fresh_and_mouse_flags_forward_as_separate_tui_arguments() {
-        for flags in [
-            ["--fresh", "--mouse-capture"],
-            ["--mouse-capture", "--fresh"],
-        ] {
-            let cli = parse_ok(&[
-                "codewhale",
-                "--workspace",
-                "workspace with spaces",
-                "--no-project-config",
-                flags[0],
-                flags[1],
-            ]);
-            assert_eq!(
-                tui_argv(&cli, root_tui_passthrough(&cli).unwrap()),
-                [
-                    "codewhale",
-                    "--workspace",
-                    "workspace with spaces",
-                    "--mouse-capture",
-                    "--fresh",
-                    "--no-project-config",
-                ],
-                "{flags:?} must remain launch flags, not a joined prompt"
-            );
-        }
-    }
-
-    #[test]
-    fn root_feature_toggles_forward_to_the_tui_instead_of_becoming_prompt_text() {
-        // `codewhale --enable extension_host` used to fail: the dispatcher had
-        // no such flag, and the TUI parser rejected the joined prompt text.
+    fn root_launch_facts_are_typed_and_prompt_whitespace_is_preserved() {
         let cli = parse_ok(&[
             "codewhale",
+            "--workspace",
+            "workspace with spaces",
+            "--fresh",
+            "--mouse-capture",
+            "--no-project-config",
             "--enable",
             "extension_host",
             "--disable",
             "web_search",
-            "--enable",
-            "goals",
-        ]);
-        assert!(cli.prompt.is_empty());
-        assert_eq!(
-            tui_argv(&cli, root_tui_passthrough(&cli).unwrap()),
-            [
-                "codewhale",
-                "--enable",
-                "extension_host",
-                "--enable",
-                "goals",
-                "--disable",
-                "web_search",
-            ]
-        );
-    }
-
-    #[test]
-    fn root_fresh_preserves_quoted_prompt_whitespace_and_split_tail() {
-        let cli = parse_ok(&[
-            "codewhale",
-            "--fresh",
-            "--mouse-capture",
             "--prompt",
             "Keep  two spaces\nand a tab\there",
             "then",
             "explain them",
         ]);
+        let options = &cli.runtime_options;
         assert_eq!(
-            tui_argv(&cli, root_tui_passthrough(&cli).unwrap()),
+            options.workspace,
+            Some(PathBuf::from("workspace with spaces"))
+        );
+        assert!(options.fresh && options.mouse_capture && options.no_project_config);
+        assert_eq!(options.enable, ["extension_host"]);
+        assert_eq!(options.disable, ["web_search"]);
+        assert_eq!(
+            root_tui_passthrough(&cli).unwrap(),
             [
-                "codewhale",
-                "--mouse-capture",
-                "--fresh",
                 "--prompt",
                 "Keep  two spaces\nand a tab\there then explain them",
             ]
@@ -12266,13 +12517,58 @@ verbosity = "concise"
             "as literal flags",
         ]);
         assert_eq!(
-            tui_argv(&cli, root_tui_passthrough(&cli).unwrap()),
+            cli.runtime_options,
+            codewhale_tui::RuntimeOptions::default()
+        );
+        assert_eq!(
+            root_tui_passthrough(&cli).unwrap(),
             [
-                "codewhale",
                 "--prompt",
                 "Explain --fresh --mouse-capture as literal flags",
             ]
         );
+    }
+
+    #[test]
+    fn canonical_cli_accepts_legacy_tui_workspace_and_completion_aliases() {
+        let cli = parse_ok(&[
+            "codewhale-tui",
+            "-w",
+            "legacy workspace",
+            "--verbose",
+            "--max-subagents",
+            "4",
+            "doctor",
+        ]);
+        assert_eq!(
+            cli.workspace.as_deref(),
+            Some(std::path::Path::new("legacy workspace"))
+        );
+        assert!(cli.verbose);
+        assert_eq!(cli.max_subagents, Some(4));
+        assert!(matches!(cli.command, Some(Commands::Doctor(_))));
+        let cli = parse_ok(&["codewhale-tui", "completions", "bash"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Completion { shell: Shell::Bash })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_runtime_paths_keep_non_utf8_workspace_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/workspace-\xff".to_vec(),
+        ));
+        let cli = Cli::try_parse_from([
+            std::ffi::OsString::from("codewhale"),
+            std::ffi::OsString::from("--workspace"),
+            path.clone().into_os_string(),
+        ])
+        .expect("native workspace path parses");
+        assert_eq!(cli.runtime_options.workspace, Some(path));
+        assert!(root_tui_passthrough(&cli).unwrap().is_empty());
     }
 
     #[test]

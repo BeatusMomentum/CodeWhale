@@ -208,7 +208,7 @@ impl ToolSpec for FetchUrlTool {
                         &fetched.bytes,
                         is_success,
                         body_text.as_deref(),
-                        PdfTextCommand::system(context.cancel_token.as_ref()),
+                        PdfTextCommand::system(Some(context)),
                     )
                     .await?;
                     Ok((extracted, fields))
@@ -292,7 +292,7 @@ async fn extract_fetched_document(
     is_success: bool,
     decoded_body: Option<&str>,
     pdf_command: PdfTextCommand<'_>,
-) -> Result<ExtractedDocument, ToolError> {
+) -> super::web::adapter::AdapterResult<ExtractedDocument> {
     let extraction = if format == Format::Raw
         && super::web::extract::validate_pdf_response(url, Some(content_type), bytes)?
     {
@@ -316,8 +316,10 @@ async fn extract_fetched_document(
     };
     match extraction {
         Ok(document) => Ok(document),
-        Err(_error)
-            if (format == Format::Raw || !is_success) && is_declared_textual(content_type) =>
+        Err(error)
+            if error.content()
+                && (format == Format::Raw || !is_success)
+                && is_declared_textual(content_type) =>
         {
             let body_text = match decoded_body {
                 Some(body_text) => body_text.to_string(),

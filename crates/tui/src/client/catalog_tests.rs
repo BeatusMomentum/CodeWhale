@@ -460,7 +460,7 @@ async fn models_redirects_never_reach_another_server_from_any_consumer() {
         recovery.maybe_probe_recovery().await;
         assert!(recovery.connection_health.lock().await.last_probe.is_some());
         assert!(
-            verify_provider_api_key(ApiProvider::Anthropic, KEY, &server.uri())
+            verify_provider_api_key(ProviderKind::Anthropic, KEY, &server.uri())
                 .await
                 .is_err()
         );

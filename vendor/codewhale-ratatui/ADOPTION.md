@@ -17,17 +17,34 @@ facts, localized labels and hints, clock lifecycle, live/custom theme ink and
 action dispatch. The current kit drops the pinned right PostureFact's optional
 ink during layout. The host carries every fact's exact ink in a distinct role
 and uses the shared live-theme adapter, so permission and right-notice colors
-remain independent without modifying pinned source. Mounted composer,
-dock, transcript, ocean and character remain in the Engine until their keyboard, mouse,
-localization and layout contracts can move together.
+remain independent without modifying pinned source. Dock tabs, body layout
+and scrollbar paint use the accepted shared plans. Engine still composes live
+rows, hover text and typed actions. Character state and timing remain in the
+Engine; packed Braille painting uses the shared raster plan.
 
-The Ocean compatibility slice adopts the complete ramp/column pure
-sampling facade with explicit live colors, retaining the Engine's monotonic
-clocks, life-presence policy and actual-ramp cache identity. Host semantic
-finishing still follows the current ColorCompatBackend policy. This is not
-yet adoption of the kit's guarded apply/apply_matching path: its known-dark
-truecolor-only gate and refusal of unreadable or unknown foregrounds require
-explicit reconciliation with current host painting before that move.
+The Ocean facade adopts complete pure sampling and guarded painting. The
+kit owns matching-cell iteration, proposed visible-ink contrast checks,
+absolute-row cached samples, explicit semantic-surface projection and sparse
+caustic paint/math. Engine keeps live UiTheme colors, actual backend depth and
+ASCII facts, monotonic clocks, phase/context/presence/completion policy,
+actual-ramp cache identity, frame composition and ambient character lifecycle.
+Backend palette adaptation supplies the exact proposed visible ink; source
+symbols, inks and modifiers stay untouched. Main and focused transcripts
+publish explicit styled-ground masks, preserving blank semantic padding and
+custom RGB aliases through the final whole-shell pass. A composer selection
+whose custom ground aliases its base conservatively protects its mounted area.
+
+This deliberately reconciles prior unguarded host paint: lower color depths
+keep the flat selected pane; light, Reset and unknown named base grounds never
+supply dark-water evidence. An actually painted opaque dark pane can supply
+known-ground evidence when the terminal default is unknown, while actual
+truecolor capability is still required. Unreadable or unknown backend inks,
+reversed cells, different grounds and semantic regions are spared. Caustics
+only touch already painted ordinary water and share reduced-motion/capability
+guards. Frozen safe-painter comparisons retain exact ordinary RGB geometry,
+phase/cache samples and travelling caustic rounding; intentional guard
+improvements have explicit cases. Character paint and its occupancy/scheduler
+remain outside this background finishing adoption.
 
 PendingCard routes the complete composer pending-input facade through the
 kit's measured row plan, shared with its existing generic PendingInputPreview.
@@ -50,5 +67,46 @@ collapsed and empty frames retain canonical empty slots and withdraw stale
 geometry. Every styled span and rule-coverage string is display-safe before
 measurement and painting. The generic bordered ApprovalCard keeps
 its separate verbatim-subject/input contract, and the native band does not
-claim its invisible-token encoding. Mounted composer, ElevationWidget painting
-and transcript are still outside this slice.
+claim its invisible-token encoding. ElevationWidget painting
+remains outside this approval slice.
+
+NativeComposerFrame adopts the complete mounted composer: shell/titles,
+raw scalar source row projection, display-safe selection, final caret/prompt,
+IME empty row, menu reservation/centering/columns, wrapped option rectangles
+and hover bounds. Existing NativeComposer painting/caret also uses this same
+pure plan. Engine editor state, history/completion/filtering, localized fact
+copy, exact live/custom styles, paste/submit predicates and key/IME dispatch
+remain authoritative. Frame viewport records the painter's actual centered
+padding and scroll; mouse/keyboard/wheel source projection uses the same kit
+rows while retaining keyboard display-column versus wheel scalar-column
+policy. Old mounted shell, wrapping, selection and menu geometry are deleted;
+frozen old code is test-only. Generated gallery/catalogue assets and native
+input/provider acceptance require separate evidence after this candidate.
+
+
+TranscriptViewport adopts every mounted cached-row painter: the main
+ChatWidget, focused-child transcript and LiveTranscriptOverlay use the kit's
+pure content/viewport/chrome plan. The old paragraph/scrollbar/jump compositor,
+link-column clipping and span selection painter are deleted from production.
+Engine parsing, cache/source receipts and revisions, original clipboard source,
+streaming/session state, scroll intent and selection endpoints remain
+unchanged. The host supplies exact live style facts and its existing CJK/keycap
+column grammar; the kit preserves styled spans and guards display content.
+Opaque hyperlink targets remain only in Engine metadata, with existing URI
+validation and OSC emission; final geometry excludes rails and the opaque
+jump button. The kit guarded Ocean finishing runs between transcript content
+and chrome using the same source-derived semantic regions; ambient character
+policy remains host-owned. Counterparts are private cfg(test) fixtures. Generated
+previews, compiled/native accessibility/input checks and hosted CI require
+separate acceptance evidence.
+
+DockTabRow supplies fitting, painting and typed target geometry for all strip
+tabs. WorkbarLayout::for_body and WorkbarScrollbar share body reservation,
+clipping and rail paint with the gallery. Engine keeps the selected caller,
+live row facts, localized labels, custom ink, viewport intent and action
+dispatch. Exact buffer and target counterparts are private test fixtures;
+source adoption alone does not qualify installed-terminal behavior.
+
+BrailleFrame paints the existing packed character raster. Engine retains its
+external pose digest, session cursor, animation/audio ownership and scheduler.
+This avoids a second character clock while using the same measured pixels.

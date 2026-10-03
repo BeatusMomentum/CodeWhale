@@ -2,6 +2,7 @@
 
 import type { RatatuiCopy } from "@/lib/content/ratatui";
 import { CopyButton } from "./explorer";
+import { CodeBlock } from "./highlight";
 import { INSTALL, STARTER_SOURCE, TRY_STARTER, getRecipe, learningGuideUrl } from "@/lib/ratatui/recipes";
 import "./quickstart.css";
 
@@ -18,7 +19,7 @@ export function RatatuiQuickstart({ copy }: { copy: RatatuiCopy }) {
     </div>
     <div className="rat-start-command">
       <CopyButton text={TRY_STARTER} copy={copy} />
-      <pre tabIndex={0} dir="ltr"><code>{TRY_STARTER}</code></pre>
+      <CodeBlock code={TRY_STARTER} language="sh" />
       <p>{copy.rustVersion} · {copy.license}</p>
     </div>
     <details className="rat-existing-app">
@@ -26,10 +27,10 @@ export function RatatuiQuickstart({ copy }: { copy: RatatuiCopy }) {
       <div className="rat-existing-body">
         <p>{copy.installationDescription}</p>
         <CopyButton text={INSTALL} copy={copy} />
-        <pre tabIndex={0} dir="ltr"><code>{INSTALL}</code></pre>
+        <CodeBlock code={INSTALL} language="toml" />
         <p>{copy.themeNote}</p>
-        <pre tabIndex={0} dir="ltr"><code>{"let theme = codewhale_ratatui::Theme::detect().tui();"}</code></pre>
-        {composer && <><CopyButton text={composer.code} copy={copy} /><pre tabIndex={0} dir="ltr"><code>{composer.code}</code></pre></>}
+        <CodeBlock code={"let theme = codewhale_ratatui::Theme::detect().tui();"} language="rust" />
+        {composer && <><CopyButton text={composer.code} copy={copy} /><CodeBlock code={composer.code} language="rust" /></>}
         <dl className="rat-host-flow">
           <div><dt>{copy.stateTitle}</dt><dd>{copy.stateDescription}</dd></div>
           <div><dt>{copy.paintTitle}</dt><dd>{copy.paintDescription}</dd></div>

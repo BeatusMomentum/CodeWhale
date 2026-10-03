@@ -30,9 +30,10 @@
 //! modules its bundle embeds, which the core checks against what it launched
 //! (`supervisor::check_hello_identity`).
 //!
-//! There is deliberately no method that expresses approval, and nothing a
-//! host can send makes the core *do* anything: registrations are admitted or
-//! refused, and tool calls only flow core→host after the gate. `command/run`
+//! There is deliberately no method that expresses approval. Registrations
+//! are admitted or refused and tool calls flow core→host after the gate. The
+//! builtin-only broker methods redeem single-use exact Rust-issued operation
+//! tickets; they expose no launch command, credential or decision key. `command/run`
 //! flows core→host only when the user invokes the command themselves; the
 //! host answers with text or a prompt, and the core decides whether and how
 //! to show or submit it. The authority lint in `protocol/tests.rs` keeps
@@ -147,12 +148,68 @@ pub const METHODS: &[MethodSpec] = &[
     row(Direction::CoreToHost, "tool/call", true),
     row(Direction::CoreToHost, "command/run", true),
     row(Direction::CoreToHost, "hook/evaluate", true),
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::CoreToHost, "mcp/open", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::CoreToHost, "mcp/request", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::CoreToHost, "mcp/close", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::CoreToHost, "harness/run", true)
+    },
     row(Direction::CoreToHost, "$/cancel", false),
     row(Direction::HostToCore, "host/hello", false),
     row(Direction::HostToCore, "host/ready", false),
     row(Direction::HostToCore, "registry/register", true),
     row(Direction::HostToCore, "registry/unregister", true),
     row(Direction::HostToCore, "core/call", true),
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "proc/launch", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "proc/read", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "proc/write", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "proc/close", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "net/start", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "net/fetch", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "net/read", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "net/release", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "net/close", true)
+    },
+    MethodSpec {
+        tiers: &[HostTier::Builtin],
+        ..row(Direction::HostToCore, "exec/redeem", true)
+    },
     row(Direction::HostToCore, "ext/faulted", false),
     row(Direction::HostToCore, "log", false),
     row(Direction::HostToCore, "$/cancel", false),
@@ -277,6 +334,9 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<V
 
 /// `Some(value)` even for an explicit JSON `null`, so `"result": null` is a
 /// present result and round-trips.
+fn present_entry<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<EntryRef>, D::Error> {
+    EntryRef::deserialize(deserializer).map(Some)
+}
 fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
     Value::deserialize(deserializer).map(Some)
 }
@@ -382,7 +442,10 @@ pub enum RegisterKind {
     Command,
     Hook,
     PromptSection,
+    PromptTemplate,
     SkillRoot,
+    ShellHook,
+    McpServer,
 }
 
 /// What a registration proposes. The fields a kind uses are fixed by
@@ -410,6 +473,12 @@ pub struct RegisterSpecWire {
 #[serde(deny_unknown_fields)]
 pub struct RegisterParams {
     pub owner: OwnerRef,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_entry"
+    )]
+    pub scope: Option<EntryRef>,
     pub kind: RegisterKind,
     pub spec: RegisterSpecWire,
 }
@@ -430,7 +499,7 @@ impl RegisterParams {
             RegisterKind::Command if spec.input_schema.is_some() => {
                 Err("a command registration has no `spec.input_schema`".to_string())
             }
-            RegisterKind::Hook | RegisterKind::PromptSection | RegisterKind::SkillRoot
+            RegisterKind::Hook | RegisterKind::PromptSection | RegisterKind::PromptTemplate | RegisterKind::SkillRoot | RegisterKind::ShellHook | RegisterKind::McpServer
                 if spec.input_schema.is_some() || spec.argument_hint.is_some() =>
             {
                 Err(
@@ -492,11 +561,171 @@ pub struct CancelParams {
     pub id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HookDispatchWire {
+    pub event: String,
+    pub dialect: String,
+    pub point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    pub query: String,
+}
+
+// Opaque execution references only. Rust never sends commands, inputs, environment or credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRunParams {
+    pub owner: OwnerRef,
+    pub execution_id: String,
+    pub ticket: String,
+    pub deadline_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<HookDispatchWire>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionRedeemParams {
+    pub owner: OwnerRef,
+    pub execution_id: String,
+    pub ticket: String,
+}
+
+// Tier-0 MCP semantic operations and broker pipe access. Launch details and
+// Computer Use keys are Rust-only; every write is an exact single-use grant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct McpOperationGrant {
+    pub ticket: String,
+    pub operation_id: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_id: Option<String>,
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct McpOpenParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub launch_ticket: String,
+    pub transport: String,
+    pub initialize_grant: McpOperationGrant,
+    pub initialized_grant: McpOperationGrant,
+    pub client_version: String,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct McpRequestParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub grant: McpOperationGrant,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct McpCloseParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProcLaunchParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub ticket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProcSessionParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProcWriteParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub frame: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+/// The SDK can propose framing headers only. Rust adds credentials itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct McpHttpHeaders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_protocol_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct NetFetchParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub url: String,
+    pub method: String,
+    pub headers: McpHttpHeaders,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct NetReadParams {
+    pub owner: OwnerRef,
+    pub session_id: String,
+    pub response_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostRequest {
     Register(RegisterParams),
     Unregister(UnregisterParams),
     CoreCall(CoreCallParams),
+    ExecutionRedeem(ExecutionRedeemParams),
+    ProcClose(ProcSessionParams),
+    NetStart(ProcLaunchParams),
+    NetFetch(NetFetchParams),
+    NetRead(NetReadParams),
+    NetRelease(NetReadParams),
+    NetClose(ProcSessionParams),
+    ProcWrite(ProcWriteParams),
+    ProcRead(ProcSessionParams),
+    ProcLaunch(ProcLaunchParams),
 }
 
 impl HostRequest {
@@ -507,6 +736,16 @@ impl HostRequest {
             Self::Register(params) => &params.owner.plugin_id,
             Self::Unregister(params) => &params.owner.plugin_id,
             Self::CoreCall(params) => &params.owner.plugin_id,
+            Self::ExecutionRedeem(params) => &params.owner.plugin_id,
+            Self::ProcClose(params) => &params.owner.plugin_id,
+            Self::NetClose(params) => &params.owner.plugin_id,
+            Self::NetRelease(params) => &params.owner.plugin_id,
+            Self::NetRead(params) => &params.owner.plugin_id,
+            Self::NetFetch(params) => &params.owner.plugin_id,
+            Self::NetStart(params) => &params.owner.plugin_id,
+            Self::ProcWrite(params) => &params.owner.plugin_id,
+            Self::ProcRead(params) => &params.owner.plugin_id,
+            Self::ProcLaunch(params) => &params.owner.plugin_id,
         }
     }
 }
@@ -618,6 +857,46 @@ pub fn parse_host_message(value: Value, tier: HostTier) -> Result<HostMessage, P
             id,
             request: HostRequest::CoreCall(params(&method, p)?),
         },
+        ("net/start", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::NetStart(params(&method, p)?),
+        },
+        ("net/fetch", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::NetFetch(params(&method, p)?),
+        },
+        ("net/read", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::NetRead(params(&method, p)?),
+        },
+        ("net/release", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::NetRelease(params(&method, p)?),
+        },
+        ("net/close", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::NetClose(params(&method, p)?),
+        },
+        ("proc/close", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::ProcClose(params(&method, p)?),
+        },
+        ("proc/write", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::ProcWrite(params(&method, p)?),
+        },
+        ("proc/read", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::ProcRead(params(&method, p)?),
+        },
+        ("exec/redeem", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::ExecutionRedeem(params(&method, p)?),
+        },
+        ("proc/launch", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::ProcLaunch(params(&method, p)?),
+        },
         ("host/hello", None) => {
             let hello: HelloParams = params(&method, p)?;
             if !matches!(hello.runtime.name.as_str(), "bun" | "node") {
@@ -674,7 +953,18 @@ impl HostMessage {
                 HostRequest::Unregister(p) => {
                     request_value(*id, "registry/unregister", to_value(p))
                 }
+                HostRequest::ExecutionRedeem(p) => request_value(*id, "exec/redeem", to_value(p)),
                 HostRequest::CoreCall(p) => request_value(*id, "core/call", to_value(p)),
+                HostRequest::ProcClose(p) => request_value(*id, "proc/close", to_value(p)),
+                HostRequest::NetStart(p) => request_value(*id, "net/start", to_value(p)),
+                HostRequest::NetFetch(p) => request_value(*id, "net/fetch", to_value(p)),
+                HostRequest::NetRead(p) => request_value(*id, "net/read", to_value(p)),
+                HostRequest::NetRelease(p) => request_value(*id, "net/release", to_value(p)),
+                HostRequest::NetClose(p) => request_value(*id, "net/close", to_value(p)),
+
+                HostRequest::ProcWrite(p) => request_value(*id, "proc/write", to_value(p)),
+                HostRequest::ProcRead(p) => request_value(*id, "proc/read", to_value(p)),
+                HostRequest::ProcLaunch(p) => request_value(*id, "proc/launch", to_value(p)),
             },
             Self::Notification(notification) => match notification {
                 HostNotification::Hello(p) => notification_value("host/hello", to_value(p)),
@@ -708,7 +998,7 @@ pub struct InitializeParams {
     pub limits: HostLimits,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct EntryRef {
     pub path: String,
@@ -719,6 +1009,12 @@ pub struct EntryRef {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ActivateParams {
     pub owner: OwnerRef,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_entry"
+    )]
+    pub scope: Option<EntryRef>,
     pub plugin_name: String,
     pub entry: EntryRef,
     /// The plugin's settings (`[plugins."<name>".config]`), delivered as the
@@ -739,6 +1035,12 @@ fn empty_object() -> Value {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DeactivateParams {
     pub owner: OwnerRef,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_entry"
+    )]
+    pub entry: Option<EntryRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -837,6 +1139,10 @@ pub enum CoreRequest {
     ToolCall(ToolCallParams),
     CommandRun(CommandRunParams),
     HookEvaluate(HookEvaluateParams),
+    HarnessRun(HarnessRunParams),
+    McpClose(McpCloseParams),
+    McpRequest(McpRequestParams),
+    McpOpen(Box<McpOpenParams>),
 }
 
 impl CoreRequest {
@@ -852,6 +1158,10 @@ impl CoreRequest {
             Self::ToolCall(_) => "tool/call",
             Self::CommandRun(_) => "command/run",
             Self::HookEvaluate(_) => "hook/evaluate",
+            Self::HarnessRun(_) => "harness/run",
+            Self::McpClose(_) => "mcp/close",
+            Self::McpRequest(_) => "mcp/request",
+            Self::McpOpen(_) => "mcp/open",
         }
     }
 
@@ -867,6 +1177,10 @@ impl CoreRequest {
             Self::ToolCall(p) => to_value(p),
             Self::CommandRun(p) => to_value(p),
             Self::HookEvaluate(p) => to_value(p),
+            Self::HarnessRun(p) => to_value(p),
+            Self::McpClose(p) => to_value(p),
+            Self::McpRequest(p) => to_value(p),
+            Self::McpOpen(p) => to_value(p),
         }
     }
 
@@ -899,6 +1213,10 @@ impl CoreRequest {
             Self::ToolCall(params) => Duration::from_millis(params.deadline_ms),
             Self::CommandRun(params) => Duration::from_millis(params.deadline_ms),
             Self::HookEvaluate(params) => Duration::from_millis(params.deadline_ms),
+            Self::HarnessRun(params) => Duration::from_millis(params.deadline_ms),
+            Self::McpClose(params) => Duration::from_millis(params.deadline_ms),
+            Self::McpRequest(params) => Duration::from_millis(params.deadline_ms),
+            Self::McpOpen(params) => Duration::from_millis(params.deadline_ms),
         }
     }
 
@@ -1028,6 +1346,10 @@ pub fn parse_core_message(value: Value, tier: HostTier) -> Result<CoreMessage, P
         "tool/call" => CoreRequest::ToolCall(params(&method, p)?),
         "command/run" => CoreRequest::CommandRun(params(&method, p)?),
         "hook/evaluate" => CoreRequest::HookEvaluate(params(&method, p)?),
+        "harness/run" => CoreRequest::HarnessRun(params(&method, p)?),
+        "mcp/close" => CoreRequest::McpClose(params(&method, p)?),
+        "mcp/request" => CoreRequest::McpRequest(params(&method, p)?),
+        "mcp/open" => CoreRequest::McpOpen(params(&method, p)?),
         _ => return Err(undecoded(&method)),
     };
     Ok(CoreMessage::Request { id, request })

@@ -13,6 +13,8 @@ const SECTION_ID = /^[a-z][a-z0-9_-]{0,63}$/u
 export interface PromptSectionDefinition {
   readonly id: string
   readonly text: string
+  /** Only Core supplies these values, once at the accepted turn boundary. */
+  readonly interpolate?: 'model-cwd'
 }
 
 export interface LocalPromptSection<O extends OwnerBase = OwnerBase> extends OwnedEntry<O> {
@@ -30,10 +32,10 @@ export function normalizePromptSection(value: unknown): PromptSectionDefinition 
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('prompt section must be an object with id and text')
   }
-  if (Object.keys(value).some((key) => key !== 'id' && key !== 'text')) {
-    throw new TypeError('prompt section supports only id and text')
+  if (Object.keys(value).some((key) => key !== 'id' && key !== 'text' && key !== 'interpolate')) {
+    throw new TypeError('prompt section supports only id and text, plus optional model-cwd interpolation')
   }
-  const { id, text } = value as { id?: unknown; text?: unknown }
+  const { id, text, interpolate } = value as { id?: unknown; text?: unknown; interpolate?: unknown }
   if (typeof id !== 'string' || !SECTION_ID.test(id)) {
     throw new TypeError('prompt section id must be lower case, start with a letter, and use a-z, 0-9, _ or - (at most 64 characters)')
   }
@@ -46,18 +48,38 @@ export function normalizePromptSection(value: unknown): PromptSectionDefinition 
   if (Buffer.byteLength(text, 'utf8') > MAX_PROMPT_SECTION_BYTES) {
     throw new RangeError(`prompt section "${id}" exceeds ${MAX_PROMPT_SECTION_BYTES} UTF-8 bytes`)
   }
-  return Object.freeze({ id, text })
+  if (interpolate !== undefined && interpolate !== 'model-cwd') throw new TypeError('prompt interpolation supports only model-cwd')
+  if (interpolate !== undefined) validatePromptTemplate(text)
+  return Object.freeze({ id, text, ...(interpolate === undefined ? {} : { interpolate }) })
+}
+
+/** Borrowed strict simple-group semantics: unmatched opens are literal; only
+ * existing Core turn facts are permitted. Values are never expanded in JS. */
+export function validatePromptTemplate(text: string): void {
+  for (let open = text.indexOf('{{'); open >= 0;) {
+    const group = /^\{\{([^{}]*)\}\}/u.exec(text.slice(open))
+    if (!group) {
+      if (text.indexOf('}}', open + 2) >= 0) throw new TypeError('malformed prompt variable reference')
+      open = text.indexOf('{{', open + 2)
+      continue
+    }
+    if (!/^[a-z][a-z0-9_]*$/u.test(group[1]!)) throw new TypeError('malformed prompt variable reference')
+    if (group[1] !== 'model' && group[1] !== 'cwd') throw new TypeError(`unknown Core prompt variable "{{${group[1]}}}"; supported variables: model, cwd`)
+    open = text.indexOf('{{', open + group[0].length)
+  }
 }
 
 /** Reserve pending registrations too, so a burst cannot bypass byte/count limits. */
 export class PromptSections<O extends OwnerBase> {
   private readonly registrations: OwnedRegistrations<O, LocalPromptSection<O>>
+  private readonly templates: OwnedRegistrations<O, LocalPromptSection<O>>
   private readonly owners = new Map<O, Map<string, PromptReservation<O>>>()
   private bytes = 0
   private count = 0
 
   constructor(rpc: RpcPeer, ownedBy: (owner: O) => Map<number, LocalPromptSection<O>>, warn: (message: string, owner: O) => void) {
     this.registrations = new OwnedRegistrations(rpc, 'prompt_section', ownedBy, warn)
+    this.templates = new OwnedRegistrations(rpc, 'prompt_template', ownedBy, warn)
   }
 
   register(owner: O, definition: PromptSectionDefinition): () => void {
@@ -74,7 +96,7 @@ export class PromptSections<O extends OwnerBase> {
       throw new RangeError('prompt section owner or host registration limit reached')
     }
     const entry: LocalPromptSection<O> = { owner, name: section.id, definition: section, disposed: false }
-    const undo = this.registrations.add(entry, { name: section.id, description: section.text })
+    const undo = (section.interpolate === undefined ? this.registrations : this.templates).add(entry, { name: section.id, description: section.text })
     const record: PromptReservation<O> = { entry, bytes, dispose: () => {
       if (sections.get(section.id) !== record) return
       sections.delete(section.id)
@@ -94,6 +116,7 @@ export class PromptSections<O extends OwnerBase> {
   forget(owner: O) {
     for (const record of [...(this.owners.get(owner)?.values() ?? [])]) record.dispose()
     this.registrations.forget(owner)
+    this.templates.forget(owner)
   }
 }
 

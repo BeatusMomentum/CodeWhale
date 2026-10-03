@@ -850,22 +850,38 @@ pub fn install_plugin_registry(
     errors
 }
 
+pub fn with_registry_for_plugins<R>(
+    plugins: &crate::plugins::PluginRegistry,
+    f: impl FnOnce(&UserCommandRegistry) -> R,
+) -> R {
+    with_registry_for_workspace(Some(plugins.workspace()), |base| {
+        let mut selected = base.clone();
+        selected
+            .commands
+            .retain(|_, metadata| metadata.extension.is_none());
+        selected.load_extension_commands(crate::extension_host::live_commands_for_plugins(plugins));
+        f(&selected)
+    })
+}
+pub fn with_registry_for_app<R>(app: &App, f: impl FnOnce(&UserCommandRegistry) -> R) -> R {
+    with_registry_for_plugins(app.extension_plugin_view().as_ref(), f)
+}
+
 pub fn try_dispatch(app: &mut App, input: &str) -> Option<CommandResult> {
     let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
     let command = normalize_name(parts.first().copied().unwrap_or_default());
     let args = parts.get(1).copied().unwrap_or("").trim();
 
-    let (dispatch_error, metadata) =
-        with_registry_for_workspace(Some(&app.workspace), |registry| {
-            // Dispatch must see a just-revoked plugin command long enough to
-            // return a visible authority error. Discovery and palettes use
-            // `get`/`iter`, which hide it immediately.
-            let metadata = registry.get_unchecked(&command).cloned();
-            let dispatch_error = metadata
-                .as_ref()
-                .and_then(|_| registry.dispatch_error(&command));
-            (dispatch_error, metadata)
-        });
+    let (dispatch_error, metadata) = with_registry_for_app(app, |registry| {
+        // Dispatch must see a just-revoked plugin command long enough to
+        // return a visible authority error. Discovery and palettes use
+        // `get`/`iter`, which hide it immediately.
+        let metadata = registry.get_unchecked(&command).cloned();
+        let dispatch_error = metadata
+            .as_ref()
+            .and_then(|_| registry.dispatch_error(&command));
+        (dispatch_error, metadata)
+    });
     if let Some(error) = dispatch_error {
         return Some(CommandResult::error(error));
     }

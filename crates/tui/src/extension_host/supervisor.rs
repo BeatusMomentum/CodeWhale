@@ -41,13 +41,17 @@
 //!   wrapper around `<runtime> --version` ([`probe_bwrap`]). When bwrap is
 //!   missing or cannot start — e.g. unprivileged user namespaces blocked by
 //!   Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns` — the host
-//!   starts unsandboxed and every surface says so with bwrap's own error;
-//!   never a silent downgrade. bwrap can mask only what exists, so each
+//!   refuses Native launch and reports the concrete error. The pinned Builtin
+//!   exception is diagnosed and ticket-bound. bwrap can mask only what exists, so each
 //!   Codewhale home is masked whole and its readable entries are bound again
 //!   (`sandbox::bwrap_exception_args`): an entry created after launch is
 //!   denied, as on macOS.
-//! * Windows: unsandboxed (the Job Object contains the process tree; that is
-//!   not isolation), and `/plugin` says so.
+//! * Windows: Native uses a freshly created LPAC AppContainer with no network
+//!   capabilities. Rust checks its actual token, attaches/caps the existing Job
+//!   before resuming, and requires a real data-read/write + outside-read/write
+//!   + loopback-network allow/deny probe. Only Core-selected runtime/bundle and
+//!     reviewed staged roots are granted reads. The Job is lifetime/memory only.
+//!     Builtin retains the separately diagnosed Rust-ticket-bound exception.
 //!
 //! Known limits under bubblewrap: a default-deny-list credential store
 //! created after launch stays readable (Seatbelt denies it by name); a
@@ -183,6 +187,9 @@ pub(crate) struct HostLaunch {
     /// build pins ([`tier::BUILTIN_MODULES`]), which the host bundle embedded
     /// from the same build must agree with ([`check_hello_identity`]).
     pub builtin_modules: &'static [BuiltinModule],
+    /// Exact verified Native LPAC plan; Builtin retains its labelled exception.
+    #[cfg(windows)]
+    pub windows: Option<super::windows::NativeSandbox>,
 }
 
 /// Whether the host runs under an OS sandbox, and why not when it does not
@@ -211,6 +218,10 @@ impl HostSandbox {
 impl std::fmt::Display for HostSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Wrapped(name) if name == "windows-lpac" => write!(
+                f,
+                "windows-lpac sandbox (no direct network; reads only the selected runtime, canonical bundle and reviewed staged code; writes to Native data and platform-private scratch; Job limits lifetime/memory)"
+            ),
             Self::Wrapped(name) => write!(
                 f,
                 "{name} sandbox (no direct network; the Codewhale home except plugin code, the Codex and DSH credential homes and the default credential stores are unreadable; other files you can read, such as project .env files, are not protected)"
@@ -304,6 +315,9 @@ pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 ///   are locked in the host itself (`src/runtime.ts`).
 #[must_use]
 pub(crate) fn runtime_args(runtime: &HostRuntime) -> Vec<String> {
+    if runtime.compiled {
+        return Vec::new();
+    }
     base_runtime_args(runtime.kind)
         .iter()
         .chain(&runtime.native_code_flags)
@@ -329,6 +343,9 @@ pub(crate) fn runtime_env(kind: HostRuntimeKind) -> Vec<(String, String)> {
     let mut env = vec![("NODE_OPTIONS".to_string(), String::new())];
     if kind == HostRuntimeKind::Bun {
         env.push(("BUN_JSC_useShadowRealm".to_string(), "0".to_string()));
+        env.push(("BUN_OPTIONS".to_string(), String::new()));
+        // This variable otherwise makes a standalone image act as the Bun CLI.
+        env.push(("BUN_BE_BUN".to_string(), "0".to_string()));
     }
     env
 }
@@ -404,9 +421,8 @@ const HOST_DENIED_HOME_ENTRIES: &[&str] = &[
 ///
 /// The plugin tier also denies the builtin tier's data directory, which lies
 /// inside the readable `extension-host/` entry: plugin code never reads
-/// tier-0 state. (Under bubblewrap a directory that does not exist when the
-/// plugin host starts cannot be masked, so tier-0 state created later is
-/// visible to a plugin host that was already running.)
+/// tier-0 state. Planning materializes that sibling before the wrapper masks
+/// it, because bubblewrap cannot mask a directory that does not exist yet.
 pub(crate) fn host_denied_read_paths(
     tier: HostTier,
     home: &Path,
@@ -505,9 +521,35 @@ pub(crate) fn plan_launch(
     memory_cap: u64,
 ) -> Result<HostLaunch, String> {
     let data = host_data_dir(home, tier)?;
+    // Bubblewrap cannot mask a root that does not exist yet. Materialize the
+    // sibling before a Native host gets its immutable read-deny projection.
+    if tier == HostTier::Plugin {
+        host_data_dir(home, HostTier::Builtin)?;
+    }
     let mut args = runtime_args(runtime);
-    args.push(bundle.to_string_lossy().into_owned());
+    if !runtime.compiled {
+        args.push(bundle.to_string_lossy().into_owned());
+    }
     args.push(tier.argv_flag());
+    #[cfg(windows)]
+    if tier == HostTier::Plugin {
+        let sandbox =
+            super::windows::NativeSandbox::prepare(runtime, bundle, home, &data, memory_cap)?;
+        return Ok(HostLaunch {
+            tier,
+            program: sandbox.program.clone(),
+            args,
+            cwd: data,
+            sandbox: HostSandbox::Wrapped("windows-lpac".into()),
+            sandbox_env: vec![("CODEWHALE_SANDBOX".into(), "windows-lpac".into())],
+            runtime: runtime.clone(),
+            runtime_env: runtime_env(runtime.kind),
+            memory_cap,
+            memory: MemoryEnforcement::JobObject,
+            builtin_modules: tier::BUILTIN_MODULES,
+            windows: Some(sandbox),
+        });
+    }
     let wrapped = wrap_host(tier, &runtime.path, &args, &data, home);
     host_launch(tier, runtime, args, data, memory_cap, wrapped)
 }
@@ -521,6 +563,25 @@ pub(crate) fn planned_sandbox(
     home: &Path,
 ) -> Result<HostSandbox, String> {
     let data = host_data_dir(home, tier)?;
+    if tier == HostTier::Plugin {
+        host_data_dir(home, HostTier::Builtin)?;
+    }
+    #[cfg(windows)]
+    if tier == HostTier::Plugin {
+        let bundle = super::materialize_bundle(home)?;
+        return Ok(
+            match super::windows::NativeSandbox::prepare(
+                runtime,
+                &bundle,
+                home,
+                &data,
+                HOST_MEMORY_CAP,
+            ) {
+                Ok(_) => HostSandbox::Wrapped("windows-lpac".into()),
+                Err(error) => HostSandbox::Unsandboxed(error),
+            },
+        );
+    }
     Ok(
         match wrap_host(tier, &runtime.path, &runtime_args(runtime), &data, home) {
             Ok(wrapped) => HostSandbox::Wrapped(wrapped.name),
@@ -668,7 +729,8 @@ fn wrap_host(
 }
 
 /// The launch for a [`wrap_host`] outcome: the wrapper's argv, or the
-/// runtime itself, unsandboxed, carrying the reason `/plugin` shows. Pure.
+/// pinned Builtin runtime itself, carrying the reason `/plugin` shows. Native
+/// code is refused without the verified wrapper. Pure.
 fn host_launch(
     tier: HostTier,
     runtime: &HostRuntime,
@@ -690,6 +752,13 @@ fn host_launch(
                 wrapped.env,
             )
         }
+        Err(reason) if tier == HostTier::Plugin => {
+            return Err(format!(
+                "Native extensions require a verified OS sandbox: {reason}"
+            ));
+        }
+        // Only the pinned Builtin tier may run without filesystem/network
+        // isolation. Every effect is still admitted by Rust operation tickets.
         Err(reason) => (
             runtime.path.clone(),
             args,
@@ -709,6 +778,8 @@ fn host_launch(
         memory_cap,
         memory: MemoryEnforcement::planned(runtime.kind),
         builtin_modules: tier::BUILTIN_MODULES,
+        #[cfg(windows)]
+        windows: None,
     })
 }
 
@@ -810,7 +881,7 @@ fn bwrap_probe_verdict(succeeded: bool, status: &str, stderr: &str) -> Result<()
 /// Known limit: in that case `/plugin` and doctor still name the configured
 /// cap, not the lower inherited one.
 #[cfg(target_os = "linux")]
-fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
+pub(super) fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
     // SAFETY: the closure runs in the forked child before exec and calls only
     // `getrlimit` and `setrlimit`, which are async-signal-safe; it allocates
     // nothing.
@@ -837,7 +908,7 @@ fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn limit_child_memory(_command: &mut tokio::process::Command, _cap: u64) {}
+pub(super) fn limit_child_memory(_command: &mut tokio::process::Command, _cap: u64) {}
 
 /// Resident size of `pid` in bytes, for the macOS memory-cap check.
 #[cfg(target_os = "macos")]
@@ -936,6 +1007,10 @@ pub(crate) trait HostEvents: Send + Sync + 'static {
     fn log(&self, params: &protocol::LogParams);
     fn exited(&self, host_generation: u64, reason: String, stderr_tail: String);
 
+    /// A current, non-revoked call received a correlated reply. Late replies
+    /// and heartbeat answers do not pass here; the monitor validates pongs.
+    fn responded(&self) {}
+
     /// Answer one host-originated request. Every such request runs as its own
     /// task (`start_host_request`), so a handler may take as long as it needs
     /// without holding up the reader. The registry requests are quick and
@@ -975,7 +1050,17 @@ pub(crate) fn registry_host_request<E: HostEvents + ?Sized>(
             events.unregister(&params);
             Ok(json!({}))
         }
-        HostRequest::CoreCall(_) => Err(RpcErrorWire {
+        HostRequest::ExecutionRedeem(_)
+        | HostRequest::CoreCall(_)
+        | HostRequest::ProcLaunch(_)
+        | HostRequest::ProcRead(_)
+        | HostRequest::ProcWrite(_)
+        | HostRequest::ProcClose(_)
+        | HostRequest::NetStart(_)
+        | HostRequest::NetFetch(_)
+        | HostRequest::NetRead(_)
+        | HostRequest::NetRelease(_)
+        | HostRequest::NetClose(_) => Err(RpcErrorWire {
             code: error_code::REFUSED,
             message: "core/call is not served here".to_string(),
             data: None,
@@ -1115,6 +1200,8 @@ struct PendingCall {
     tx: oneshot::Sender<Result<Value, HostCallError>>,
     /// Plugin whose revocation cancels this call.
     owner: Option<String>,
+    /// Exact never-reused registration handle, when this is a contribution call.
+    handle: Option<u64>,
     revoked: bool,
     heartbeat: bool,
 }
@@ -1141,6 +1228,8 @@ pub(crate) struct HostProcess {
     memory: Arc<std::sync::OnceLock<MemoryEnforcement>>,
     pub sandbox: HostSandbox,
     tree: Arc<crate::process_tree::ProcessTree>,
+    #[cfg(windows)]
+    windows: Option<super::windows::NativeSandbox>,
     outbound: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
     /// Requests the host sent, running as tasks ([`start_host_request`]).
@@ -1171,7 +1260,144 @@ fn tail_string(tail: &Mutex<VecDeque<u8>>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// The watcher/protocol remains one implementation for both launch mechanisms.
+enum HostChild {
+    Tokio(tokio::process::Child),
+    #[cfg(windows)]
+    Native(super::windows::Child),
+}
+impl HostChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Tokio(child) => child.wait().await,
+            #[cfg(windows)]
+            Self::Native(child) => child.wait().await,
+        }
+    }
+    async fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tokio(child) => child.kill().await,
+            #[cfg(windows)]
+            Self::Native(child) => child.kill().await,
+        }
+    }
+}
+struct SpawnedHost {
+    child: HostChild,
+    pid: Option<u32>,
+    tree: Arc<crate::process_tree::ProcessTree>,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+}
+fn spawn_host(
+    launch: &HostLaunch,
+    mut command: tokio::process::Command,
+    _environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<SpawnedHost, String> {
+    #[cfg(windows)]
+    if let Some(sandbox) = &launch.windows {
+        let native = sandbox
+            .spawn(&launch.args, _environment, launch.memory_cap)
+            .map_err(|error| {
+                format!("failed to launch the verified Windows Native host: {error}")
+            })?;
+        let stdin =
+            tokio::process::ChildStdin::from_std(std::process::ChildStdin::from(native.stdin))
+                .map_err(|error| format!("host stdin conversion failed: {error}"))?;
+        let stdout =
+            tokio::process::ChildStdout::from_std(std::process::ChildStdout::from(native.stdout))
+                .map_err(|error| format!("host stdout conversion failed: {error}"))?;
+        let stderr =
+            tokio::process::ChildStderr::from_std(std::process::ChildStderr::from(native.stderr))
+                .map_err(|error| format!("host stderr conversion failed: {error}"))?;
+        let tree = Arc::clone(&native.child.tree);
+        let pid = Some(native.child.pid);
+        return Ok(SpawnedHost {
+            child: HostChild::Native(native.child),
+            pid,
+            tree,
+            stdin,
+            stdout,
+            stderr,
+        });
+    }
+    // On Linux a failure to apply the memory cap in the child surfaces
+    // here as a spawn error carrying only its errno, indistinguishable
+    // from a failed exec, so the message names both.
+    let mut child = command.spawn().map_err(|error| {
+            if cfg!(target_os = "linux") {
+                format!(
+                    "failed to start {}, or to apply its {} MiB memory cap (RLIMIT_DATA) before exec: {error}",
+                    launch.program.display(),
+                    launch.memory_cap / (1024 * 1024)
+                )
+            } else {
+                format!("failed to start {}: {error}", launch.program.display())
+            }
+        })?;
+    let pid = child.id();
+    let tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
+        Ok(tree) => Arc::new(tree),
+        Err(error) => {
+            let _ = child.start_kill();
+            return Err(format!("failed to contain the extension host: {error}"));
+        }
+    };
+    #[cfg(windows)]
+    if let Err(error) = tree.limit_process_memory(launch.memory_cap) {
+        let _ = tree.kill();
+        let _ = child.start_kill();
+        return Err(format!(
+            "failed to cap the extension host's memory: {error}"
+        ));
+    }
+    let stdin = child.stdin.take().ok_or("host stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("host stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("host stderr unavailable")?;
+
+    Ok(SpawnedHost {
+        child: HostChild::Tokio(child),
+        pid,
+        tree,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 impl HostProcess {
+    #[cfg(windows)]
+    pub(crate) async fn admit_windows_root(
+        &self,
+        authority: crate::plugins::types::PluginAuthority,
+    ) -> Result<(), String> {
+        let sandbox = self
+            .windows
+            .clone()
+            .ok_or("Native host has no verified LPAC plan")?;
+        let policy = crate::plugins::activation::extension_host_policy_enabled();
+        if !policy {
+            return Err("Native extensions are disabled".into());
+        }
+        #[cfg(test)]
+        let env_scope = crate::test_support::env_scope_ticket();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _env_scope = crate::test_support::join_env_scope(env_scope);
+            let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+            let capability = crate::plugins::activation::PluginActivationCapability::Native;
+            crate::plugins::registry::verify_plugin_component_authority(&authority, capability)?;
+            let root =
+                crate::plugins::agent_plugin::plugin_root_for_manifest(&authority.staged_manifest)
+                    .ok_or("reviewed runtime manifest has no bundle root")?;
+            sandbox.admit_root(root)?;
+            crate::plugins::registry::verify_plugin_component_authority(&authority, capability)
+        })
+        .await
+        .map_err(|error| format!("Windows bundle admission worker failed: {error}"))?
+    }
+
     /// Spawn the host and complete the handshake. `expected_sha256` is the
     /// digest of the bundle this process materialized; the host's
     /// self-reported digest must match (a consistency check, not
@@ -1214,49 +1440,22 @@ impl HostProcess {
                 ("CODEWHALE_HOST_PARENT_PID", parent_pid.as_str()),
                 ("CODEWHALE_HOST_PROCESS_GROUP", own_group),
             ]);
-        for (key, value) in
-            crate::child_env::sanitized_plugin_mcp_env_from(std::env::vars_os(), overrides)
-        {
-            command.env(key, value);
-        }
+        let environment =
+            crate::child_env::sanitized_plugin_mcp_env_from(std::env::vars_os(), overrides);
+        command.envs(environment.iter().map(|(key, value)| (key, value)));
         #[cfg(unix)]
         command.process_group(0);
         limit_child_memory(&mut command, launch.memory_cap);
 
-        // On Linux a failure to apply the memory cap in the child surfaces
-        // here as a spawn error carrying only its errno, indistinguishable
-        // from a failed exec, so the message names both.
-        let mut child = command.spawn().map_err(|error| {
-            if cfg!(target_os = "linux") {
-                format!(
-                    "failed to start {}, or to apply its {} MiB memory cap (RLIMIT_DATA) before exec: {error}",
-                    launch.program.display(),
-                    launch.memory_cap / (1024 * 1024)
-                )
-            } else {
-                format!("failed to start {}: {error}", launch.program.display())
-            }
-        })?;
-        let pid = child.id();
-        let tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
-            Ok(tree) => Arc::new(tree),
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(format!("failed to contain the extension host: {error}"));
-            }
-        };
-        #[cfg(windows)]
-        if let Err(error) = tree.limit_process_memory(launch.memory_cap) {
-            let _ = tree.kill();
-            let _ = child.start_kill();
-            return Err(format!(
-                "failed to cap the extension host's memory: {error}"
-            ));
-        }
+        let SpawnedHost {
+            mut child,
+            pid,
+            tree,
+            stdin,
+            stdout,
+            stderr,
+        } = spawn_host(launch, command, &environment)?;
         let memory: Arc<std::sync::OnceLock<MemoryEnforcement>> = Arc::default();
-        let stdin = child.stdin.take().ok_or("host stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("host stdout unavailable")?;
-        let stderr = child.stderr.take().ok_or("host stderr unavailable")?;
 
         let (outbound, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
         let pending: Arc<Mutex<HashMap<u64, PendingCall>>> = Arc::default();
@@ -1396,6 +1595,8 @@ impl HostProcess {
             memory,
             sandbox: launch.sandbox.clone(),
             tree,
+            #[cfg(windows)]
+            windows: launch.windows.clone(),
             outbound,
             pending,
             inbound,
@@ -1627,6 +1828,12 @@ impl HostProcess {
                 PendingCall {
                     tx,
                     owner,
+                    handle: match &request {
+                        CoreRequest::ToolCall(params) => Some(params.handle),
+                        CoreRequest::CommandRun(params) => Some(params.handle),
+                        CoreRequest::HookEvaluate(params) => Some(params.handle),
+                        _ => None,
+                    },
                     revoked: false,
                     heartbeat: matches!(request, CoreRequest::Ping),
                 },
@@ -1714,11 +1921,24 @@ impl HostProcess {
         // Requests the host sent for this owner are cancelled too (and
         // answered `Cancelled`), whatever they are waiting for.
         self.inbound.cancel_owner(plugin_id);
+        self.revoke_pending_where(|call| call.owner.as_deref() == Some(plugin_id));
+    }
+
+    /// Retiring one Native entry cancels exactly its admitted contribution
+    /// calls. Sibling entry requests and owner-wide broker lifecycle survive.
+    pub(crate) fn revoke_calls_for_handles(self: &Arc<Self>, plugin_id: &str, handles: &[u64]) {
+        self.revoke_pending_where(|call| {
+            call.owner.as_deref() == Some(plugin_id)
+                && call.handle.is_some_and(|handle| handles.contains(&handle))
+        });
+    }
+
+    fn revoke_pending_where(self: &Arc<Self>, drop_it: impl Fn(&PendingCall) -> bool) {
         let ids: Vec<u64> = {
             let mut pending = self.pending.lock().expect("pending lock");
             pending
                 .iter_mut()
-                .filter(|(_, call)| call.owner.as_deref() == Some(plugin_id))
+                .filter(|(_, call)| drop_it(call))
                 .map(|(id, call)| {
                     call.revoked = true;
                     *id
@@ -1807,6 +2027,9 @@ impl Reader {
                     tracing::debug!(target: "extension_host", id, "dropping late host response");
                     return Ok(());
                 };
+                if !call.revoked && !call.heartbeat {
+                    self.events.responded();
+                }
                 let result = if call.revoked {
                     Err(HostCallError::Cancelled(
                         "extension was revoked".to_string(),
@@ -1955,22 +2178,59 @@ pub fn bundle_dir(root: &Path, sha256: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compiled_host_has_direct_argv_and_cannot_become_a_bun_cli() {
+        let runtime = HostRuntime {
+            kind: HostRuntimeKind::Bun,
+            path: PathBuf::from("/opt/codewhale-extension-host"),
+            version: (1, 4, 0),
+            native_code_flags: Vec::new(),
+            compiled: true,
+        };
+        assert!(runtime_args(&runtime).is_empty());
+        let temp = tempfile::tempdir().unwrap();
+        let launch = host_launch(
+            HostTier::Builtin,
+            &runtime,
+            vec![HostTier::Builtin.argv_flag()],
+            temp.path().to_path_buf(),
+            HOST_MEMORY_CAP,
+            Err("fixture unsupported platform".to_string()),
+        )
+        .unwrap();
+        assert_eq!(launch.program, runtime.path);
+        assert_eq!(launch.args, vec!["--tier=builtin".to_string()]);
+        assert!(
+            launch
+                .runtime_env
+                .contains(&("BUN_OPTIONS".to_string(), String::new()))
+        );
+        assert!(
+            launch
+                .runtime_env
+                .contains(&("BUN_BE_BUN".to_string(), "0".to_string()))
+        );
+        assert_eq!(
+            launch.memory,
+            MemoryEnforcement::planned(HostRuntimeKind::Bun)
+        );
+    }
+
     fn node() -> HostRuntime {
         HostRuntime {
             kind: HostRuntimeKind::Node,
             path: PathBuf::from("/opt/node/bin/node"),
             version: (22, 19, 0),
             native_code_flags: Vec::new(),
+            compiled: false,
         }
     }
 
-    /// The Linux launch decision, exercised on every platform: a bwrap that
-    /// is installed but cannot start (the probe's stderr as Ubuntu 24.04
-    /// prints it) launches the runtime itself, labelled unsandboxed with
-    /// bwrap's own error wherever the sandbox is reported — never
-    /// `linux-bwrap` — while a probe that ran keeps the wrapper's argv.
+    /// A failed exact sandbox probe refuses Native code on every platform.
+    /// The pinned Builtin exception keeps the concrete diagnostic; a verified
+    /// wrapper keeps its command and never silently falls through to raw JS.
     #[test]
-    fn a_bwrap_that_cannot_start_leaves_the_host_unsandboxed_and_says_why() {
+    fn missing_verified_sandbox_refuses_native_but_reports_pinned_builtin_exception() {
         let runtime = node();
         let data = PathBuf::from("/home/u/.codewhale/extension-host/data");
         let mut args = runtime_args(&runtime);
@@ -1990,8 +2250,19 @@ mod tests {
             refused.contains("kernel.apparmor_restrict_unprivileged_userns"),
             "{refused}"
         );
-        let launch = host_launch(
+        let error = host_launch(
             HostTier::Plugin,
+            &runtime,
+            args.clone(),
+            data.clone(),
+            HOST_MEMORY_CAP,
+            Err(refused.clone()),
+        )
+        .unwrap_err();
+        assert!(error.contains("Native extensions require a verified OS sandbox"));
+        assert!(error.contains(&refused));
+        let launch = host_launch(
+            HostTier::Builtin,
             &runtime,
             args.clone(),
             data.clone(),
@@ -2378,6 +2649,7 @@ mod tests {
 
     fn register_request(plugin: &str) -> HostRequest {
         HostRequest::Register(protocol::RegisterParams {
+            scope: None,
             owner: owner(plugin),
             kind: protocol::RegisterKind::Tool,
             spec: protocol::RegisterSpecWire {

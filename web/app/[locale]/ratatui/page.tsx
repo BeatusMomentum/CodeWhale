@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { PageHeader } from "@/components/page-header";
 import { RatatuiExplorer } from "@/components/ratatui/explorer";
+import { RatatuiHero } from "@/components/ratatui/hero";
+import { RatatuiProjectLinks } from "@/components/ratatui/project-links";
 import { RatatuiQuickstart } from "@/components/ratatui/quickstart";
 import { getRatatuiCopy } from "@/lib/content/ratatui";
 import { buildPageMetadata } from "@/lib/page-meta";
@@ -38,8 +40,10 @@ export default async function RatatuiPage({ params }: { params: Promise<{ locale
           </>
         }
       />
+      <RatatuiHero locale={locale} copy={copy} />
       <RatatuiQuickstart copy={copy} />
       <RatatuiExplorer catalogue={catalogue} locale={locale} copy={copy} />
+      <RatatuiProjectLinks revision={catalogue.source.revision} copy={copy} />
     </div>
   );
 }

@@ -216,6 +216,21 @@ impl Engine {
     ) -> Result<ApprovalResult, ToolError> {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
+        if self
+            .child_host
+            .as_ref()
+            .is_some_and(|child| !child.authority.runtime.parent_can_prompt)
+        {
+            self.commit_approval_outcome(
+                tool_id,
+                ApprovalOutcome::Unavailable,
+                Some(ApprovalDecider::Host),
+            )
+            .await?;
+            return Err(ToolError::not_available(
+                "child caller has no host that can answer this approval",
+            ));
+        }
         if self.send_event(event).await.is_err() {
             self.commit_approval_outcome(
                 tool_id,
@@ -235,6 +250,10 @@ impl Engine {
         // came back. Every non-unwinding exit of `await_tool_approval` runs
         // through the resume below; a panic unwinds out of `run_turn`, which
         // restarts the clock on its next turn anyway.
+        let _child_person_wait = self
+            .child_host
+            .as_ref()
+            .map(|child| child.authority.pause_person_wait());
         self.turn_wall_clock.begin_human_wait();
         let decision = self.await_tool_approval(tool_id, withdraw).await;
         self.turn_wall_clock.end_human_wait();
@@ -1019,6 +1038,7 @@ mod tests {
     #[derive(Default)]
     struct NestedTurnOptions {
         tools: Vec<Arc<dyn ToolSpec>>,
+        tool_context: Option<ToolContext>,
         turn_wall_clock: Option<Duration>,
         hook_executor: Option<Arc<crate::hooks::HookExecutor>>,
     }
@@ -1091,6 +1111,9 @@ mod tests {
         use crate::tools::codemode::EXECUTE_TOOLS_TOOL_NAME;
 
         let tmp = tempfile::tempdir().expect("fixture directory");
+        let tool_context = options
+            .tool_context
+            .unwrap_or_else(|| ToolContext::new(tmp.path()));
         let args = json!({ "code": code }).to_string();
         let mock = Arc::new(MockLlmClient::new(vec![
             canned::tool_call_turn("exec-1", EXECUTE_TOOLS_TOOL_NAME, &args),
@@ -1099,7 +1122,7 @@ mod tests {
         let defaults = EngineConfig::default();
         let (mut engine, handle) = Engine::new_with_model_client(
             EngineConfig {
-                workspace: tmp.path().to_path_buf(),
+                workspace: tool_context.workspace.clone(),
                 snapshots_enabled: false,
                 subagents_enabled: false,
                 terminal_chrome_enabled: false,
@@ -1124,7 +1147,7 @@ mod tests {
         engine.approval_receipt_store = Ok(store.clone());
         let session_id = engine.session.id.clone();
         let executions = Arc::new(AtomicUsize::new(0));
-        let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(tmp.path()));
+        let mut registry = crate::tools::ToolRegistry::new(tool_context);
         registry.register(Arc::new(ApprovalFixtureTool {
             executions: executions.clone(),
             claim_only: false,
@@ -1294,6 +1317,7 @@ mod tests {
         let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
         let fixture = crate::extension_host::tests::FixturePlugins::new(&["slow-tool"]).await;
         let manager = fixture.manager(node);
+        let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
         let attachment = manager.attach(fixture.registry());
         attachment.sync().await.expect("host activation");
         let tool =
@@ -1309,6 +1333,10 @@ mod tests {
             code,
             NestedTurnOptions {
                 tools: vec![tool],
+                tool_context: Some(
+                    ToolContext::new(fixture.workspace())
+                        .with_plugin_registry(attachment.plugin_view()),
+                ),
                 ..NestedTurnOptions::default()
             },
         );

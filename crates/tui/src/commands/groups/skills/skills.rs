@@ -33,7 +33,7 @@ fn discover_visible_skills(app: &crate::tui::app::App) -> crate::skills::SkillRe
         &app.workspace,
         &app.skills_dir,
         app.skills_discovery_mode,
-        Some(app.plugin_registry.as_ref()),
+        Some(app.extension_plugin_view().as_ref()),
     )
     .into_enabled()
 }
@@ -89,7 +89,8 @@ fn activate_skill(app: &mut crate::tui::app::App, name: &str) -> CommandResult {
         }
         let plugin_provenance = skill.source.provenance();
         if let Some(provenance) = &plugin_provenance
-            && let Err(reason) = provenance.verify(&app.workspace)
+            && let Err(reason) =
+                provenance.verify_for(&app.workspace, Some(app.extension_plugin_view().as_ref()))
         {
             return CommandResult::error(format!(
                 "Plugin skill '{}' is no longer active: {reason}",

@@ -83,8 +83,8 @@ or shell execution, and `/mode work` when you want it to make changes. Press
 
 ## Terminal, apps, and Computer Use
 
-The terminal and graphical clients connect to the Codewhale Runtime, which runs
-the agent and its tools:
+The terminal and graphical clients connect to the
+[Codewhale Engine](docs/ARCHITECTURE.md), which runs the agent and its tools:
 
 - **Terminal:** `codewhale` opens the interactive interface; `codewhale exec`
   runs a task from a script or CI job.

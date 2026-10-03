@@ -14,11 +14,7 @@ use std::time::Duration;
 use codewhale_ratatui::{
     MotionMode, OceanColumn as NativeColumn, OceanPhase, OceanRamp as NativeRamp,
 };
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Modifier},
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
 use crate::tui::underwater::ShellPhase;
 use codewhale_palette::UiTheme;
@@ -157,6 +153,7 @@ pub struct OceanColumn {
     /// Fixed-point (0..=1000) life presence; keeps `Eq` derivable.
     presence: u16,
     context_percent: u8,
+    paint_caps: Option<codewhale_ratatui::Caps>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +245,7 @@ impl OceanColumn {
             animated,
             presence,
             context_percent: context_percent.min(100),
+            paint_caps: None,
         }
     }
 
@@ -335,19 +333,101 @@ impl OceanColumn {
         self
     }
 
-    /// Continue the shared column through a shell-owned surface without
-    /// flattening semantic highlights (selection, hover, error, code blocks).
-    pub fn paint_matching(self, area: Rect, buf: &mut Buffer, background: Color) {
-        let area = area.intersection(buf.area);
-        for y in area.top()..area.bottom() {
-            let row_bg = self.color_at_y(y);
-            for x in area.left()..area.right() {
-                let cell = &mut buf[(x, y)];
-                if cell.bg == background && !cell.modifier.contains(Modifier::REVERSED) {
-                    cell.set_bg(row_bg);
-                }
-            }
+    /// Borrowed backend facts for this render snapshot; no detector or store.
+    #[must_use]
+    pub fn with_paint_caps(mut self, caps: Option<codewhale_ratatui::Caps>) -> Self {
+        self.paint_caps = caps;
+        self
+    }
+
+    fn paint_theme(self, ground: Color) -> Option<codewhale_ratatui::Theme> {
+        let mut caps = self.paint_caps?;
+        // Equality-matched opaque ground is actual pane evidence. A terminal
+        // Reset/named ink supplies no RGB evidence; an OS hint cannot fill it.
+        caps.appearance = codewhale_ratatui::detect::appearance_for_background(ground)?;
+        Some(
+            codewhale_ratatui::Theme::new(caps)
+                .ground(codewhale_ratatui::Ground::Ocean)
+                .tui_palette(codewhale_ratatui::TuiPalette::Underwater),
+        )
+    }
+
+    /// Complete matching facade. The kit owns cell iteration and all guards;
+    /// the same backend adapter reports exact visible custom-theme ink.
+    pub fn paint_matching_native(
+        self,
+        area: Rect,
+        buf: &mut Buffer,
+        background: Color,
+        ui_theme: &UiTheme,
+        protected: &[Rect],
+    ) {
+        let facts = codewhale_ratatui::ocean::OceanPaintFacts {
+            protected,
+            ..codewhale_ratatui::ocean::OceanPaintFacts::new(background)
+        };
+        self.paint_native(area, buf, ui_theme, &facts);
+    }
+
+    pub(crate) fn paint_native(
+        self,
+        area: Rect,
+        buf: &mut Buffer,
+        ui_theme: &UiTheme,
+        facts: &codewhale_ratatui::ocean::OceanPaintFacts<'_>,
+    ) {
+        if ui_theme.name != codewhale_palette::UNDERWATER_UI_THEME.name {
+            return;
         }
+        let Some(theme) = self.paint_theme(facts.ground) else {
+            return;
+        };
+        let inks = codewhale_ratatui::ocean::OceanContrastInks {
+            border: Some(ui_theme.border),
+            border_strong: Some(ui_theme.text_hint),
+            dim: Some(ui_theme.text_dim),
+        };
+        self.native()
+            .ramp(self.ramp.native())
+            .viewport(Rect::new(0, self.top, 0, self.height))
+            .contrast_inks(inks)
+            .apply_native(area, buf, &theme, facts, |cell, water| {
+                crate::tui::color_compat::project_ocean_ink(cell, water, theme.depth(), ui_theme)
+            });
+    }
+
+    pub(crate) fn paint_caustics(
+        self,
+        area: Rect,
+        buf: &mut Buffer,
+        facts: &codewhale_ratatui::ocean::OceanCausticFacts<'_>,
+    ) {
+        let Some(theme) = self.paint_theme(facts.paint.ground) else {
+            return;
+        };
+        self.native()
+            .ramp(self.ramp.native())
+            .viewport(Rect::new(0, self.top, 0, self.height))
+            .apply_caustics(area, buf, &theme, facts);
+    }
+
+    // Existing pure fixture facade explicitly supplies a synthetic backend.
+    // Runtime callers all use the live fact-bearing native facade above.
+    #[cfg(test)]
+    fn paint_matching(self, area: Rect, buf: &mut Buffer, background: Color) {
+        let caps = crate::tui::color_compat::ColorCompatBackend::new(
+            std::io::sink(),
+            codewhale_palette::ColorDepth::TrueColor,
+            codewhale_palette::PaletteMode::Dark,
+        )
+        .native_ocean_caps();
+        self.with_paint_caps(Some(caps)).paint_matching_native(
+            area,
+            buf,
+            background,
+            &codewhale_palette::UNDERWATER_UI_THEME,
+            &[],
+        );
     }
 }
 
@@ -502,3 +582,10 @@ fn mix(from: (u8, u8, u8), to: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 #[path = "ocean/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ocean/guarded_legacy.rs"]
+mod guarded_legacy;
+#[cfg(test)]
+#[path = "ocean/guarded_tests.rs"]
+mod guarded_tests;

@@ -606,7 +606,7 @@ fn responses_body_serializes_the_child_catalog_without_duplication() {
     request.tools = Some(tools);
     let body = build_responses_body(&request);
     assert_eq!(body["parallel_tool_calls"], false);
-    let generic = build_responses_body_for_provider(&request, ApiProvider::Openai, None);
+    let generic = build_responses_body_for_provider(&request, ProviderKind::Openai, None);
     assert_eq!(generic["parallel_tool_calls"], true);
     assert_eq!(body["tools"].as_array().unwrap().len(), 1);
     assert_eq!(body["tools"][0]["type"], "namespace");
@@ -786,7 +786,7 @@ async fn codex_selected_effort_reaches_preview_wire_and_restored_receipt_unchang
         let activity = WorkActivityEvent::ReasoningEffortChanged {
             requested: selected.into(),
             effective: selected.into(),
-            provider_kind: Some(ApiProvider::OpenaiCodex),
+            provider_kind: Some(ProviderKind::OpenaiCodex),
             provider: "openai-codex".to_string(),
             endpoint_identity: Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string()),
             model: Some("gpt-6-astra".to_string()),
@@ -807,7 +807,7 @@ async fn codex_selected_effort_reaches_preview_wire_and_restored_receipt_unchang
         let mut request = minimal_responses_request();
         request.model = "gpt-6-astra".to_string();
         request.reasoning_effort = restored
-            .api_value_for_provider(ApiProvider::OpenaiCodex)
+            .api_value_for_provider(ProviderKind::OpenaiCodex)
             .map(str::to_string);
         let prepared = client.prepare_outbound_request(request, true).unwrap();
         assert_eq!(
@@ -838,12 +838,13 @@ fn codex_tiers_do_not_change_other_responses_provider_dialects() {
     for effort in ["max", "ultra"] {
         request.reasoning_effort = Some(effort.to_string());
         assert_eq!(
-            build_responses_body_for_provider(&request, ApiProvider::Concentrate, None)["reasoning"]
+            build_responses_body_for_provider(&request, ProviderKind::Concentrate, None)["reasoning"]
                 ["effort"],
             "xhigh"
         );
         assert_eq!(
-            build_responses_body_for_provider(&request, ApiProvider::Deepseek, None)["reasoning"]["effort"],
+            build_responses_body_for_provider(&request, ProviderKind::Deepseek, None)["reasoning"]
+                ["effort"],
             "max"
         );
     }
@@ -879,7 +880,7 @@ fn concentrate_responses_body_sends_only_documented_fields() {
         cache_control: None,
     }]);
 
-    let body = build_responses_body_for_provider(&request, ApiProvider::Concentrate, None);
+    let body = build_responses_body_for_provider(&request, ProviderKind::Concentrate, None);
     let documented = [
         "model",
         "input",
@@ -928,7 +929,7 @@ fn concentrate_responses_body_sends_only_documented_fields() {
 
     // The same request on the generic Responses path still carries the
     // OpenAI-only fields, so the Concentrate branch is a deliberate subset.
-    let generic = build_responses_body_for_provider(&request, ApiProvider::Openai, None);
+    let generic = build_responses_body_for_provider(&request, ProviderKind::Openai, None);
     assert!(
         generic.get("store").is_some()
             && generic.get("include").is_some()
@@ -955,7 +956,7 @@ fn deepseek_flash_responses_body_uses_stateless_0731_contract() {
         },
     );
 
-    let body = build_responses_body_for_provider(&request, ApiProvider::Deepseek, None);
+    let body = build_responses_body_for_provider(&request, ProviderKind::Deepseek, None);
 
     assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["max_output_tokens"], 128);
@@ -986,7 +987,7 @@ fn chatgpt_plan_body_omits_unsupported_output_caps() {
     let mut request = minimal_responses_request();
     request.max_tokens = 4_096;
 
-    let codex = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, None);
+    let codex = build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, None);
     assert!(
         codex.get("max_output_tokens").is_none(),
         "ChatGPT plan body names an unsupported output cap: {codex}"
@@ -996,7 +997,7 @@ fn chatgpt_plan_body_omits_unsupported_output_caps() {
         "no alternate output-cap spelling may sneak onto the Codex wire: {codex}"
     );
 
-    let deepseek = build_responses_body_for_provider(&request, ApiProvider::Deepseek, None);
+    let deepseek = build_responses_body_for_provider(&request, ProviderKind::Deepseek, None);
     assert_eq!(deepseek["max_output_tokens"], json!(4_096));
 }
 
@@ -1005,7 +1006,7 @@ fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
     const SENTINEL: &str = "readable private reasoning must not be replayed";
     const SCOPE: &str = "openai-responses-siwc-v1:test-grant";
     let state = OpaqueReasoningState {
-        provider: ApiProvider::OpenaiCodex.as_str().to_string(),
+        provider: ProviderKind::OpenaiCodex.as_str().to_string(),
         api: SCOPE.to_string(),
         model: "gpt-5.5".to_string(),
         id: Some("rs_opaque".to_string()),
@@ -1024,7 +1025,7 @@ fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
         },
     );
 
-    let exact = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, Some(SCOPE));
+    let exact = build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, Some(SCOPE));
     let exact_wire = exact.to_string();
     assert!(!exact_wire.contains(SENTINEL), "{exact}");
     assert_eq!(exact.pointer("/input/0/type"), Some(&json!("reasoning")));
@@ -1037,7 +1038,7 @@ fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
 
     for other_scope in [None, Some("openai-responses-siwc-v1:another-grant")] {
         let body =
-            build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, other_scope);
+            build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, other_scope);
         assert!(!body.to_string().contains("enc_opaque_payload"), "{body}");
         assert!(!body.to_string().contains(SENTINEL), "{body}");
     }
@@ -1049,12 +1050,12 @@ fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
         state.api = "openai-responses".to_string();
     }
     let legacy_body =
-        build_responses_body_for_provider(&legacy, ApiProvider::OpenaiCodex, Some(SCOPE));
+        build_responses_body_for_provider(&legacy, ProviderKind::OpenaiCodex, Some(SCOPE));
     assert!(!legacy_body.to_string().contains("enc_opaque_payload"));
 
     request.model = "gpt-5.6".to_string();
     let switched_model =
-        build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, Some(SCOPE));
+        build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, Some(SCOPE));
     assert!(!switched_model.to_string().contains(SENTINEL));
     assert!(
         switched_model
@@ -1065,7 +1066,7 @@ fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
     );
 
     let switched_provider =
-        build_responses_body_for_provider(&request, ApiProvider::Deepseek, None);
+        build_responses_body_for_provider(&request, ProviderKind::Deepseek, None);
     let switched_wire = switched_provider.to_string();
     assert!(!switched_wire.contains(SENTINEL), "{switched_provider}");
     assert!(
@@ -1125,7 +1126,7 @@ async fn chatgpt_stream_captures_only_scoped_encrypted_reasoning() {
             continue;
         };
         let state = captured.expect("encrypted reasoning state delta");
-        assert_eq!(state.provider, ApiProvider::OpenaiCodex.as_str());
+        assert_eq!(state.provider, ProviderKind::OpenaiCodex.as_str());
         assert_eq!(state.api, scope);
         assert_eq!(state.model, "gpt-5.5");
         assert_eq!(state.id.as_deref(), Some("rs_1"));
@@ -1228,10 +1229,10 @@ async fn generic_responses_captures_and_replays_opaque_reasoning() {
     );
     assert!(!replay.body.to_string().contains("readable-private-summary"));
     continuation.model = "another-model".into();
-    let wrong_model = build_responses_body_for_provider(&continuation, ApiProvider::Openai, None);
+    let wrong_model = build_responses_body_for_provider(&continuation, ProviderKind::Openai, None);
     assert!(!wrong_model.to_string().contains("enc_generic"));
     let wrong_provider =
-        build_responses_body_for_provider(&continuation, ApiProvider::Deepseek, None);
+        build_responses_body_for_provider(&continuation, ProviderKind::Deepseek, None);
     assert!(!wrong_provider.to_string().contains("enc_generic"));
 }
 
@@ -1438,7 +1439,7 @@ fn parse_responses_usage_keeps_old_shape_with_cache_write_fallback() {
 /// `output_tokens_details.reasoning_tokens` a subset of it.
 #[test]
 fn responses_usage_reaches_pricing_conversion_without_double_billing_reasoning() {
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use crate::pricing::{calculate_turn_cost_estimate_for_provider, token_usage_for_pricing};
 
     let usage = parse_responses_usage(&json!({
@@ -1456,7 +1457,7 @@ fn responses_usage_reaches_pricing_conversion_without_double_billing_reasoning()
     assert_eq!(classes.cache_write, 0);
 
     // gpt-5.5: 0.50 cache-read / 5.00 input / 30.00 output per million.
-    let cost = calculate_turn_cost_estimate_for_provider(ApiProvider::Openai, "gpt-5.5", &usage)
+    let cost = calculate_turn_cost_estimate_for_provider(ProviderKind::Openai, "gpt-5.5", &usage)
         .expect("direct OpenAI route is priced");
     let expected = 0.006 * 0.50 + 0.004 * 5.00 + 0.004 * 30.00;
     assert!(
@@ -1511,7 +1512,7 @@ fn responses_input_includes_user_role_tool_results() {
         top_p: None,
     };
 
-    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
+    let input = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
 
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["call_id"], "call_abc");
@@ -1549,12 +1550,12 @@ fn responses_input_encodes_tool_call_names() {
         top_p: None,
     };
 
-    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
+    let input = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
 
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["name"], to_api_tool_name("web.run"));
     assert_eq!(input[0]["namespace"], "codewhale");
-    let generic = convert_messages_to_responses_input(&request, ApiProvider::Openai, None);
+    let generic = convert_messages_to_responses_input(&request, ProviderKind::Openai, None);
     assert!(generic[0].get("namespace").is_none());
 }
 
@@ -1679,7 +1680,7 @@ fn user_image_becomes_an_input_image_item() {
         },
     });
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
+    let items = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
 
     let user = items
         .iter()
@@ -1733,7 +1734,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         },
     ];
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
+    let items = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
     let output = items
         .iter()
         .find(|item| item["type"] == "function_call_output")
@@ -1775,8 +1776,8 @@ fn responses_input_preserves_system_history_with_the_provider_role() {
     );
 
     for (provider, role) in [
-        (ApiProvider::OpenaiCodex, "developer"),
-        (ApiProvider::Openai, "system"),
+        (ProviderKind::OpenaiCodex, "developer"),
+        (ProviderKind::Openai, "system"),
     ] {
         let items = convert_messages_to_responses_input(&request, provider, None);
         let system = items

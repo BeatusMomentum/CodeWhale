@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::tools::schema_sanitize;
@@ -33,7 +33,7 @@ const CHATGPT_TOOL_NAMESPACE: &str = "codewhale";
 /// Build the Responses API request body from a `MessageRequest`.
 #[cfg(test)]
 pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
-    build_responses_body_for_provider(request, ApiProvider::OpenaiCodex, None)
+    build_responses_body_for_provider(request, ProviderKind::OpenaiCodex, None)
 }
 
 /// Build a provider-aware Responses API request body.
@@ -44,10 +44,10 @@ pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
 /// provider-neutral message model.
 pub(super) fn build_responses_body_for_provider(
     request: &MessageRequest,
-    provider: ApiProvider,
+    provider: ProviderKind,
     reasoning_api: Option<&str>,
 ) -> Value {
-    let is_deepseek = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN);
+    let is_deepseek = matches!(provider, ProviderKind::Deepseek);
     // Concentrate documents `model`, `input`, `stream`, `max_output_tokens`,
     // `tools` / `tool_choice` / `parallel_tool_calls`, and `reasoning.effort`;
     // `store`, `include`, `instructions`, and `reasoning.summary` are absent
@@ -55,7 +55,7 @@ pub(super) fn build_responses_body_for_provider(
     // fields and carries the system prompt as a leading `system` message item
     // (a documented input role) instead of `instructions`.
     // https://concentrate.ai/docs/api-reference/endpoint/request-parameters
-    let is_concentrate = provider == ApiProvider::Concentrate;
+    let is_concentrate = provider == ProviderKind::Concentrate;
     let model = &request.model;
     let mut body = json!({
         "model": model,
@@ -69,7 +69,7 @@ pub(super) fn build_responses_body_for_provider(
     // escape the central route cap and made preview unable to prove the wire
     // allowance. The official ChatGPT plan preview contract disallows
     // max_output_tokens, so that route carries no client-side output cap.
-    if request.max_tokens > 0 && provider != ApiProvider::OpenaiCodex {
+    if request.max_tokens > 0 && provider != ProviderKind::OpenaiCodex {
         body["max_output_tokens"] = json!(request.max_tokens);
     }
     if is_deepseek {
@@ -106,7 +106,7 @@ pub(super) fn build_responses_body_for_provider(
     if let Some(tools) = request.tools.as_ref() {
         let responses_tools: Vec<Value> = tools.iter().map(tool_to_responses_function).collect();
         if !responses_tools.is_empty() {
-            body["tools"] = if provider == ApiProvider::OpenaiCodex {
+            body["tools"] = if provider == ProviderKind::OpenaiCodex {
                 json!([{ "type": "namespace", "name": CHATGPT_TOOL_NAMESPACE,
                     "description": "Codewhale tools running under the user's local permissions.",
                     "tools": responses_tools }])
@@ -115,7 +115,7 @@ pub(super) fn build_responses_body_for_provider(
             };
             body["tool_choice"] = json!("auto");
             // The plan preview decoder tracks one active function-call block.
-            body["parallel_tool_calls"] = json!(provider != ApiProvider::OpenaiCodex);
+            body["parallel_tool_calls"] = json!(provider != ProviderKind::OpenaiCodex);
         }
     }
 
@@ -124,7 +124,7 @@ pub(super) fn build_responses_body_for_provider(
     // collapse newer tiers to an older model's xhigh ceiling. Other Responses
     // providers retain their own compatibility vocabulary.
     if let Some(raw) = request.reasoning_effort.as_deref()
-        && let Some(effort) = if provider == ApiProvider::OpenaiCodex {
+        && let Some(effort) = if provider == ProviderKind::OpenaiCodex {
             codex_responses_reasoning_effort(raw)
         } else {
             responses_reasoning_effort(raw, is_deepseek)
@@ -158,7 +158,7 @@ impl CodewhaleClient {
         // Body, endpoint, and route shape all come from the shared
         // prepared-request seam (`prepare_outbound_request`).
         let body = &prepared.body;
-        let is_chatgpt = self.api_provider == ApiProvider::OpenaiCodex;
+        let is_chatgpt = self.api_provider == ProviderKind::OpenaiCodex;
         let url = prepared.endpoint.url.clone();
         // The synthetic MessageStart below is emitted from inside the stream
         // closure, which outlives `prepared`. Clone the wire model — the id
@@ -223,7 +223,7 @@ impl CodewhaleClient {
 
         let stream_idle_timeout = self.stream_idle_timeout;
         let first_byte = super::stream_entry::first_byte_timeout(stream_idle_timeout);
-        let provider_label = self.api_provider.display_name();
+        let provider_label = self.api_provider.provider().display_name();
         let error_secrets = self.model_bound_secret_values.clone();
         let byte_stream = response.bytes_stream();
 
@@ -806,10 +806,10 @@ pub(super) fn responses_tool_output(content: &str, content_blocks: Option<&[Valu
 /// Convert Codewhale messages to Responses API input items.
 pub(super) fn convert_messages_to_responses_input(
     request: &MessageRequest,
-    provider: ApiProvider,
+    provider: ProviderKind,
     reasoning_api: Option<&str>,
 ) -> Vec<Value> {
-    let is_deepseek = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN);
+    let is_deepseek = matches!(provider, ProviderKind::Deepseek);
     let mut items = Vec::new();
 
     for msg in &request.messages {
@@ -897,7 +897,7 @@ pub(super) fn convert_messages_to_responses_input(
                                 "name": to_api_tool_name(name),
                                 "arguments": serde_json::to_string(input).unwrap_or_default(),
                             });
-                            if provider == ApiProvider::OpenaiCodex {
+                            if provider == ProviderKind::OpenaiCodex {
                                 item["namespace"] = json!(CHATGPT_TOOL_NAMESPACE);
                             }
                             items.push(item);
@@ -907,7 +907,7 @@ pub(super) fn convert_messages_to_responses_input(
                         } => {
                             if let Some(state) = state {
                                 if state.provider == provider.as_str()
-                                    && if provider == ApiProvider::OpenaiCodex {
+                                    && if provider == ProviderKind::OpenaiCodex {
                                         reasoning_api.is_some_and(|api| state.api == api)
                                     } else {
                                         state.api == "openai-responses"
@@ -981,7 +981,7 @@ pub(super) fn convert_messages_to_responses_input(
                         if !content_items.is_empty() {
                             items.push(json!({
                                 "type": "message",
-                                "role": if provider == ApiProvider::OpenaiCodex && role == "system" { "developer" } else { role },
+                                "role": if provider == ProviderKind::OpenaiCodex && role == "system" { "developer" } else { role },
                                 "content": content_items,
                             }));
                         }
@@ -1023,7 +1023,7 @@ fn tool_to_responses_function(tool: &Tool) -> Value {
 fn codex_responses_reasoning_effort(raw: &str) -> Option<&'static str> {
     crate::reasoning_preference::ReasoningEffort::parse_strict(raw)
         .unwrap_or(crate::reasoning_preference::ReasoningEffort::Medium)
-        .api_value_for_provider(ApiProvider::OpenaiCodex)
+        .api_value_for_provider(ProviderKind::OpenaiCodex)
 }
 
 fn compatible_responses_reasoning_effort(raw: &str) -> Option<&'static str> {

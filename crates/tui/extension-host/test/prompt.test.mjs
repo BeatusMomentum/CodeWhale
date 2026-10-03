@@ -108,3 +108,38 @@ test('core refusal fails prompt activation with its reason', async (t) => {
   assert.equal(result.status, 'failed')
   assert.match(result.diagnostic, /reviewed Native authority is gone/)
 })
+
+
+test('Native source preserves exact non-ASCII prompt text on both runtimes', async t => {
+  const host=await startHost();t.after(()=>host.stop())
+  const text='中文 界 日本語 한국어 🌊 café'
+  const entry=plugin(t,`ctx.prompt.registerSection({id:'unicode',text:${JSON.stringify(text)}})`)
+  const mounted=await activate(host,'unicode-prompt-source',entry)
+  assert.equal(mounted.result.status,'ok',mounted.result.diagnostic)
+  assert.equal(host.registry.find(row=>row.op==='register' && row.kind==='prompt_section').spec.description,text)
+  assert.deepEqual(await host.call('ext/deactivate',{owner:mounted.ref}),{disposed:true,leaked:[]})
+})
+
+
+test('template sections keep Core-owned values unresolved and share literal lifecycle and bounds', async t => {
+  const host = await startHost(); t.after(() => host.stop())
+  const source = plugin(t, `
+    const definition = {id:'persona-prefix',text:'Model {{model}} at {{cwd}}. lone {{',interpolate:'model-cwd'}
+    ctx.prompt.registerSection(definition)
+    definition.text='forged values'
+    ctx.prompt.registerSection({id:'literal',text:'{{model}} stays literal'})
+  `)
+  const mounted = await activate(host, 'templates', source)
+  assert.equal(mounted.result.status, 'ok', mounted.result.diagnostic)
+  const rows = host.registry.filter(row => row.op === 'register')
+  assert.equal(rows.find(row => row.kind === 'prompt_template').spec.description, 'Model {{model}} at {{cwd}}. lone {{')
+  assert.equal(rows.find(row => row.kind === 'prompt_section').spec.description, '{{model}} stays literal')
+  assert.deepEqual(await host.call('ext/deactivate', {owner:mounted.ref}), {disposed:true,leaked:[]})
+  for (const row of rows) assert.ok(host.registry.some(event => event.op === 'unregister' && event.handle === row.handle))
+  for (const [index, text] of ['{{model_id}}','{{}}','{{ model }}','{{{cwd}}'].entries()) {
+    const bad = await activate(host, 'bad-template-'+index, plugin(t, `ctx.prompt.registerSection({id:'invalid',text:${JSON.stringify(text)},interpolate:'model-cwd'})`))
+    assert.equal(bad.result.status, 'failed'); assert.match(bad.result.diagnostic,/prompt variable/)
+  }
+  const duplicate = await activate(host, 'duplicate-template', plugin(t, `ctx.prompt.registerSection({id:'same',text:'{{model}}',interpolate:'model-cwd'});ctx.prompt.registerSection({id:'same',text:'literal'})`))
+  assert.equal(duplicate.result.status, 'failed'); assert.match(duplicate.result.diagnostic,/already registered/)
+})

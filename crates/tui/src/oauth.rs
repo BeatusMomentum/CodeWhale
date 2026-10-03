@@ -2051,9 +2051,12 @@ fn registration_from_entry(entry: &OwnedAuthEntry) -> Result<ChatgptRegistration
 
 /// Metadata only: no network, refresh, token return, or external credential import.
 pub(crate) fn official_chatgpt_registration(config: &Config) -> Result<ChatgptRegistration> {
+    let identity = config
+        .builtin_provider_identity(OAuthProvider::Chatgpt.api())
+        .map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         config
-            .provider_config_for(OAuthProvider::Chatgpt.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             == Some("oauth"),
         "Sign in with ChatGPT using `codewhale auth chatgpt`; the selected route has no official OAuth grant"
@@ -2069,19 +2072,16 @@ pub(crate) fn official_chatgpt_registration(config: &Config) -> Result<ChatgptRe
 impl OAuthProvider {
     /// The engine provider this OAuth row belongs to.
     #[must_use]
-    pub fn api(self) -> crate::config::ApiProvider {
+    pub fn api(self) -> crate::config::ProviderKind {
         match self {
-            OAuthProvider::Xai => crate::config::ApiProvider::Xai,
-            OAuthProvider::Chatgpt => crate::config::ApiProvider::OpenaiCodex,
+            OAuthProvider::Xai => crate::config::ProviderKind::Xai,
+            OAuthProvider::Chatgpt => crate::config::ProviderKind::OpenaiCodex,
         }
     }
 
     /// `[providers.<key>]` table this provider's auth state lives under.
     fn config_key(self) -> &'static str {
-        crate::config::provider_config_key(self.api()).unwrap_or(match self {
-            OAuthProvider::Xai => "xai",
-            OAuthProvider::Chatgpt => "openai_codex",
-        })
+        codewhale_config::descriptors::compatibility_for_kind(self.api()).config_key
     }
 
     fn legacy_file_name(self) -> &'static str {
@@ -2793,8 +2793,11 @@ fn configured_owned_auth_file_path(
     provider: OAuthProvider,
     config: &Config,
 ) -> Result<Option<PathBuf>> {
+    let identity = config
+        .builtin_provider_identity(provider.api())
+        .map_err(anyhow::Error::msg)?;
     let generation = config
-        .provider_config_for(provider.api())
+        .provider_config_for(&identity)
         .and_then(|entry| entry.oauth_credential_generation.as_deref());
     match generation {
         Some(generation) => provider.generation_path(generation).map(Some),
@@ -2828,6 +2831,7 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
 /// costs no second credential read.
 #[must_use]
 pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<UsableSignIn> {
+    let identity = config.builtin_provider_identity(provider.api()).ok()?;
     let usable = |entry: &OwnedAuthEntry| UsableSignIn {
         account_label: entry.account_label(),
     };
@@ -2837,7 +2841,7 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
     // launch.
     if provider == OAuthProvider::Chatgpt
         && config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             != Some("oauth")
     {
@@ -2845,7 +2849,7 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
     }
     if provider == OAuthProvider::Xai
         && !config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             .is_some_and(auth_mode_uses_xai_oauth)
     {
@@ -2860,7 +2864,7 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
         return Some(usable(&entry));
     }
     if config
-        .provider_config_for(provider.api())
+        .provider_config_for(&identity)
         .and_then(|entry| entry.oauth_credential_generation.as_deref())
         .is_some()
     {
@@ -2880,11 +2884,11 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
         // #5772: with no persisted consent record there is no external path
         // to resolve and nothing to open.
         if let Some(consent_path) = config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.external_credentials.as_ref())
             .map(|consent| consent.path.clone())
             && let Ok(grant) = config.external_credential_read_grant(
-                provider.api(),
+                &identity,
                 codewhale_config::ExternalCredentialSource::GrokCli,
                 &consent_path,
             )
@@ -2933,10 +2937,14 @@ pub fn validate_grok_external_credentials(
 /// credentials may refresh and rewrite Codewhale-owned storage; external
 /// credentials are read-only.
 pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
+    let identity = config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
-        config.api_provider() == crate::config::ApiProvider::Xai
+        identity.provider == crate::config::ProviderKind::Xai
+            && identity.key.as_str() == crate::config::ProviderKind::Xai.as_str()
             && config
-                .provider_config_for(crate::config::ApiProvider::Xai)
+                .provider_config_for(&identity)
                 .and_then(|entry| entry.auth_mode.as_deref())
                 .is_some_and(auth_mode_uses_xai_oauth),
         "Codewhale-owned xAI OAuth credentials are inactive until the xAI route explicitly selects OAuth"
@@ -2951,7 +2959,7 @@ pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
 
     let external_path = grok_auth_file_path();
     let grant = config.external_credential_read_grant(
-        crate::config::ApiProvider::Xai,
+        &identity,
         codewhale_config::ExternalCredentialSource::GrokCli,
         &external_path,
     )?;
@@ -2987,10 +2995,13 @@ pub fn get_owned_credentials(
     provider: OAuthProvider,
     config: &Config,
 ) -> Result<OwnedOAuthCredentials> {
+    let identity = config
+        .builtin_provider_identity(provider.api())
+        .map_err(anyhow::Error::msg)?;
     if provider == OAuthProvider::Chatgpt {
         anyhow::ensure!(
             config
-                .provider_config_for(provider.api())
+                .provider_config_for(&identity)
                 .and_then(|entry| entry.auth_mode.as_deref())
                 == Some("oauth"),
             "ChatGPT credentials are inactive; run `codewhale auth chatgpt`"
@@ -3375,9 +3386,9 @@ fn activate_login_locked(
 
     if let Some(config) = live_config {
         match provider {
-            OAuthProvider::Xai => config.mark_codewhale_owned_xai_oauth(generation.clone()),
+            OAuthProvider::Xai => config.mark_codewhale_owned_xai_oauth(generation.clone())?,
             OAuthProvider::Chatgpt => {
-                config.mark_codewhale_owned_chatgpt_oauth(generation.clone());
+                config.mark_codewhale_owned_chatgpt_oauth(generation.clone())?;
             }
         }
     }
@@ -3470,11 +3481,12 @@ fn revoke_owned_login_locked_with(
         }
         Ok(previous)
     })?;
-    if let Some(config) = live_config
-        && provider == OAuthProvider::Chatgpt
-    {
-        config.clear_codewhale_owned_chatgpt_oauth();
-    }
+    let live_config_clear = match live_config {
+        Some(config) if provider == OAuthProvider::Chatgpt => {
+            config.clear_codewhale_owned_chatgpt_oauth()
+        }
+        _ => Ok(()),
+    };
     let names = match previous.as_deref() {
         Some(generation) if provider.is_valid_generation(generation) => {
             vec![generation.to_string()]
@@ -3522,10 +3534,16 @@ fn revoke_owned_login_locked_with(
             .remove(&name)
             .context("OAuth sign-out could not clear local credential storage")?;
     }
-    anyhow::ensure!(
-        !remote_unconfirmed,
-        "Signed out locally, but remote revocation was not confirmed. Disconnect Codewhale in ChatGPT Settings to end the renewable session."
-    );
+    // A refused live mirror must not leave durable tokens behind. Report it
+    // only after local removal and preserve an unconfirmed remote outcome.
+    if remote_unconfirmed {
+        return live_config_clear.context(
+            "Signed out locally, but the live route could not be refreshed and remote revocation was not confirmed.",
+        ).and_then(|()| anyhow::bail!(
+            "Signed out locally, but remote revocation was not confirmed. Disconnect Codewhale in ChatGPT Settings to end the renewable session."
+        ));
+    }
+    live_config_clear.context("Signed out locally, but the live route could not be refreshed")?;
     Ok(())
 }
 
@@ -3544,9 +3562,12 @@ fn revoke_owned_login_locked_with(
 /// [#5032]: https://github.com/Hmbown/CodeWhale/issues/5032
 #[must_use]
 pub fn owned_generation_is_dangling(provider: OAuthProvider, config: &Config) -> bool {
+    let Ok(identity) = config.builtin_provider_identity(provider.api()) else {
+        return false;
+    };
     if provider == OAuthProvider::Xai
         && !config
-            .provider_config_for(provider.api())
+            .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             .is_some_and(auth_mode_uses_xai_oauth)
     {
@@ -3770,14 +3791,14 @@ pub(crate) fn install_test_chatgpt_registration_for(
     codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
         write_auth_file_to_store(store, &generation, &file, false)
     })?;
-    config.mark_codewhale_owned_chatgpt_oauth(generation);
+    config.mark_codewhale_owned_chatgpt_oauth(generation)?;
     Ok("siwc-test-access".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -5008,7 +5029,9 @@ mod tests {
             Some("b@example.com")
         );
         let mut config = Config::default();
-        config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
+        config
+            .mark_codewhale_owned_chatgpt_oauth(generation.to_string())
+            .expect("admitted OAuth fixture");
         assert_eq!(
             usable_sign_in(OAuthProvider::Chatgpt, &config),
             Some(UsableSignIn {
@@ -5065,7 +5088,9 @@ mod tests {
             .and_then(|name| name.to_str())
             .expect("generation name");
         let mut config = Config::default();
-        config.mark_codewhale_owned_xai_oauth(generation.to_string());
+        config
+            .mark_codewhale_owned_xai_oauth(generation.to_string())
+            .expect("admitted OAuth fixture");
         assert_eq!(
             usable_sign_in(OAuthProvider::Xai, &config)
                 .and_then(|sign_in| sign_in.account_label)
@@ -5088,7 +5113,7 @@ mod tests {
         let config_path = root.join("config.toml");
         std::fs::write(&config_path, "").expect("empty config");
         let mut config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             ..Config::default()
         };
         let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
@@ -5172,7 +5197,9 @@ mod tests {
         })
         .expect("seed stale generation");
         let mut config = Config::default();
-        config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
+        config
+            .mark_codewhale_owned_chatgpt_oauth(generation.to_string())
+            .expect("admitted OAuth fixture");
         assert!(!credentials_valid(OAuthProvider::Chatgpt, &config));
         assert_eq!(usable_sign_in(OAuthProvider::Chatgpt, &config), None);
         let reason = owned_account_label_for_generation(OAuthProvider::Chatgpt, generation)
@@ -5468,7 +5495,7 @@ mod tests {
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -5516,7 +5543,7 @@ mod tests {
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -5570,7 +5597,7 @@ mod tests {
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -5653,7 +5680,7 @@ mod tests {
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let _key_guard = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -5677,7 +5704,10 @@ mod tests {
             "an expired external access token is not usable material"
         );
         assert!(
-            !crate::config::has_api_key_for(&config, ApiProvider::Xai),
+            !crate::config::has_api_key_for(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             "expired external xAI OAuth must fall through to the missing-key path"
         );
         assert_eq!(
@@ -5707,7 +5737,10 @@ mod tests {
         )
         .unwrap();
         assert!(credentials_present(OAuthProvider::Xai, &config));
-        assert!(crate::config::has_api_key_for(&config, ApiProvider::Xai));
+        assert!(crate::config::has_api_key_for(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Xai)
+        ));
     }
 
     #[test]
@@ -6138,7 +6171,9 @@ consent_version = 1
                 & 0o777,
             0o600
         );
-        let live_xai = live.provider_config_for(ApiProvider::Xai).unwrap();
+        let live_xai = live
+            .provider_config_for(&live.test_identity_for_kind(ProviderKind::Xai))
+            .unwrap();
         assert_eq!(live_xai.auth_mode.as_deref(), Some("oauth"));
         assert_eq!(
             live_xai.oauth_credential_generation.as_deref(),
@@ -6301,7 +6336,7 @@ consent_version = 1
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
 
         let config = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -6320,7 +6355,7 @@ consent_version = 1
         // Specificity: OAuth selected but no generation configured is the normal
         // "needs auth" state, not a dangling pointer.
         let unconfigured = Config {
-            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            provider: Some(ProviderKind::Xai.as_str().to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 xai: crate::config::ProviderConfig {
                     auth_mode: Some("oauth".to_string()),
@@ -6418,7 +6453,9 @@ consent_version = 1
         );
         let error = result.expect_err("invalid backup path must fail activation");
         assert!(error.to_string().contains("not activated"), "{error:#}");
-        let live_xai = live.provider_config_for(ApiProvider::Xai).unwrap();
+        let live_xai = live
+            .provider_config_for(&live.test_identity_for_kind(ProviderKind::Xai))
+            .unwrap();
         assert_eq!(live_xai.auth_mode.as_deref(), Some("api_key"));
         assert!(live_xai.oauth_credential_generation.is_none());
         assert_eq!(
@@ -6897,10 +6934,12 @@ consent_version = 1
             .unwrap()
             .to_string();
         let mut config = Config {
-            provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+            provider: Some(ProviderKind::OpenaiCodex.as_str().to_string()),
             ..Config::default()
         };
-        config.mark_codewhale_owned_chatgpt_oauth(generation.clone());
+        config
+            .mark_codewhale_owned_chatgpt_oauth(generation.clone())
+            .expect("admitted OAuth fixture");
         assert!(credentials_valid(OAuthProvider::Chatgpt, &config));
 
         let stale = jwt_with_exp(1_000_000_000);
@@ -6967,6 +7006,63 @@ consent_version = 1
         assert!(
             posts.iter().any(|(url, _)| url.contains("/oauth/revoke")),
             "{posts:?}"
+        );
+    }
+
+    #[test]
+    fn chatgpt_revoke_removes_durable_tokens_when_live_mirror_refuses() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let pending = pending_login_with_id_token_for_test(
+            OAuthProvider::Chatgpt,
+            "access-1",
+            "refresh-1",
+            Some(&jwt_with_account("acct-7")),
+        );
+        let activation = activate_login(pending, Some(&config_path), None).expect("activate");
+        assert!(activation.auth_path.exists());
+        let mut live = Config::default();
+        live.providers
+            .get_or_insert_with(Default::default)
+            .custom
+            .insert(
+                ProviderKind::OpenaiCodex.as_str().to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://localhost:1234/v1".to_string()),
+                    ..Default::default()
+                },
+            );
+        assert!(live.clear_codewhale_owned_chatgpt_oauth().is_err());
+        let mock = MockTokenClient::new(vec![(200, String::new())]);
+        let error = codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            revoke_owned_login_locked_with(
+                OAuthProvider::Chatgpt,
+                Some(&config_path),
+                Some(&mut live),
+                store,
+                &mock,
+            )
+        })
+        .expect_err("live mirror refusal remains visible");
+        assert!(error.to_string().contains("Signed out locally"));
+        assert!(
+            !activation.auth_path.exists(),
+            "local tokens cannot survive a refused mirror"
+        );
+        let after = std::fs::read_to_string(&config_path).expect("config after revoke");
+        assert!(
+            !after.contains("chatgpt-auth-"),
+            "durable generation pointer removed"
+        );
+        assert_eq!(
+            mock.posts.lock().unwrap().len(),
+            1,
+            "one captured remote revoke"
         );
     }
 

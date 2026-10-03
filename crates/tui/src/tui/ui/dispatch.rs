@@ -42,7 +42,7 @@ pub(crate) fn dispatch_hotbar_slot(
         return Ok(Some(HotbarDispatch::Handled));
     }
 
-    action.dispatch(app).map(Some)
+    action.dispatch(app, config).map(Some)
 }
 
 pub(crate) fn queued_ui_to_session(msg: &QueuedMessage) -> QueuedSessionMessage {
@@ -358,7 +358,7 @@ pub(crate) fn queued_message_content_for_app(
 ) -> Result<String> {
     if let Some(provenance) = message.skill_provenance.as_ref() {
         provenance
-            .verify(&app.workspace)
+            .verify_for(&app.workspace, Some(app.extension_plugin_view().as_ref()))
             .map_err(anyhow::Error::msg)?;
     }
     // Pass the process CWD explicitly so the resolver's two-pass logic can
@@ -596,7 +596,8 @@ pub(crate) fn prepare_user_dispatch(
     if let Some(note) = paused_dispatch.note() {
         content.push_str(note);
     }
-    let (app_route_identity, route_config) = app_scoped_runtime_config(app, config);
+    let (app_route_identity, route_config) =
+        app_scoped_runtime_config(app, config).map_err(anyhow::Error::msg)?;
 
     let should_auto_resolve = auto_router::should_resolve_auto_model_selection(app);
     let auto_router_context = auto_router::recent_auto_router_context(&app.api_messages);
@@ -800,7 +801,10 @@ where
                         .to_string(),
                     detail: Some(format!(
                         "{} / {}",
-                        fallback.api_provider.display_name(),
+                        fallback
+                            .app_route_identity
+                            .compatibility()
+                            .map_or(fallback.app_route_identity.key.as_str(), |row| row.label),
                         fallback.app_model
                     )),
                     turn_id: None,

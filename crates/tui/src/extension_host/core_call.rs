@@ -250,6 +250,9 @@ pub(crate) struct Invocation {
     tier: HostTier,
     host_generation: u64,
     owner: OwnerRef,
+    scope: Option<super::protocol::EntryRef>,
+    plugins: Option<Arc<crate::plugins::PluginRegistry>>,
+    content_hash: String,
     calls: CodemodeInvoker,
     /// Fires when the invocation ends or is revoked: withdraws every
     /// `core/call` still waiting or running for it.
@@ -259,7 +262,7 @@ pub(crate) struct Invocation {
 /// The tickets and invocations of one manager.
 #[derive(Default)]
 pub(crate) struct CoreCalls {
-    tickets: super::ticket::TicketTable,
+    pub(super) tickets: super::ticket::TicketTable,
     invocations: Mutex<HashMap<String, Arc<Invocation>>>,
 }
 
@@ -268,6 +271,7 @@ impl CoreCalls {
     /// running on `tier`'s host process `host_generation`, if `gate` is the
     /// nested-call gate the turn loop serves for exactly this tool
     /// (`expected`). `None` otherwise: no ticket, so no `core/call`.
+    #[cfg(test)]
     pub(crate) fn begin(
         self: &Arc<Self>,
         tier: HostTier,
@@ -277,6 +281,31 @@ impl CoreCalls {
         expected: &ExtensionCaller,
         context: &ToolContext,
         gate: &NestedCallGate,
+    ) -> Option<InvocationGuard> {
+        self.begin_scoped(
+            tier,
+            host_generation,
+            owner,
+            call_id,
+            expected,
+            context,
+            gate,
+            None,
+            String::new(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_scoped(
+        self: &Arc<Self>,
+        tier: HostTier,
+        host_generation: u64,
+        owner: &OwnerRef,
+        call_id: &str,
+        expected: &ExtensionCaller,
+        context: &ToolContext,
+        gate: &NestedCallGate,
+        scope: Option<super::protocol::EntryRef>,
+        content_hash: String,
     ) -> Option<InvocationGuard> {
         let (caller, specs) = gate.extension()?;
         if caller != expected {
@@ -303,6 +332,9 @@ impl CoreCalls {
             tier,
             host_generation,
             owner: owner.clone(),
+            scope,
+            plugins: context.plugin_registry.clone(),
+            content_hash,
             calls,
             cancel: CancellationToken::new(),
         });
@@ -349,6 +381,22 @@ impl CoreCalls {
     pub(crate) fn revoke_owner(&self, plugin_id: &str) {
         self.tickets.revoke_owner(plugin_id);
         self.revoke_where(|invocation| invocation.owner.plugin_id == plugin_id);
+    }
+
+    pub(crate) fn revoke_scope(&self, plugin_id: &str, scope: &super::protocol::EntryRef) {
+        self.revoke_where(|invocation| {
+            invocation.owner.plugin_id == plugin_id && invocation.scope.as_ref() == Some(scope)
+        });
+    }
+
+    pub(crate) fn revoke_attachment(&self, id: u64) {
+        self.revoke_where(|invocation| {
+            invocation
+                .plugins
+                .as_ref()
+                .and_then(|plugins| plugins.caller_selection())
+                .is_some_and(|selection| selection.attachment_id == id)
+        });
     }
 
     /// One host process exited.
@@ -427,6 +475,18 @@ impl CoreCalls {
                 "the invocation this core/call belongs to has ended".to_string(),
             ));
         };
+        shared
+            .check_selection(
+                invocation
+                    .plugins
+                    .as_ref()
+                    .and_then(|plugins| plugins.caller_selection()),
+                invocation.plugins.as_deref(),
+                &params.owner.plugin_id,
+                &invocation.content_hash,
+                invocation.scope.as_ref(),
+            )
+            .map_err(|message| refuse(error_code::REFUSED, message))?;
         // Withdrawn when the host cancels this request, its owner is revoked,
         // the host exits (`cx.cancel`), or the invocation ends.
         let withdraw = invocation.cancel.child_token();
@@ -443,6 +503,18 @@ impl CoreCalls {
             .calls
             .call(params.name, params.input, Some(&withdraw))
             .await;
+        shared
+            .check_selection(
+                invocation
+                    .plugins
+                    .as_ref()
+                    .and_then(|plugins| plugins.caller_selection()),
+                invocation.plugins.as_deref(),
+                &params.owner.plugin_id,
+                &invocation.content_hash,
+                invocation.scope.as_ref(),
+            )
+            .map_err(|message| refuse(error_code::REFUSED, message))?;
         let result = match outcome {
             Ok(response) => Ok(wire_from_response(response)),
             Err(NestedFailure::Rejected { decision, message }) => Err(refuse(

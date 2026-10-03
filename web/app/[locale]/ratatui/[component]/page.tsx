@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { PageHeader } from "@/components/page-header";
 import { RatatuiExplorer } from "@/components/ratatui/explorer";
+import { RatatuiProjectLinks } from "@/components/ratatui/project-links";
 import { getRatatuiCopy } from "@/lib/content/ratatui";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { readCatalogue } from "@/lib/ratatui/catalogue";
@@ -35,12 +36,14 @@ export default async function RatatuiComponentPage({ params }: { params: PagePar
   const entry = catalogue.entries.find((item) => item.name === component);
   if (!entry) notFound();
   const copy = getRatatuiCopy(locale);
+  const family = catalogue.families.find((item) => item.id === entry.family);
 
   return (
     <div className="ratatui-page">
       <PageHeader
         title={entry.title}
         lede={entry.description}
+        kicker={family ? <Link href={`/${locale}/ratatui`}>{copy.title} · {family.title}</Link> : copy.title}
         actions={
           <>
             <Link href={`/${locale}/ratatui`} className="btn btn-secondary">{copy.back}</Link>
@@ -48,7 +51,8 @@ export default async function RatatuiComponentPage({ params }: { params: PagePar
           </>
         }
       />
-      <RatatuiExplorer catalogue={catalogue} locale={locale} copy={copy} initialEntry={entry.name} />
+      <RatatuiExplorer catalogue={catalogue} locale={locale} copy={copy} initialEntry={entry.name} detail />
+      <RatatuiProjectLinks revision={catalogue.source.revision} copy={copy} />
     </div>
   );
 }

@@ -124,7 +124,7 @@ pub struct RouteBillingEnvelope {
 /// Provider/model route resolved for a model-backed turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnRoute {
-    /// `ApiProvider` key (`deepseek`, `openai`, `custom`, ...).
+    /// `ProviderKind` key (`deepseek`, `openai`, `custom`, ...).
     pub provider: String,
     /// Exact non-secret configured route key.
     pub provider_identity: String,
@@ -355,6 +355,17 @@ pub enum EventMsg {
     ToolCallHeartbeat {
         thread_id: ThreadId,
         session_id: SessionId,
+    },
+    ToolExecutionStarted {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        tool_call_id: String,
+    },
+    ToolResultContent {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        tool_call_id: String,
+        blocks: Value,
     },
     ToolCallComplete {
         thread_id: ThreadId,
@@ -853,6 +864,8 @@ impl EventMsg {
             Self::ThinkingComplete { .. } => "thinking_complete",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallHeartbeat { .. } => "tool_call_heartbeat",
+            Self::ToolExecutionStarted { .. } => "tool_execution_started",
+            Self::ToolResultContent { .. } => "tool_result_content",
             Self::ToolCallComplete { .. } => "tool_call_complete",
             Self::OperationActivityStarted { .. } => "operation_activity_started",
             Self::OperationActivityCompleted { .. } => "operation_activity_completed",
@@ -910,6 +923,8 @@ impl EventMsg {
             | Self::ThinkingComplete { thread_id, .. }
             | Self::ToolCallStarted { thread_id, .. }
             | Self::ToolCallHeartbeat { thread_id, .. }
+            | Self::ToolExecutionStarted { thread_id, .. }
+            | Self::ToolResultContent { thread_id, .. }
             | Self::ToolCallComplete { thread_id, .. }
             | Self::OperationActivityStarted { thread_id, .. }
             | Self::OperationActivityCompleted { thread_id, .. }
@@ -967,6 +982,8 @@ impl EventMsg {
             | Self::ThinkingComplete { session_id, .. }
             | Self::ToolCallStarted { session_id, .. }
             | Self::ToolCallHeartbeat { session_id, .. }
+            | Self::ToolExecutionStarted { session_id, .. }
+            | Self::ToolResultContent { session_id, .. }
             | Self::ToolCallComplete { session_id, .. }
             | Self::OperationActivityStarted { session_id, .. }
             | Self::OperationActivityCompleted { session_id, .. }

@@ -66,7 +66,7 @@ fn collect() -> Value {
             &Config::default(),
         );
         app.ui_locale = codewhale_localization::Locale::En;
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         samples.insert(command.to_string(), outcome(execute(command, &mut app)));
     }
     for (label, prompt) in [
@@ -101,9 +101,9 @@ fn collect() -> Value {
             &Config::default(),
         );
         app.ui_locale = codewhale_localization::Locale::En;
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         match label {
-            "balance_unsupported" => app.api_provider = crate::config::ApiProvider::OpenaiCodex,
+            "balance_unsupported" => app.api_provider = crate::config::ProviderKind::OpenaiCodex,
             "tokens_reported_telemetry" => {
                 app.session.total_tokens = 1234;
                 app.session.last_prompt_tokens = Some(100);

@@ -283,7 +283,7 @@ pub(crate) fn apply_engine_error_to_app(
         app.push_status_toast(
             tr(app.ui_locale, MessageId::OnboardApiKeyRejectedEnv)
                 .replace("{provider}", provider.as_str())
-                .replace("{env}", &provider.env_vars_label())
+                .replace("{env}", &provider.provider().env_vars().join(" / "))
                 .replace("{path}", &config_path),
             StatusToastLevel::Error,
             Some(App::STICKY_ERROR_TTL_MS),
@@ -915,8 +915,7 @@ pub(crate) async fn apply_model_picker_choice(
     engine_handle: &mut EngineHandle,
     config: &mut Config,
     model: String,
-    target_provider: Option<ApiProvider>,
-    target_provider_id: Option<String>,
+    target_identity: Option<crate::config::ProviderIdentity>,
     effort: crate::reasoning_preference::ReasoningEffort,
     previous_model: String,
     previous_effort: crate::reasoning_preference::ReasoningEffort,
@@ -928,29 +927,36 @@ pub(crate) async fn apply_model_picker_choice(
         note_startup_default_not_saved(app, save_as_startup_default);
         return;
     }
-    let target_provider = target_provider.unwrap_or(app.api_provider);
-    let target_identity = if target_provider == ApiProvider::Custom {
-        target_provider_id.unwrap_or_else(|| config.provider_identity_for(target_provider))
-    } else {
-        target_provider.as_str().to_string()
+    let Some(target_identity) = target_identity else {
+        app.push_status_toast(
+            "The selected model has no admitted provider route.",
+            StatusToastLevel::Error,
+            Some(8_000),
+        );
+        note_startup_default_not_saved(app, save_as_startup_default);
+        return;
     };
+    if let Err(reason) = config.verify_provider_identity(&target_identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        note_startup_default_not_saved(app, save_as_startup_default);
+        return;
+    }
+    let target_provider = target_identity.provider;
+    let target_key = target_identity.key.to_string();
     let model_is_auto = model.trim().eq_ignore_ascii_case("auto");
     let preserve_auto_effort =
         app.reasoning_effort_preference.is_some() || effort != previous_effort;
-    if target_provider != app.api_provider
-        || target_identity != app.provider_identity_for_persistence()
-    {
-        config.provider = Some(target_identity.clone());
+    if app.admitted_provider_identity().ok() != Some(&target_identity) {
         switch_provider(
             app,
             engine_handle,
             config,
-            target_provider,
+            target_identity.clone(),
             (!model_is_auto).then_some(model.clone()),
         )
         .await;
         if app.api_provider != target_provider
-            || app.provider_identity_for_persistence() != target_identity
+            || app.provider_identity_for_persistence() != target_key
         {
             // The switch was refused (missing credentials, bad route). The
             // live route is still the old one, so persisting it as the startup
@@ -967,16 +973,28 @@ pub(crate) async fn apply_model_picker_choice(
         }
     }
 
+    let current_identity = match app.admitted_provider_identity().cloned() {
+        Ok(identity) => identity,
+        Err(reason) => {
+            app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            note_startup_default_not_saved(app, save_as_startup_default);
+            return;
+        }
+    };
     let model_changed = model != previous_model || app.auto_model != model_is_auto;
     let mut resolved_model = model.clone();
     let mut route_base_url = config.active_route_base_url();
     if !model_is_auto {
-        match crate::route_runtime::resolve_runtime_route(config, app.api_provider, Some(&model)) {
+        match crate::route_runtime::resolve_runtime_route_for_identity(
+            config,
+            &current_identity,
+            Some(&model),
+        ) {
             Ok(resolution) => {
                 resolved_model = resolution.candidate.wire_model_id().as_str().to_string();
                 route_base_url = resolution.candidate.endpoint().base_url.clone();
                 if model_changed {
-                    app.set_active_context_window_override(config, app.api_provider);
+                    app.set_active_context_window_override(config, &current_identity);
                     app.set_active_route_resolution(
                         route_base_url.clone(),
                         resolution.candidate.limits(),
@@ -991,7 +1009,7 @@ pub(crate) async fn apply_model_picker_choice(
             }
         }
     } else if model_changed {
-        app.set_active_context_window_override(config, app.api_provider);
+        app.set_active_context_window_override(config, &current_identity);
         app.active_route_limits = app.context_window_override_limits();
         app.active_route_base_url = route_base_url.clone();
         app.active_context_window_source = app
@@ -1178,7 +1196,16 @@ pub(crate) async fn apply_provider_fallback_switch(
     let target = app.api_provider;
     let previous_model = app.model.clone();
 
-    let resolved_route = match resolve_runtime_route(config, target, None) {
+    let target_capture = match app.admitted_provider_identity().cloned() {
+        Ok(identity) => identity,
+        Err(reason) => {
+            app.set_provider_identity_record(previous_identity);
+            app.provider_chain = previous_chain;
+            app.status_message = Some(reason);
+            return;
+        }
+    };
+    let resolved_route = match resolve_runtime_route_for_identity(config, &target_capture, None) {
         Ok(route) => route,
         Err(reason) => {
             app.set_provider_identity_record(previous_identity.clone());
@@ -1217,8 +1244,8 @@ pub(crate) async fn apply_provider_fallback_switch(
     }
     *config = *next_config;
     app.refresh_notification_settings(config);
-    app.set_provider_identity_record(target_identity);
-    app.billing_presentation = crate::route_billing::for_route(config, target);
+    app.set_provider_identity_record(target_identity.clone());
+    app.billing_presentation = crate::route_billing::for_route(config, &target_identity);
 
     let new_base_url = resolved_endpoint;
     let new_endpoint = display_base_url_host(&new_base_url);
@@ -1226,7 +1253,7 @@ pub(crate) async fn apply_provider_fallback_switch(
     app.model_ids_passthrough = config.model_ids_pass_through();
     app.set_model_selection(new_model.clone());
     app.apply_provider_switch_reasoning_effort(target, &new_base_url, None);
-    app.set_active_context_window_override(config, target);
+    app.set_active_context_window_override(config, &target_identity);
     app.set_active_route_resolution(
         new_base_url.clone(),
         resolved_route.candidate.limits(),
@@ -1620,22 +1647,32 @@ async fn apply_command_result_inner(
                     apply_workspace_runtime_state(app, config, workspace.clone());
                     sync_runtime_workspace_state(task_manager, workspace.clone()).await;
                 }
-                let provider_changed = config.api_provider() != app.api_provider
-                    || config.provider_identity_for(config.api_provider())
-                        != app.provider_identity_for_persistence();
-                if provider_changed {
-                    let identity = match config
-                        .resolve_provider_identity(app.provider_identity_for_persistence())
-                    {
+                let identity =
+                    match app
+                        .admitted_provider_identity()
+                        .cloned()
+                        .and_then(|identity| {
+                            config.verify_provider_identity(&identity)?;
+                            Ok(identity)
+                        }) {
                         Ok(identity) => identity,
-                        Err(err) => {
-                            app.status_message =
-                                Some(format!("Failed to restore saved session provider: {err}"));
+                        Err(reason) => {
+                            app.status_message = Some(format!(
+                                "Failed to restore saved session provider: {reason}"
+                            ));
                             return Ok(false);
                         }
                     };
-                    restore_loaded_session_provider(app, config, identity);
-                    config.set_provider_model_override(app.api_provider, Some(model.clone()));
+                let provider_changed =
+                    config.active_provider_identity().as_ref().ok() != Some(&identity);
+                if provider_changed {
+                    restore_loaded_session_provider(app, config, identity.clone())
+                        .map_err(anyhow::Error::msg)?;
+                    config.set_provider_model_override(&identity, Some(model.clone()))?;
+                    let prepared = config
+                        .active_provider_identity()
+                        .map_err(anyhow::Error::msg)?;
+                    app.set_provider_identity_record(prepared);
                 }
                 // Re-resolve from the live config even when the provider did
                 // not change. The command layer intentionally has no Config
@@ -1833,10 +1870,11 @@ async fn apply_command_result_inner(
                 app.status_message = Some(format!("Running /{name} ({origin})..."));
                 // Awaited here like `/balance`; the call is bounded by its
                 // deadline and cancelled in the host when it expires.
-                match crate::extension_host::run_command(
+                match crate::extension_host::run_command_for_plugins(
                     &command,
                     &input,
                     app.current_session_id.as_deref(),
+                    app.extension_plugin_view().as_ref(),
                 )
                 .await
                 {
@@ -2028,7 +2066,7 @@ async fn apply_command_result_inner(
                     app.add_message(HistoryCell::System {
                         content: format!(
                             "Balance check is not supported for {} yet. Check the provider dashboard for account balance details.",
-                            provider.display_name()
+                            provider.provider().display_name()
                         ),
                     });
                 } else {
@@ -2037,7 +2075,7 @@ async fn apply_command_result_inner(
                         app.add_message(HistoryCell::System {
                             content: format!(
                                 "No API key configured for {}.",
-                                provider.display_name()
+                                provider.provider().display_name()
                             ),
                         });
                     } else {
@@ -2052,7 +2090,7 @@ async fn apply_command_result_inner(
                                 }
                                 app.last_balance_fetch = Some(Instant::now());
                                 app.add_message(HistoryCell::System {
-                                    content: info.report(provider.display_name()),
+                                    content: info.report(provider.provider().display_name()),
                                 });
                             }
                             None => {
@@ -2065,7 +2103,7 @@ async fn apply_command_result_inner(
                                         info.chip_label().map(|amount| {
                                             format!(
                                                 "Could not refresh {} balance; last known: {amount}",
-                                                provider.display_name()
+                                                provider.provider().display_name()
                                             )
                                         })
                                     });
@@ -2073,7 +2111,7 @@ async fn apply_command_result_inner(
                                     content: fallback.unwrap_or_else(|| {
                                         format!(
                                             "Could not fetch {} account balance. Check the provider dashboard.",
-                                            provider.display_name()
+                                            provider.provider().display_name()
                                         )
                                     }),
                                 });
@@ -2101,7 +2139,15 @@ async fn apply_command_result_inner(
                         app.add_message(HistoryCell::System {
                             content: format!(
                                 "Failed to fetch models from {}: {error}",
-                                config.api_provider().display_name()
+                                config
+                                    .active_provider_identity()
+                                    .ok()
+                                    .as_ref()
+                                    .map(|identity| identity
+                                        .compatibility()
+                                        .map(|row| row.label)
+                                        .unwrap_or(identity.key.as_str()))
+                                    .unwrap_or("unavailable")
                             ),
                         });
                     }
@@ -2199,12 +2245,23 @@ async fn apply_command_result_inner(
                 }
             }
             AppAction::SwitchProvider { provider, model } => {
-                switch_provider(app, engine_handle, config, provider, model).await;
+                let identity = match config.resolve_provider_selection_identity(provider.as_str()) {
+                    Ok(identity) => identity,
+                    Err(reason) => {
+                        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+                        return Ok(false);
+                    }
+                };
+                switch_provider(app, engine_handle, config, identity, model).await;
                 let api_key = config.active_route_api_key().unwrap_or_default();
                 let base_url = config.active_route_base_url();
                 schedule_balance_fetch(app, &api_key, &base_url, false);
             }
-            AppAction::SwitchModelRoute { provider, model } => {
+            AppAction::SwitchModelRoute { identity, model } => {
+                if let Err(reason) = config.verify_provider_identity(&identity) {
+                    app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+                    return Ok(false);
+                }
                 let previous_model = if app.auto_model {
                     "auto".to_string()
                 } else {
@@ -2221,8 +2278,7 @@ async fn apply_command_result_inner(
                     engine_handle,
                     config,
                     model,
-                    Some(provider),
-                    None,
+                    Some(identity),
                     previous_effort,
                     previous_model,
                     previous_effort,
@@ -2451,6 +2507,14 @@ async fn apply_command_result_inner(
                             app.api_provider,
                             app.ui_locale,
                         ));
+                }
+            }
+            AppAction::ReviewIssueReport { id, change } => {
+                if let Err(error) = super::feedback_host::start(app, config, id, change) {
+                    tracing::warn!(target:"feedback_host",%error,"feedback request refused before admission");
+                    app.add_message(HistoryCell::System {
+                        content: app.tr(MessageId::FeedbackUnavailable).into_owned(),
+                    });
                 }
             }
             AppAction::OpenFeedbackPicker => {
@@ -2840,9 +2904,9 @@ fn apply_validated_profile_config(
     app.configured_models = config.custom_models.clone().unwrap_or_default();
     app.refresh_notification_settings(config);
     app.set_provider_identity_record(route.identity.clone());
-    app.billing_presentation = crate::route_billing::for_route(config, app.api_provider);
+    app.billing_presentation = crate::route_billing::for_route(config, &route.identity);
     app.set_model_selection(route.model.clone());
-    app.set_active_context_window_override(config, app.api_provider);
+    app.set_active_context_window_override(config, &route.identity);
     app.set_active_route_resolution(
         route.candidate.endpoint().base_url.clone(),
         route.candidate.limits(),
@@ -3401,7 +3465,22 @@ pub(crate) async fn apply_provider_picker_custom_provider(
         "Custom provider {provider_id} saved to {}",
         written.display()
     ));
-    switch_provider(app, engine_handle, config, ApiProvider::Custom, model).await
+    let identity = match config.resolve_provider_pin_identity(&provider_id) {
+        Ok(identity) if identity.provider == ProviderKind::Custom => identity,
+        Ok(_) => {
+            app.push_status_toast(
+                "Saved custom route changed transport identity.",
+                StatusToastLevel::Error,
+                Some(8_000),
+            );
+            return false;
+        }
+        Err(reason) => {
+            app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            return false;
+        }
+    };
+    switch_provider(app, engine_handle, config, identity, model).await
 }
 
 async fn reopen_provider_picker_list(
@@ -3487,18 +3566,21 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
     catalog_view: bool,
     verifier: &dyn ProviderKeyVerifier,
 ) {
+    if let Err(reason) = config.verify_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     let provider = identity.provider;
     let mut scoped_config = config.clone();
-    scoped_config.provider = Some(identity.key.clone());
-    let selected_id = if provider == ApiProvider::Custom {
-        Some(identity.key.clone())
-    } else {
-        Some(provider.as_str().to_string())
-    };
+    if let Err(reason) = scoped_config.scope_to_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
+    let selected_id = Some(identity.key.to_string());
     if !crate::client::provider_api_key_verification_is_observed(provider) {
         app.push_status_toast(
             app.tr(MessageId::ProviderTestConnectionNoEndpoint)
-                .replace("{provider}", &identity.key),
+                .replace("{provider}", identity.key.as_str()),
             StatusToastLevel::Warning,
             Some(8_000),
         );
@@ -3510,7 +3592,7 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
         _ => {
             app.push_status_toast(
                 app.tr(MessageId::ProviderTestConnectionNeedKey)
-                    .replace("{provider}", &identity.key),
+                    .replace("{provider}", identity.key.as_str()),
                 StatusToastLevel::Warning,
                 Some(8_000),
             );
@@ -3521,10 +3603,22 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
     };
     let base_url = scoped_config.active_route_base_url();
     let model = scoped_config.default_model();
-    match verifier.verify(provider, &api_key, &base_url).await {
+    let outcome = verifier.verify(provider, &api_key, &base_url).await;
+    if let Err(reason) = config.verify_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
+    match outcome {
         Ok(()) => {
-            app.provider_health
-                .record_models_probe_success(&scoped_config, provider, &model);
+            app.provider_health.record_models_probe_success(
+                &scoped_config,
+                &identity,
+                &model,
+                crate::route_receipt::CredentialGeneration::derive(
+                    &base_url,
+                    &codewhale_secrets::normalize_api_key(&api_key),
+                ),
+            );
             app.push_status_toast(
                 app.tr(MessageId::ProviderConnectionChecked).into_owned(),
                 StatusToastLevel::Success,
@@ -3535,14 +3629,18 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
             let safe = sanitize_probe_status(&reason, &api_key);
             app.provider_health.record_models_probe_failure(
                 &scoped_config,
-                provider,
+                &identity,
                 &model,
+                crate::route_receipt::CredentialGeneration::derive(
+                    &base_url,
+                    &codewhale_secrets::normalize_api_key(&api_key),
+                ),
                 provider_verification_error_category(&reason),
                 &safe,
             );
             app.push_status_toast(
                 app.tr(MessageId::ProviderTestConnectionFailed)
-                    .replace("{provider}", &identity.key)
+                    .replace("{provider}", identity.key.as_str())
                     .replace("{error}", &safe),
                 StatusToastLevel::Error,
                 Some(8_000),
@@ -3581,14 +3679,24 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
     base_url_override: Option<String>,
     verifier: &dyn ProviderKeyVerifier,
 ) {
+    if let Err(reason) = config.verify_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     let provider = identity.provider;
     let mut scoped_config = config.clone();
-    scoped_config.provider = Some(identity.key.clone());
+    if let Err(reason) = scoped_config.scope_to_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     // #4526: a billing route chosen in the wizard is applied to the scoped
     // clone only, so the key is probed against the endpoint it will be saved
     // for without touching the on-disk config before the user confirms.
-    if let Some(base_url) = base_url_override.clone() {
-        scoped_config.set_provider_base_url_override(provider, Some(base_url));
+    if let Some(base_url) = base_url_override.clone()
+        && let Err(reason) = scoped_config.set_provider_base_url_override(&identity, Some(base_url))
+    {
+        app.push_status_toast(reason.to_string(), StatusToastLevel::Error, Some(8_000));
+        return;
     }
     // #3875: verify the key against the provider before opening the rest of
     // the guided flow. Nothing is persisted until the confirm stage.
@@ -3597,7 +3705,12 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
     // This prevents a replacement Kimi Code API key from being probed against
     // the ordinary Moonshot endpoint.
     let base_url = scoped_config.active_route_base_url();
-    match verifier.verify(provider, &api_key, &base_url).await {
+    let outcome = verifier.verify(provider, &api_key, &base_url).await;
+    if let Err(reason) = config.verify_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
+    match outcome {
         Ok(()) => {
             // Keep the readiness row aligned with the live check the wizard
             // just completed. This probe only proves the endpoint and
@@ -3609,8 +3722,12 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
                 let verified_model = scoped_config.default_model();
                 app.provider_health.record_models_probe_success(
                     &scoped_config,
-                    provider,
+                    &identity,
                     &verified_model,
+                    crate::route_receipt::CredentialGeneration::derive(
+                        &base_url,
+                        &codewhale_secrets::normalize_api_key(&api_key),
+                    ),
                 );
             }
             // Key is valid — continue the guided flow at model pick without
@@ -3619,7 +3736,7 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
             if let Some(picker) =
                 crate::tui::provider_picker::ProviderPickerView::new_for_model_pick_after_validation(
                     app.api_provider,
-                    provider,
+                    &identity,
                     &scoped_config,
                     runtime_status,
                     api_key,
@@ -3663,7 +3780,7 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
             if let Some(picker) =
                 crate::tui::provider_picker::ProviderPickerView::new_for_key_entry_with_error(
                     app.api_provider,
-                    provider,
+                    &identity,
                     &scoped_config,
                     runtime_status,
                     reason,
@@ -3703,6 +3820,18 @@ pub(crate) async fn apply_provider_picker_setup_confirmed(
         save_provider_context_window_for_identity, save_provider_model_for_identity,
     };
 
+    if let Err(reason) = config.verify_provider_identity(&identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return false;
+    }
+    if identity.persisted_id().is_none() {
+        app.push_status_toast(
+            "Choose the exact custom provider table before changing its credentials or endpoint.",
+            StatusToastLevel::Error,
+            Some(8_000),
+        );
+        return false;
+    }
     let provider = identity.provider;
 
     let model = model.trim().to_string();
@@ -3730,7 +3859,12 @@ pub(crate) async fn apply_provider_picker_setup_confirmed(
             });
             return false;
         }
-        config.set_provider_base_url_override(provider, Some(base_url.to_string()));
+        if let Err(reason) =
+            config.set_provider_base_url_override(&identity, Some(base_url.to_string()))
+        {
+            app.push_status_toast(reason.to_string(), StatusToastLevel::Error, Some(8_000));
+            return false;
+        }
     }
 
     // Persist key first via the existing comment-preserving path, then pin the
@@ -3786,13 +3920,20 @@ pub(crate) async fn apply_provider_picker_setup_confirmed(
         }
     }
 
-    config.provider = Some(identity.key);
-    mirror_saved_api_key_in_config(config, provider, api_key);
-    mirror_saved_model_in_config(config, provider, model.clone());
-    if let Some(context_window) = context_window {
-        mirror_saved_context_window_in_config(config, provider, context_window);
+    if let Err(reason) = config
+        .scope_to_provider_identity(&identity)
+        .and_then(|()| mirror_saved_model_in_config(config, &identity, model.clone()))
+        .and_then(|()| {
+            context_window.map_or(Ok(()), |window| {
+                mirror_saved_context_window_in_config(config, &identity, window)
+            })
+        })
+        .and_then(|()| mirror_saved_api_key_in_config(config, &identity, api_key))
+    {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return false;
     }
-    let switched = switch_provider(app, engine_handle, config, provider, Some(model)).await;
+    let switched = switch_provider(app, engine_handle, config, identity, Some(model)).await;
     // The switch overwrites the status line with the route summary (the full
     // summary also lands in the transcript), so the save confirmation is
     // applied last — it is the answer to the action the user just confirmed.
@@ -3806,7 +3947,7 @@ async fn apply_codewhale_owned_login(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    provider: ApiProvider,
+    provider: ProviderKind,
     pending: crate::oauth::PendingOAuthLogin,
     status_prefix: &str,
     login_kind: &str,
@@ -3839,7 +3980,7 @@ async fn apply_codewhale_owned_login(
         }
     }
 
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         let mut selected = config.clone();
         selected.provider = Some(provider.as_str().to_string());
         if crate::codex_model_cache::update_from_chatgpt(&selected)
@@ -3857,7 +3998,14 @@ async fn apply_codewhale_owned_login(
             return false;
         }
     }
-    switch_provider(app, engine_handle, config, provider, None).await
+    let identity = match config.builtin_provider_identity(provider) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            return false;
+        }
+    };
+    switch_provider(app, engine_handle, config, identity, None).await
 }
 
 pub(crate) async fn apply_codewhale_owned_xai_login(
@@ -3871,7 +4019,7 @@ pub(crate) async fn apply_codewhale_owned_xai_login(
         app,
         engine_handle,
         config,
-        ApiProvider::Xai,
+        ProviderKind::Xai,
         pending,
         status_prefix,
         "device login",
@@ -3890,7 +4038,7 @@ pub(crate) async fn apply_codewhale_owned_chatgpt_login(
         app,
         engine_handle,
         config,
-        ApiProvider::OpenaiCodex,
+        ProviderKind::OpenaiCodex,
         pending,
         status_prefix,
         "ChatGPT sign-in",
@@ -3914,12 +4062,20 @@ pub(crate) async fn run_chatgpt_revoke_from_tui(app: &mut App, config: &mut Conf
     .await
     .map_err(|err| anyhow::anyhow!("ChatGPT revoke task was lost: {err}"))
     .and_then(|result| result);
-    let message = match outcome {
-        Ok(()) => {
-            config.clear_codewhale_owned_chatgpt_oauth();
+    // Clear the live route even when remote revocation could not be confirmed;
+    // local credential removal may already have succeeded in that outcome.
+    let live_clear = config.clear_codewhale_owned_chatgpt_oauth();
+    let message = match (outcome, live_clear) {
+        (Ok(()), Ok(())) => {
             "Revoked Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.".to_string()
         }
-        Err(err) => format!("ChatGPT revoke failed: {err:#}"),
+        (Ok(()), Err(err)) => format!(
+            "ChatGPT tokens were revoked, but the live route could not be refreshed: {err:#}"
+        ),
+        (Err(err), Ok(())) => format!("ChatGPT revoke failed: {err:#}"),
+        (Err(err), Err(live_err)) => format!(
+            "ChatGPT revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
+        ),
     };
     app.add_message(HistoryCell::System {
         content: message.clone(),
@@ -4137,7 +4293,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         let snapshot = goal.to_runtime_snapshot();
         let _ = apply_goal_snapshot_to_app(app, &snapshot);
     }
-    restore_loaded_session_provider(app, config, provider_identity);
+    restore_loaded_session_provider(app, config, provider_identity)?;
     // Session records do not own a reasoning preference. `set_model_selection`
     // restores the raw explicit global preference for Auto (or releases an
     // implicit fixed-route default) instead of reusing normalized live state.
@@ -4196,19 +4352,23 @@ pub(crate) fn apply_loaded_session_with_goal(
         .iter()
         .cloned()
         .collect();
-    crate::cost_status::restore_usage_source_fingerprints(
+    crate::cost_status::restore_usage_source_ledger(
         session
             .metadata
             .cost
             .usage_source_fingerprints
             .iter()
             .cloned(),
+        &session.metadata.cost.missing_usage_sources,
+        session.metadata.cost.missing_usage_overflowed,
     );
     // Coverage is restored *with* the money, and the live counters are cleared
     // first: whatever the previous session in this process priced is not inside
     // the total being loaded, so carrying those counters over would describe the
     // wrong total (#4318).
     app.reset_cost_coverage();
+    app.session.missing_usage_sources = session.metadata.cost.missing_usage_sources.clone();
+    app.session.missing_usage_overflowed = session.metadata.cost.missing_usage_overflowed;
     app.session.cost_priced_turns = session.metadata.cost.priced_turns;
     app.session.cost_unpriced_turns = session.metadata.cost.unpriced_turns;
     app.session.cost_cny_priced_turns = session.metadata.cost.cny_priced_turns;

@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -228,9 +228,9 @@ impl FleetMember {
 /// endpoints before the configured route binder can resolve them.
 pub(crate) fn provider_ids_match(saved: &str, requested: &str) -> bool {
     saved.trim() == requested.trim()
-        || ApiProvider::parse(saved)
-            .filter(|provider| *provider != ApiProvider::Custom)
-            .is_some_and(|provider| Some(provider) == ApiProvider::parse(requested))
+        || ProviderKind::parse(saved)
+            .filter(|provider| *provider != ProviderKind::Custom)
+            .is_some_and(|provider| Some(provider) == ProviderKind::parse(requested))
 }
 
 /// The member pins exactly `provider`/`model`.

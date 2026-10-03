@@ -1,3 +1,4 @@
+import { ReviewedLoader, installCompositionLoader } from './dsh/composition.ts'
 /**
  * The Cordis root that plugin fibers run under.
  *
@@ -22,6 +23,11 @@ import {
   type HookVerdictWire,
   type Json,
   type OwnerRef,
+  type EntryRef,
+  type HarnessRunParams,
+  type McpOpenParams,
+  type McpRequestParams,
+  type McpCloseParams,
   type ToolResultWire,
 } from './protocol.ts'
 import { RpcError, type RpcPeer } from './rpc.ts'
@@ -29,9 +35,11 @@ import { explainImportError } from './dsh/resolve-hooks.ts'
 import { isJson } from './json.ts'
 import { makeCoreApi } from './shims/core.ts'
 import { OwnedRegistrations } from './shims/owned.ts'
+import { defineShellHooksService,type LocalShellHook } from './shims/shell-hooks.ts'
 import { hookExecution, hookVerdict, type LocalHook } from './shims/hooks.ts'
 import { PromptSections, definePromptService, type LocalPromptSection } from './shims/prompt.ts'
 import { createStorage, type PluginStorage } from './shims/storage.ts'
+import {McpDefinitions,defineMcpService,type LocalMcp} from './shims/mcp.ts'
 import { SkillRoots, defineSkillsService, type LocalSkillRoot } from './shims/skills.ts'
 import { ownerTier, type HostTier } from './tier.ts'
 import {
@@ -52,7 +60,8 @@ export const OWNER = Symbol.for('codewhale.extension-host.owner')
  * provided by the host root as shims and are refused to plugins for the same
  * reason.
  */
-export const REFUSED_SERVICES = new Set([
+export const REFUSED_SERVICES = new Set(['shellHooks',
+  'loader', // one host-owned composition loader; plugins may not replace it
   'approval',
   'agents',
   'sessions',
@@ -62,22 +71,37 @@ export const REFUSED_SERVICES = new Set([
   'fs',
   'subprocess',
   'systemPrompt',
+  'runtimeLoop', // the one Rust Engine owns scheduling and execution
   'tools',
   'commands',
   'prompt',
   'storage',
   'skills',
+  'mcp',
   'logger',
 ])
 
 /** Services the root provides; `inject` of anything else fails activation. */
-const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'skills', 'logger', 'events', 'reflect', 'registry'])
+const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'skills', 'mcp', 'logger', 'events', 'reflect', 'registry'])
 
 const ACTIVATE_DEADLINE_MS = 5_000
 const DISPOSE_DEADLINE_MS = 2_000
 
+interface HarnessBuiltin { run(params: HarnessRunParams, signal: AbortSignal): Promise<unknown>; dispose(): Promise<void> }
+
+interface McpBuiltin {
+  open(params: McpOpenParams, signal: AbortSignal): Promise<unknown>
+  request(params: McpRequestParams, signal: AbortSignal): Promise<unknown>
+  close(owner: OwnerRef, sessionId: string): Promise<void>
+  dispose(): Promise<void>
+}
+
 export interface OwnerRecord {
+  mcp?: McpBuiltin;
+  harness?: HarnessBuiltin;
   ref: OwnerRef
+  scope?: EntryRef
+  views?: Map<string, OwnerRecord>
   pluginName: string
   fibers: any[]
   /** In-flight `registry/register` requests, awaited before activation acks. */
@@ -85,9 +109,11 @@ export interface OwnerRecord {
   refusals: string[]
   tools: Map<number, LocalTool>
   commands: Map<number, LocalCommand<OwnerRecord>>
+  shellHooks:Map<number,LocalShellHook<OwnerRecord>>
   hooks: Map<number, LocalHook<OwnerRecord>>
   promptSections: Map<number, LocalPromptSection<OwnerRecord>>
   skillRoots: Map<number, LocalSkillRoot<OwnerRecord>>
+  mcpDefinitions:Map<number,LocalMcp<OwnerRecord>>
   storage?: PluginStorage
   warnedAllow?: boolean
   /** Entry modules activated under this owner so far (a plugin may declare several). */
@@ -127,9 +153,11 @@ export class HostRoot {
   readonly owners = new Map<string, OwnerRecord>()
   private readonly toolRegistrations: OwnedRegistrations<OwnerRecord, LocalTool>
   private readonly commandRegistrations: OwnedRegistrations<OwnerRecord, LocalCommand<OwnerRecord>>
+  private readonly shellRegistrations:OwnedRegistrations<OwnerRecord,LocalShellHook<OwnerRecord>>
   private readonly hookRegistrations: OwnedRegistrations<OwnerRecord, LocalHook<OwnerRecord>>
   private readonly promptSections: PromptSections<OwnerRecord>
   private readonly skillRoots: SkillRoots<OwnerRecord>
+  private readonly mcpDefinitions:McpDefinitions<OwnerRecord>
 
   constructor(
     private readonly rpc: RpcPeer,
@@ -151,16 +179,25 @@ export class HostRoot {
       (owner) => owner.commands,
       (message, owner) => this.log('warn', message, owner),
     )
+    this.shellRegistrations=new OwnedRegistrations(rpc,'shell_hook',(owner)=>owner.shellHooks,(message,owner)=>this.log('warn',message,owner))
     this.hookRegistrations = new OwnedRegistrations(rpc, 'hook', (owner) => owner.hooks,
       (message, owner) => this.log('warn', message, owner))
     this.promptSections = new PromptSections(rpc, (owner) => owner.promptSections,
       (message, owner) => this.log('warn', message, owner))
+    this.mcpDefinitions=new McpDefinitions(rpc,(owner)=>owner.mcpDefinitions,(message,owner)=>this.log('warn',message,owner))
     this.skillRoots = new SkillRoots(rpc, (owner) => owner.skillRoots,
       (message, owner) => this.log('warn', message, owner))
 
     // Cordis already owns listener effects and teardown. Intercept this one
     // event using its supported extension point instead of replacing ctx.on.
+    // Actual upstream bridge seams for which this checkpoint has no core
+    // projection. Refuse instead of accepting listeners that never fire.
+    const unsupportedDshLifecycle = new Set([
+      'agent/created', 'agent/pre-step', 'agent/turn-stopping',
+      'tools/post-execute', 'subagent/start', 'subagent/end',
+    ])
     root.on('internal/listener', function (this: any, name: string, callback: any, options: any) {
+      if (this[OWNER] && unsupportedDshLifecycle.has(name)) throw new Error(`DSH lifecycle ${name} is not projected by this host checkpoint`)
       if (name !== 'tools/pre-execute') return
       const owner: OwnerRecord | undefined = this[OWNER]
       if (!owner) throw new Error('pre-execute listener registered outside an extension owner')
@@ -229,6 +266,8 @@ export class HostRoot {
       ownerOf: (ctx) => ctx[OWNER],
       promptSections: this.promptSections,
     })
+    const ShellHooksShim=defineShellHooksService<OwnerRecord>({ownerOf:(ctx)=>ctx[OWNER],registrations:this.shellRegistrations})
+    const McpShim=defineMcpService<OwnerRecord>({ownerOf:(ctx)=>(ctx as Context & { [OWNER]?: OwnerRecord })[OWNER],definitions:this.mcpDefinitions})
     const SkillsShim = defineSkillsService<OwnerRecord>({ ownerOf: (ctx) => ctx[OWNER], skillRoots: this.skillRoots })
     class StorageShim extends Service {
       constructor(ctx: any) { super(ctx, 'storage') }
@@ -251,11 +290,17 @@ export class HostRoot {
     shimClasses.set('prompt', PromptShim)
     shimClasses.set('storage', StorageShim)
     shimClasses.set('skills', SkillsShim)
+    shimClasses.set('mcp',McpShim)
+    shimClasses.set('shellHooks',ShellHooksShim)
     root.plugin(ToolsShim)
     root.plugin(CommandsShim)
     root.plugin(PromptShim)
     root.plugin(StorageShim)
     root.plugin(SkillsShim)
+    root.plugin(McpShim)
+    root.plugin(ShellHooksShim)
+    shimClasses.set('loader', ReviewedLoader)
+    installCompositionLoader(root)
   }
 
   log(level: string, msg: string, owner?: OwnerRecord) {
@@ -285,8 +330,8 @@ export class HostRoot {
    * per entry, in order, under the same owner token, and every entry becomes a
    * fiber of that one owner. A further entry is accepted only after the
    * previous one finished activating, for the same plugin, and only once per
-   * path. Any failure fails the whole owner: its fibers, the earlier entries'
-   * included, are disposed and the owner forgotten (all-or-nothing).
+   * path. Core-selected Native scopes have independent fibers; failure withdraws
+   * that entry while siblings remain active. An unscoped owner stays atomic.
    */
   async activate(params: ActivateParams): Promise<ActivateResult> {
     // This process serves one tier. An owner of the other tier is refused
@@ -299,7 +344,16 @@ export class HostRoot {
       )
     }
     const key = params.owner.owner_token
-    const existing = this.owners.get(key)
+    let parent=this.owners.get(key)
+    const scopeKey=params.scope===undefined ? undefined : `${params.scope.path}\0${params.scope.sha256}`
+    if (scopeKey!==undefined) {
+      if (params.scope?.path!==params.entry.path || params.scope?.sha256!==params.entry.sha256) return {status:'failed',diagnostic:'scope does not match the core-selected entry'}
+      parent ??= {ref:params.owner,pluginName:params.plugin_name,fibers:[],pendingRegistrations:new Set(),refusals:[],tools:new Map(),commands:new Map(),hooks:new Map(),shellHooks:new Map(),promptSections:new Map(),skillRoots:new Map(),mcpDefinitions:new Map(),entries:new Set(),views:new Map(),state:'active',...(params.data_dir===undefined?{}:{dataDir:params.data_dir})}
+      if (parent.state!=='active' || parent.ref.plugin_id!==params.owner.plugin_id || parent.ref.generation!==params.owner.generation || parent.pluginName!==params.plugin_name) return {status:'failed',diagnostic:'scope owner was withdrawn'}
+      parent.views ??=new Map()
+      this.owners.set(key,parent)
+    }
+    const existing = scopeKey===undefined ? this.owners.get(key) : parent!.views!.get(scopeKey)
     if (existing) {
       if (existing.state !== 'active') return { status: 'failed', diagnostic: 'owner token already active' }
       if (existing.ref.plugin_id !== params.owner.plugin_id || existing.pluginName !== params.plugin_name) {
@@ -312,6 +366,7 @@ export class HostRoot {
     }
     const owner: OwnerRecord = existing ?? {
       ref: params.owner,
+      ...(params.scope===undefined ? {} : {scope:params.scope}),
       pluginName: params.plugin_name,
       fibers: [],
       pendingRegistrations: new Set(),
@@ -319,13 +374,15 @@ export class HostRoot {
       tools: new Map(),
       commands: new Map(),
       hooks: new Map(),
+      shellHooks:new Map(),
       promptSections: new Map(),
       skillRoots: new Map(),
+      mcpDefinitions:new Map(),
       entries: new Set(),
       ...(params.data_dir === undefined ? {} : { dataDir: params.data_dir }),
       state: 'activating',
     }
-    if (!existing) this.owners.set(key, owner)
+    if (!existing) {if(scopeKey===undefined)this.owners.set(key,owner);else parent!.views!.set(scopeKey,owner)}
     owner.entries.add(params.entry.path)
     try {
       const bytes = await readFile(params.entry.path)
@@ -336,6 +393,18 @@ export class HostRoot {
       const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href)).catch((error) => {
         throw explainImportError(error)
       })
+      if (this.tier === 'builtin' && owner.ref.plugin_id === 'host:harness') {
+        if (existing || typeof module.createHarnessModule !== 'function') throw new Error('invalid harness builtin module')
+        owner.harness = module.createHarnessModule(this.rpc, Object.freeze(structuredClone(owner.ref))) as HarnessBuiltin
+        owner.state = 'active'
+        return { status: 'ok', tools: [], commands: [] }
+      }
+      if (this.tier === 'builtin' && owner.ref.plugin_id === 'host:mcp') {
+        if (existing || typeof module.createMcpModule !== 'function') throw new Error('invalid MCP builtin module')
+        owner.mcp = module.createMcpModule(this.rpc, Object.freeze(structuredClone(owner.ref))) as McpBuiltin
+        owner.state = 'active'
+        return { status: 'ok', tools: [], commands: [] }
+      }
       const plugin = pickPlugin(module)
       const missing = Object.keys(Inject.resolve(plugin.inject)).filter((name) => !PROVIDED_SERVICES.has(name))
       if (missing.length > 0) {
@@ -353,6 +422,7 @@ export class HostRoot {
         await Promise.allSettled([...owner.pendingRegistrations])
       }
       if (owner.refusals.length > 0) throw new Error(owner.refusals.join('; '))
+      if (owner.state !== 'activating' || owner.disposing || (scopeKey !== undefined && parent?.state !== 'active')) throw new Error('entry was withdrawn while activating')
       owner.state = 'active'
       return {
         status: 'ok',
@@ -361,28 +431,74 @@ export class HostRoot {
       }
     } catch (error) {
       owner.state = 'failed'
-      // All-or-nothing: dispose the partial fiber, rolling back every registration.
-      await this.disposeOwner(owner).catch(() => undefined)
-      this.skillRoots.forget(owner)
-      this.owners.delete(key)
+      // Return the activation cause promptly, while retaining a dirty owner
+      // for Rust's bounded ext/deactivate receipt. Never hide an unfinished
+      // disposer by deleting the record before Core can observe it.
+      const cleanup = this.disposeOwner(owner)
+      void cleanup.then(() => {
+        this.toolRegistrations.forget(owner)
+        this.commandRegistrations.forget(owner)
+        this.hookRegistrations.forget(owner);this.shellRegistrations.forget(owner)
+        this.promptSections.forget(owner)
+        this.skillRoots.forget(owner);this.mcpDefinitions.forget(owner)
+        if (scopeKey === undefined) {
+          if (this.owners.get(key) === owner) this.owners.delete(key)
+        } else if (parent?.views?.get(scopeKey) === owner) parent.views.delete(scopeKey)
+      }, () => undefined)
       return { status: 'failed', diagnostic: describeError(error) }
     }
   }
+
+  async harnessRun(params: HarnessRunParams, signal: AbortSignal): Promise<unknown> {
+    const owner = this.owners.get(params.owner.owner_token)
+    if (this.tier !== 'builtin' || params.owner.plugin_id !== 'host:harness' || owner?.state !== 'active' || owner.ref.generation !== params.owner.generation || !owner.harness || owner.disposing) throw new RpcError(ErrorCode.NotAvailable, 'harness builtin owner is no longer live')
+    return owner.harness.run(params, signal)
+  }
+
+  private mcpOwner(ref: OwnerRef): McpBuiltin {
+    const owner = this.owners.get(ref.owner_token)
+    if (this.tier !== 'builtin' || ref.plugin_id !== 'host:mcp' || owner?.state !== 'active' || owner.ref.generation !== ref.generation || !owner.mcp || owner.disposing) {
+      throw new RpcError(ErrorCode.NotAvailable, 'MCP builtin owner is no longer live')
+    }
+    return owner.mcp
+  }
+  async mcpOpen(params: McpOpenParams, signal: AbortSignal): Promise<unknown> { return this.mcpOwner(params.owner).open(params, signal) }
+  async mcpRequest(params: McpRequestParams, signal: AbortSignal): Promise<unknown> { return this.mcpOwner(params.owner).request(params, signal) }
+  async mcpClose(params: McpCloseParams): Promise<unknown> { await this.mcpOwner(params.owner).close(params.owner, params.session_id); return {} }
 
   /** Dispose one owner's fibers (reverse order, async disposers awaited). Memoised. */
   disposeOwner(owner: OwnerRecord): Promise<void> {
     owner.state = 'disposed'
     owner.disposing ??= (async () => {
+      for (const view of owner.views?.values() ?? []) await this.disposeOwner(view)
+      await owner.mcp?.dispose()
+      await owner.harness?.dispose()
       for (const fiber of [...owner.fibers].reverse()) {
         await fiber.dispose()
+      }
+      // Admission may have answered after a failed fiber's disposer ran.
+      // OwnedRegistrations compensates that admission and tracks its cleanup;
+      // acknowledge withdrawal only once both phases have settled.
+      while (owner.pendingRegistrations.size > 0) {
+        await Promise.allSettled([...owner.pendingRegistrations])
       }
       owner.state = 'disposed'
     })()
     return owner.disposing
   }
 
-  async deactivate(ref: OwnerRef): Promise<DeactivateResult> {
-    const owner = this.owners.get(ref.owner_token)
+  async deactivate(ref: OwnerRef, entry?: EntryRef): Promise<DeactivateResult> {
+    const parent=this.owners.get(ref.owner_token)
+    if (parent && (parent.ref.plugin_id!==ref.plugin_id || parent.ref.generation!==ref.generation)) throw new Error('deactivation owner differs')
+    if (entry===undefined && parent?.views) {
+      parent.state = 'disposed'
+      const results=await Promise.all([...parent.views.values()].map(view=>this.deactivate(ref,view.scope)))
+      parent.views.clear()
+      this.owners.delete(ref.owner_token)
+      return {disposed:results.every(result=>result.disposed),leaked:results.flatMap(result=>result.leaked)}
+    }
+    const scopeKey=entry===undefined?undefined:`${entry.path}\0${entry.sha256}`
+    const owner = scopeKey===undefined?parent:parent?.views?.get(scopeKey)
     if (!owner) return { disposed: true, leaked: [] }
     let disposed = true
     try {
@@ -393,8 +509,10 @@ export class HostRoot {
     const leaked = [
       ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
       ...[...owner.commands.values()].map((command) => `command:${command.name}`),
+      ...[...owner.shellHooks.values()].map((hook)=>`shell_hook:${hook.name}`),
       ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
       ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
+      ...[...owner.mcpDefinitions.values()].map(server=>`mcp_server:${server.name}`),
       ...[...owner.skillRoots.values()].map((root) => `skill_root:${root.name}`),
     ]
     for (const fiber of owner.fibers) {
@@ -402,10 +520,10 @@ export class HostRoot {
     }
     this.toolRegistrations.forget(owner)
     this.commandRegistrations.forget(owner)
-    this.hookRegistrations.forget(owner)
+    this.hookRegistrations.forget(owner);this.shellRegistrations.forget(owner)
     this.promptSections.forget(owner)
-    this.skillRoots.forget(owner)
-    this.owners.delete(ref.owner_token)
+    this.skillRoots.forget(owner);this.mcpDefinitions.forget(owner)
+    if(scopeKey===undefined)this.owners.delete(ref.owner_token);else parent?.views?.delete(scopeKey)
     return { disposed, leaked }
   }
 

@@ -815,6 +815,7 @@ version = "0.10.1"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "codewhale-agent",
  "codewhale-config",
  "codewhale-core",
@@ -824,9 +825,11 @@ dependencies = [
  "codewhale-release",
  "codewhale-state",
  "reqwest",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -834,6 +837,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1042,8 +1046,6 @@ dependencies = [
 name = "codewhale-models"
 version = "0.10.1"
 dependencies = [
- "anyhow",
- "chrono",
  "codewhale-config",
  "codewhale-core",
  "serde",
@@ -1245,7 +1247,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
- "clap_complete",
+ "codewhale-app-server",
  "codewhale-build-support",
  "codewhale-cloud-facts",
  "codewhale-command-contract",
@@ -1289,7 +1291,6 @@ dependencies = [
  "libc",
  "liblzma",
  "lru",
- "mimalloc",
  "oauth2",
  "objc2",
  "objc2-foundation",
@@ -1307,7 +1308,6 @@ dependencies = [
  "rquickjs",
  "rusqlite",
  "rustls",
- "rusty_alloc-api",
  "schemars",
  "semver",
  "serde",

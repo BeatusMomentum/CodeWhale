@@ -17,7 +17,7 @@ use crate::commands::debug_diagnostics_test_support::{
     DiagnosticsHarness, SealedHome, assert_fixture, normalize_cache_ages,
 };
 use crate::commands::{CommandResult, execute};
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::tui::app::{AppAction, TurnCacheRecord};
 use codewhale_models::{ContentBlock, Message, Role, SystemPrompt};
 
@@ -42,14 +42,14 @@ fn render(result: &CommandResult) -> String {
 #[test]
 fn balance_branch_pair_matches_baseline() {
     let mut harness = DiagnosticsHarness::new();
-    harness.app.api_provider = ApiProvider::Deepseek;
+    harness.app.api_provider = ProviderKind::Deepseek;
     assert_fixture(
         "balance_supported.txt",
         &render(&execute("/balance", &mut harness.app)),
     );
 
     let mut harness = DiagnosticsHarness::new();
-    harness.app.api_provider = ApiProvider::Ollama;
+    harness.app.api_provider = ProviderKind::Ollama;
     assert_fixture(
         "balance_unsupported.txt",
         &render(&execute("/balance", &mut harness.app)),
@@ -449,7 +449,7 @@ fn turn_record(
     recorded_at: Instant,
 ) -> TurnCacheRecord {
     TurnCacheRecord {
-        provider: Some(ApiProvider::Deepseek),
+        provider: Some(ProviderKind::Deepseek),
         provider_identity: Some("deepseek".to_string()),
         model: Some("deepseek-v4-pro".to_string()),
         auto_model: false,

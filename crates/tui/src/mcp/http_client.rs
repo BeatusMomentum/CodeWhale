@@ -125,7 +125,7 @@ pub(super) fn mcp_headers_have_authorization(headers: &HashMap<String, String>) 
 }
 
 #[derive(Clone)]
-pub(super) struct McpHttpClient {
+pub(crate) struct McpHttpClient {
     origin: String,
     operator_configured: bool,
     private_origin_allowed: bool,
@@ -144,7 +144,7 @@ pub(super) struct McpHttpClient {
 }
 
 impl McpHttpClient {
-    pub(super) fn new(
+    pub(crate) fn new(
         url: &str,
         runtime_added: bool,
         reviewed_plugin: bool,
@@ -187,7 +187,7 @@ impl McpHttpClient {
     /// This remains separate from send so callers retain their existing auth,
     /// header and long-lived-body cancellation/deadline boundaries. OAuth uses
     /// raw execute/send and must never inherit the MCP bearer/header pass.
-    pub(super) async fn prepare_mcp_request(
+    pub(crate) async fn prepare_mcp_request(
         &self,
         request: reqwest::RequestBuilder,
         json_body: bool,
@@ -199,35 +199,106 @@ impl McpHttpClient {
         ))
     }
 
+    /// Send one exact buffered MCP request. Only an explicit 401/403 permits
+    /// one OAuth refresh and resend; transport failures and cancellation never
+    /// reach the retry arm. The caller's authority is checked around every await
+    /// and before each write. Both native Streamable HTTP and FetchProxy use it.
+    pub(crate) async fn send_mcp_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        json_body: bool,
+        event_stream: bool,
+        reactive_refresh: bool,
+        mut validate: impl FnMut() -> Result<()> + Send,
+        mut observe: impl FnMut(&Response) -> Result<()>,
+    ) -> Result<Response> {
+        let mut request = request;
+        let mut retried = false;
+        loop {
+            validate()?;
+            let fresh = request
+                .try_clone()
+                .context("MCP request body cannot be replayed")?;
+            let prepared = self.prepare_mcp_request(fresh, json_body).await?;
+            validate()?;
+            let mut prepared = prepared.build()?;
+            if !event_stream {
+                prepared.timeout_mut().get_or_insert(self.read_timeout);
+            }
+            let response = self
+                .execute_with_guard(prepared, true, &mut validate)
+                .await?;
+            validate()?;
+            observe(&response)?;
+            let status = response.status();
+            if !reactive_refresh
+                || !matches!(
+                    status,
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                )
+            {
+                return Ok(response);
+            }
+            if !retried && let Some(refresh) = self.refresh_mcp_oauth().await {
+                validate()?;
+                match refresh {
+                    Ok(()) => {
+                        // Streamable HTTP observes session headers even on
+                        // a rejected attempt, before its one authorized retry.
+                        if let Some(sid) = response.headers().get("mcp-session-id") {
+                            request = request.header("mcp-session-id", sid);
+                        }
+                        retried = true;
+                        continue;
+                    }
+                    Err(error) => bail!(
+                        "MCP server {} rejected the request with {status} and refreshing the OAuth session failed: {error:#}. {}",
+                        super::mask_url_secrets(request.build()?.url().as_str()),
+                        oauth::tui_reauth_refresh_failed_hint(),
+                    ),
+                }
+            }
+            let hint = if self.oauth_configured() {
+                oauth::tui_reauth_hint()
+            } else {
+                "Check the configured bearer token (or its environment variable)."
+            };
+            bail!(
+                "MCP server {} rejected the request with {status}; the session is no longer accepted. {hint}",
+                super::mask_url_secrets(request.build()?.url().as_str()),
+            );
+        }
+    }
+
     /// Only an explicit unauthorized response lets the transport request this
     /// refresh; the session performs no replay or automatic send of its own.
-    pub(super) async fn refresh_mcp_oauth(&self) -> Option<Result<()>> {
+    pub(crate) async fn refresh_mcp_oauth(&self) -> Option<Result<()>> {
         let oauth = self.mcp_auth.oauth.as_ref()?;
         Some(oauth.force_refresh().await)
     }
 
-    pub(super) fn oauth_configured(&self) -> bool {
+    pub(crate) fn oauth_configured(&self) -> bool {
         self.mcp_auth.oauth_configured
     }
 
-    pub(super) fn server_error_preview(&self, preview: &str) -> String {
+    pub(crate) fn server_error_preview(&self, preview: &str) -> String {
         self.mcp_auth.server_error_preview(preview)
     }
 
-    pub(super) fn with_default_headers(mut self, headers: header::HeaderMap) -> Self {
+    pub(crate) fn with_default_headers(mut self, headers: header::HeaderMap) -> Self {
         self.default_headers = headers;
         self
     }
 
-    pub(super) fn get(&self, url: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn get(&self, url: &str) -> reqwest::RequestBuilder {
         self.request_builder.get(url)
     }
 
-    pub(super) fn post(&self, url: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn post(&self, url: &str) -> reqwest::RequestBuilder {
         self.request_builder.post(url)
     }
 
-    pub(super) async fn send(&self, request: reqwest::RequestBuilder) -> Result<Response> {
+    pub(crate) async fn send(&self, request: reqwest::RequestBuilder) -> Result<Response> {
         self.execute(request.build()?, true).await
     }
 
@@ -242,14 +313,14 @@ impl McpHttpClient {
     /// keepalive only covers the hop to the proxy. MCP servers are not required
     /// to send heartbeats, so no idle deadline can tell a quiet stream from a
     /// dead one.
-    pub(super) async fn send_event_stream(
+    pub(crate) async fn send_event_stream(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<Response> {
         self.execute_with(request.build()?, true).await
     }
 
-    pub(super) async fn execute(
+    pub(crate) async fn execute(
         &self,
         mut request: Request,
         follow_redirects: bool,
@@ -262,7 +333,17 @@ impl McpHttpClient {
         self.execute_with(request, follow_redirects).await
     }
 
-    async fn execute_with(&self, mut request: Request, follow_redirects: bool) -> Result<Response> {
+    async fn execute_with(&self, request: Request, follow_redirects: bool) -> Result<Response> {
+        self.execute_with_guard(request, follow_redirects, &mut || Ok(()))
+            .await
+    }
+
+    async fn execute_with_guard(
+        &self,
+        mut request: Request,
+        follow_redirects: bool,
+        validate: &mut (dyn FnMut() -> Result<()> + Send),
+    ) -> Result<Response> {
         if request.url().origin().ascii_serialization() == self.origin {
             for (name, value) in &self.default_headers {
                 if !request.headers().contains_key(name) {
@@ -271,25 +352,41 @@ impl McpHttpClient {
             }
         }
         let timeout = request.timeout().copied().unwrap_or(self.read_timeout);
-        tokio::time::timeout(timeout, self.execute_inner(request, follow_redirects))
-            .await
-            .context("MCP HTTP request timed out")?
+        tokio::time::timeout(
+            timeout,
+            self.execute_inner(request, follow_redirects, validate),
+        )
+        .await
+        .context("MCP HTTP request timed out")?
     }
 
     async fn execute_inner(
         &self,
         mut request: Request,
         follow_redirects: bool,
+        validate: &mut (dyn FnMut() -> Result<()> + Send),
     ) -> Result<Response> {
         for redirect_count in 0..=5 {
             let url = request.url().clone();
+            validate()?;
             let client = self.client_for_target(&url).await?;
+            // DNS/guarded-client selection yielded. Owner generation, exact
+            // operation expiry and reviewed source must still authorize the
+            // write that follows, including every guarded redirect hop.
+            validate()?;
+            if let Some(source) = self.mcp_auth.reviewed_plugin.as_ref() {
+                source.validate_before_use(
+                    &self.mcp_auth.server_name,
+                    "write authenticated request to",
+                )?;
+            }
             // MCP and OAuth requests have buffered bodies. Keep the exact request
             // to replay only after the Location has passed the same guard.
             let next_request = request
                 .try_clone()
                 .context("MCP request body cannot be replayed")?;
             let response = client.execute(request).await?;
+            validate()?;
             if !follow_redirects
                 || !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
             {
@@ -513,6 +610,79 @@ mod tests {
         }
         socket.write_all(response.as_bytes()).await.unwrap();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_mcp_send_revalidates_after_client_selection_before_first_write() {
+        let _env = crate::test_support::lock_test_env();
+        let _proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let client = client(&url, false);
+        let mut checks = 0;
+        let error = client
+            .send_mcp_request(
+                client.post(&url).body("{}"),
+                true,
+                false,
+                false,
+                || {
+                    checks += 1;
+                    // Before/after auth, then before/after guarded client
+                    // selection. The fourth check is the actual write boundary.
+                    if checks == 4 {
+                        bail!("fixture owner revoked after client selection");
+                    }
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture owner revoked"));
+        assert_eq!(checks, 4);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_guard_rechecks_same_origin_redirect_before_any_second_write() {
+        let _env = crate::test_support::lock_test_env();
+        let _proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 2048];
+            assert!(socket.read(&mut buffer).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 307 Redirect\r\nLocation: /second\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            drop(socket);
+            tokio::time::timeout(Duration::from_millis(80), listener.accept())
+                .await
+                .is_err()
+        });
+        let client = client(&url, false);
+        let mut checks = 0;
+        let error = client
+            .execute_with_guard(
+                client.post(&url).body("{}").build().unwrap(),
+                true,
+                &mut || {
+                    checks += 1;
+                    if checks == 5 {
+                        bail!("fixture owner revoked at redirect write boundary");
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture owner revoked"));
+        assert_eq!(checks, 5);
+        assert!(server.await.unwrap(), "revoked redirect must not connect");
     }
 
     #[tokio::test]

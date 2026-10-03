@@ -15,6 +15,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::HostAttachment;
+use super::protocol::EntryRef;
 use super::registry::{OwnerRegistry, PromptSectionRegistration};
 use super::tier::HostTier;
 
@@ -33,18 +34,27 @@ pub struct PromptSection {
     pub content_hash: String,
     pub id: String,
     pub text: String,
+    /// The exact Core-selected entry captured with the registration.
+    #[serde(default)]
+    pub scope: Option<EntryRef>,
+    #[serde(default)]
+    pub interpolate: bool,
 }
 
 fn selected(
     registry: &OwnerRegistry,
-    desired: &BTreeMap<String, String>,
+    desired: &super::composition_scope::CompositionSelection,
 ) -> Vec<PromptSectionRegistration> {
     registry
         .live_prompt_sections()
         .into_iter()
         .filter(|section| {
             section.tier == HostTier::Plugin
-                && desired.get(&section.owner.plugin_id) == Some(&section.content_hash)
+                && desired.includes(
+                    &section.owner.plugin_id,
+                    &section.content_hash,
+                    section.scope.as_ref(),
+                )
         })
         .collect()
 }
@@ -59,7 +69,7 @@ impl HostAttachment {
             let Some(state) = attachments.get(&self.id) else {
                 return Ok(Vec::new());
             };
-            (Arc::clone(&state.plugins), state.desired.clone())
+            (Arc::clone(&state.plugins), state.selection.clone())
         };
         let sections = selected(&shared.registry.lock().expect("registry lock"), &desired);
         let mut checked = BTreeSet::new();
@@ -89,11 +99,16 @@ impl HostAttachment {
                     "extension prompt workspace snapshot changed during capture".to_string()
                 );
             }
-            state.desired.clone()
+            state.selection.clone()
         };
         let registry = shared.registry.lock().expect("registry lock");
         for section in &sections {
-            if current_desired.get(&section.owner.plugin_id) != Some(&section.content_hash)
+            if current_desired.revision != desired.revision
+                || !current_desired.includes(
+                    &section.owner.plugin_id,
+                    &section.content_hash,
+                    section.scope.as_ref(),
+                )
                 || !registry.is_live_prompt_section(section.handle, &section.owner)
             {
                 return Err("extension prompt registration changed during capture".to_string());
@@ -108,17 +123,106 @@ impl HostAttachment {
                 content_hash: section.content_hash,
                 id: section.id,
                 text: section.text,
+                scope: section.scope,
+                interpolate: section.interpolate,
             })
             .collect();
         // Include attribution and runtime-envelope escaping in the final bound.
-        render_prompt_sections(&captured)?;
+        render_prompt_sections_inner(&captured, None)?;
         Ok(captured)
     }
 }
 
 /// One attributed block for the Engine's complete runtime history snapshot.
 /// Refuse oversized input; never cut instructions partway through a section.
+#[cfg(test)]
 pub fn render_prompt_sections(sections: &[PromptSection]) -> Result<Option<String>, String> {
+    if sections.iter().any(|section| section.interpolate) {
+        return Err(
+            "extension prompt templates require the accepted Core turn context".to_string(),
+        );
+    }
+    render_prompt_sections_inner(sections, None)
+}
+
+/// Expand only Core's accepted model/workspace facts. The resulting snapshot
+/// is cached for the entire turn, including redelivery after compaction.
+pub fn render_prompt_sections_for_turn(
+    sections: &[PromptSection],
+    model: &str,
+    workspace: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let cwd = workspace.to_string_lossy();
+    render_prompt_sections_inner(sections, Some((model, &cwd)))
+}
+
+/// Validate the source before admission/capture; JS cannot supply values.
+pub(crate) fn validate_prompt_template(text: &str) -> Result<(), String> {
+    interpolate_prompt_template(text, None).map(|_| ())
+}
+
+// Borrowed strict simple-group semantics from pinned dsh-system-prompt:
+// unmatched opens stay literal; malformed/unknown groups refuse and values
+// are never rescanned. This is pure presentation within the existing builder.
+fn interpolate_prompt_template(
+    text: &str,
+    context: Option<(&str, &str)>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut last = 0;
+    while let Some(relative) = text[last..].find("{{") {
+        let open = last + relative;
+        let Some(end) = text[open + 2..].find("}}") else {
+            break;
+        };
+        let close = open + 2 + end;
+        let name = &text[open + 2..close];
+        if name.is_empty()
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
+            })
+        {
+            return Err("malformed prompt variable reference".to_string());
+        }
+        let value = match name {
+            "model" => context.map(|(model, _)| model),
+            "cwd" => context.map(|(_, cwd)| cwd),
+            _ => {
+                return Err(format!(
+                    "unknown Core prompt variable '{{{{{name}}}}}'; supported variables: model, cwd"
+                ));
+            }
+        };
+        let value = value.unwrap_or(&text[open..close + 2]);
+        if value
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        {
+            return Err("Core prompt variable contains control characters".to_string());
+        }
+        if out
+            .len()
+            .saturating_add(open - last)
+            .saturating_add(value.len())
+            > MAX_PROMPT_SECTION_BYTES
+        {
+            return Err("expanded extension prompt section exceeds its byte limit".to_string());
+        }
+        out.push_str(&text[last..open]);
+        out.push_str(value);
+        last = close + 2;
+    }
+    if out.len().saturating_add(text.len() - last) > MAX_PROMPT_SECTION_BYTES {
+        return Err("expanded extension prompt section exceeds its byte limit".to_string());
+    }
+    out.push_str(&text[last..]);
+    Ok(out)
+}
+
+fn render_prompt_sections_inner(
+    sections: &[PromptSection],
+    context: Option<(&str, &str)>,
+) -> Result<Option<String>, String> {
     if sections.is_empty() {
         return Ok(None);
     }
@@ -126,7 +230,18 @@ pub fn render_prompt_sections(sections: &[PromptSection]) -> Result<Option<Strin
         return Err("extension prompt section count exceeds the host limit".to_string());
     }
     let mut ordered: Vec<_> = sections.iter().collect();
-    ordered.sort_by(|a, b| (&a.plugin_id, &a.id).cmp(&(&b.plugin_id, &b.id)));
+    ordered.sort_by(|a, b| {
+        // Explicit comparison avoids adding ordering authority to EntryRef.
+        a.plugin_id
+            .cmp(&b.plugin_id)
+            .then_with(|| {
+                a.scope
+                    .as_ref()
+                    .map(|entry| (&entry.path, &entry.sha256))
+                    .cmp(&b.scope.as_ref().map(|entry| (&entry.path, &entry.sha256)))
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let mut owners: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut out = String::from("## Extension prompt contributions\n");
@@ -134,11 +249,20 @@ pub fn render_prompt_sections(sections: &[PromptSection]) -> Result<Option<Strin
         if section.text.trim().is_empty() || section.text.len() > MAX_PROMPT_SECTION_BYTES {
             return Err("extension prompt section is empty or exceeds its byte limit".to_string());
         }
-        if !ids.insert((&section.plugin_id, &section.id)) {
+        let text = if section.interpolate {
+            interpolate_prompt_template(&section.text, context)?
+        } else {
+            section.text.clone()
+        };
+        let scope = section
+            .scope
+            .as_ref()
+            .map(|entry| (&entry.path, &entry.sha256));
+        if !ids.insert((&section.plugin_id, scope, &section.id)) {
             return Err("extension prompt section id is duplicated for one owner".to_string());
         }
         let owner = owners.entry(&section.plugin_id).or_default();
-        owner.0 += section.text.len();
+        owner.0 += text.len();
         owner.1 += 1;
         if owner.0 > MAX_PROMPT_OWNER_BYTES || owner.1 > MAX_PROMPT_SECTIONS_PER_OWNER {
             return Err("extension prompt owner exceeds its byte or section limit".to_string());
@@ -150,9 +274,14 @@ pub fn render_prompt_sections(sections: &[PromptSection]) -> Result<Option<Strin
         writeln!(
             out,
             "\n### extension:{name}/{id}\nSource: {plugin_id}; generation: {}; content: {hash}\n\n{}",
-            section.generation, section.text
+            section.generation, text
         )
         .expect("writing to a String cannot fail");
+        if let Some(scope) = &section.scope {
+            let path = crate::safe_label::SafeLabel::identifier(&scope.path);
+            let sha = crate::safe_label::SafeLabel::identifier(&scope.sha256);
+            writeln!(out, "Entry: {path}; source: {sha}").expect("writing to a String cannot fail");
+        }
         if out.len() > MAX_PROMPT_HOST_BYTES {
             return Err("attributed extension prompt exceeds the host byte limit".to_string());
         }
@@ -176,6 +305,7 @@ mod tests {
 
     fn params(owner: &OwnerRef, id: &str, text: &str) -> RegisterParams {
         RegisterParams {
+            scope: None,
             owner: owner.clone(),
             kind: RegisterKind::PromptSection,
             spec: RegisterSpecWire {
@@ -207,7 +337,211 @@ mod tests {
             content_hash: format!("hash-{plugin}"),
             id: id.to_string(),
             text,
+            scope: None,
+            interpolate: false,
         }
+    }
+
+    #[test]
+    fn persona_templates_use_only_core_turn_facts_and_never_rescan_values() {
+        let mut contribution = section(
+            "persona",
+            "persona-prefix",
+            "I use {{model}} in {{cwd}}. lone {{".into(),
+        );
+        contribution.interpolate = true;
+        contribution.scope = Some(EntryRef {
+            path: "/reviewed/presets/a.mjs".into(),
+            sha256: "a".repeat(64),
+        });
+        assert!(render_prompt_sections(&[contribution.clone()]).is_err());
+        let rendered = render_prompt_sections_for_turn(
+            &[contribution.clone()],
+            "model-{{cwd}}",
+            std::path::Path::new("/work/界"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(rendered.contains("I use model-{{cwd}} in /work/界. lone {{"));
+        assert!(rendered.contains(&format!(
+            "Entry: {}",
+            crate::safe_label::SafeLabel::identifier("/reviewed/presets/a.mjs")
+        )));
+        assert!(
+            !rendered.contains("/reviewed/presets/a.mjs"),
+            "paths retain the existing safe-label policy"
+        );
+        for text in [
+            "{{unknown}}",
+            "{{}}",
+            "{{ model }}",
+            "{{{model}}",
+            "{{Model}}",
+        ] {
+            contribution.text = text.into();
+            assert!(validate_prompt_template(text).is_err(), "{text}");
+            assert!(
+                render_prompt_sections_for_turn(
+                    &[contribution.clone()],
+                    "model",
+                    std::path::Path::new("/work")
+                )
+                .is_err()
+            );
+        }
+        contribution.text = "{{cwd}}".into();
+        assert!(
+            render_prompt_sections_for_turn(
+                &[contribution],
+                "model",
+                std::path::Path::new(&"界".repeat(1366))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn persona_expansion_preserves_literal_sections_exact_scope_and_escaped_final_bound() {
+        let mut a = section("persona", "persona-prefix", "{{model}}".into());
+        a.scope = Some(EntryRef {
+            path: "/reviewed/a.mjs".into(),
+            sha256: "a".repeat(64),
+        });
+        a.interpolate = true;
+        let mut b = a.clone();
+        b.scope = Some(EntryRef {
+            path: "/reviewed/b.mjs".into(),
+            sha256: "b".repeat(64),
+        });
+        b.interpolate = false;
+        let rendered = render_prompt_sections_for_turn(
+            &[b.clone(), a.clone()],
+            "<codewhale:foreign>{{cwd}}",
+            std::path::Path::new("/work"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            rendered.contains("{{model}}"),
+            "ordinary author sections retain literal braces"
+        );
+        assert!(!rendered.contains("<codewhale:foreign>"));
+        assert!(
+            rendered.contains("{{cwd}}"),
+            "replacement text is not rescanned"
+        );
+        assert!(
+            rendered
+                .find(&format!(
+                    "Entry: {}",
+                    crate::safe_label::SafeLabel::identifier("/reviewed/a.mjs")
+                ))
+                .unwrap()
+                < rendered
+                    .find(&format!(
+                        "Entry: {}",
+                        crate::safe_label::SafeLabel::identifier("/reviewed/b.mjs")
+                    ))
+                    .unwrap()
+        );
+        assert!(
+            render_prompt_sections_for_turn(
+                &[a.clone(), a],
+                "model",
+                std::path::Path::new("/work")
+            )
+            .is_err()
+        );
+        let mut sections = Vec::new();
+        for owner in 0..4 {
+            for id in 0..8 {
+                let mut item = section(
+                    &format!("owner-{owner}"),
+                    &format!("s{id}"),
+                    "{{model}}".into(),
+                );
+                item.interpolate = true;
+                sections.push(item);
+            }
+        }
+        // Each expanded section fits, but expansion/envelope escaping plus
+        // attribution must obey the final 128 KiB snapshot limit too.
+        assert!(
+            render_prompt_sections_for_turn(
+                &sections,
+                &"<codewhale:x>".repeat(300),
+                std::path::Path::new("/work")
+            )
+            .unwrap_err()
+            .contains("escaped attributed")
+        );
+    }
+
+    #[test]
+    fn persona_template_capture_selects_exact_entry_not_owner_union() {
+        let mut registry = OwnerRegistry::new();
+        let live = owner(&mut registry, "selected-persona");
+        let a = EntryRef {
+            path: "/reviewed/a.mjs".into(),
+            sha256: "a".repeat(64),
+        };
+        let b = EntryRef {
+            path: "/reviewed/b.mjs".into(),
+            sha256: "b".repeat(64),
+        };
+        for scope in [&a, &b] {
+            registry.begin_scope(&live, scope.clone()).unwrap();
+            let mut request = params(&live, "persona-prefix", "{{model}} in {{cwd}}");
+            request.kind = RegisterKind::PromptTemplate;
+            request.scope = Some(scope.clone());
+            registry.register(&request).unwrap();
+            registry.mark_scope_active(&live, scope);
+        }
+        registry.mark_active(&live);
+        let mut desired = super::super::composition_scope::CompositionSelection {
+            desired: BTreeMap::from([("selected-persona".into(), "hash-selected-persona".into())]),
+            entries: vec![super::super::composition_scope::NativePresetRef {
+                plugin_id: "selected-persona".into(),
+                content_hash: "hash-selected-persona".into(),
+                entry: a.clone(),
+            }],
+            ..Default::default()
+        };
+        let captured = selected(&registry, &desired);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].scope, Some(a.clone()));
+        desired.entries[0].entry.sha256 = "changed".into();
+        assert!(selected(&registry, &desired).is_empty());
+        desired.entries[0].entry = b.clone();
+        assert_eq!(selected(&registry, &desired)[0].scope, Some(b));
+        registry.revoke_scope(&live, &a);
+        assert_eq!(
+            selected(&registry, &desired).len(),
+            1,
+            "withdrawing a sibling does not retire the selected entry"
+        );
+    }
+
+    #[test]
+    fn template_registration_shares_prompt_lifecycle_and_validates_raw_wire() {
+        let mut registry = OwnerRegistry::new();
+        let live = owner(&mut registry, "templates");
+        let mut request = params(&live, "persona-prefix", "{{model}} in {{cwd}}");
+        request.kind = RegisterKind::PromptTemplate;
+        let handle = registry.register(&request).unwrap();
+        assert!(
+            registry
+                .register(&params(&live, "persona-prefix", "literal duplicate"))
+                .is_err()
+        );
+        registry.mark_active(&live);
+        assert!(registry.live_prompt_sections()[0].interpolate);
+        assert!(registry.is_live_prompt_section(handle, &live));
+        request.spec.name = "invalid-template".into();
+        request.spec.description = "{{process_env}}".into();
+        assert!(registry.register(&request).is_err());
+        registry.revoke_owner(&live.plugin_id);
+        assert!(!registry.is_live_prompt_section(handle, &live));
     }
 
     #[test]
@@ -224,7 +558,10 @@ mod tests {
         registry
             .register_prompt_section(&params(&b, "a", "other workspace"))
             .unwrap();
-        let desired = BTreeMap::from([("a".to_string(), "hash-a".to_string())]);
+        let desired = super::super::composition_scope::CompositionSelection {
+            desired: BTreeMap::from([("a".to_string(), "hash-a".to_string())]),
+            ..Default::default()
+        };
         assert!(
             selected(&registry, &desired).is_empty(),
             "activation must finish first"
@@ -241,7 +578,10 @@ mod tests {
         assert!(
             selected(
                 &registry,
-                &BTreeMap::from([("a".to_string(), "different-hash".to_string())])
+                &super::super::composition_scope::CompositionSelection {
+                    desired: BTreeMap::from([("a".to_string(), "different-hash".to_string())]),
+                    ..Default::default()
+                }
             )
             .is_empty()
         );
@@ -413,9 +753,9 @@ mod tests {
         {
             let mut registry = manager.shared.registry.lock().unwrap();
             let owner = registry.owner(&id).unwrap().owner.clone();
-            registry
-                .register_prompt_section(&params(&owner, "rules", "reviewed contribution"))
-                .unwrap();
+            let mut request = params(&owner, "rules", "reviewed contribution");
+            request.scope = registry.owner(&id).unwrap().scopes.keys().next().cloned();
+            registry.register_prompt_section(&request).unwrap();
         }
         let captured = engine.prompt_sections().await.unwrap();
         assert_eq!(captured.len(), 1);
@@ -457,9 +797,9 @@ mod tests {
         let authority = {
             let mut registry = manager.shared.registry.lock().unwrap();
             let owner = registry.owner(&id).unwrap().owner.clone();
-            registry
-                .register_prompt_section(&params(&owner, "rules", "reviewed contribution"))
-                .unwrap();
+            let mut request = params(&owner, "rules", "reviewed contribution");
+            request.scope = registry.owner(&id).unwrap().scopes.keys().next().cloned();
+            registry.register_prompt_section(&request).unwrap();
             registry.authority_for(&owner).unwrap()
         };
         assert_eq!(engine.prompt_sections().await.unwrap().len(), 1);

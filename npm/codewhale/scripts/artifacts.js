@@ -1,5 +1,6 @@
 const path = require("path");
 const os = require("os");
+const compiledHosts = require("./compiled-hosts");
 
 const CHECKSUM_MANIFEST = "codewhale-artifacts-sha256.txt";
 const BUNDLE_CHECKSUM_MANIFEST = "codewhale-bundles-sha256.txt";
@@ -257,7 +258,7 @@ function allAssetNames() {
   return Array.from(new Set(names));
 }
 
-function allReleaseAssetNames() {
+function allReleaseAssetNames(catalog) {
   return [
     ...allAssetNames(),
     ...LEGACY_TUI_BRIDGE_ASSET_NAMES,
@@ -265,11 +266,12 @@ function allReleaseAssetNames() {
     WINDOWS_INSTALLER_ASSET,
     BUNDLE_CHECKSUM_MANIFEST,
     CHECKSUM_MANIFEST,
+    ...compiledHosts.assets(catalog),
   ];
 }
 
-function checksummedReleaseAssetNames() {
-  return allReleaseAssetNames().filter((name) => name !== CHECKSUM_MANIFEST);
+function checksummedReleaseAssetNames(catalog) {
+  return allReleaseAssetNames(catalog).filter((name) => name !== CHECKSUM_MANIFEST);
 }
 
 module.exports = {

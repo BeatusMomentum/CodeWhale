@@ -196,7 +196,11 @@ impl ToolSpec for LoadSkillTool {
                 skill.name
             )));
         }
-        ensure_reviewed_plugin_skill_is_current(skill, &context.workspace)?;
+        ensure_reviewed_plugin_skill_is_current_for(
+            skill,
+            &context.workspace,
+            context.plugin_registry.as_deref(),
+        )?;
         ensure_native_skill_file_present(skill)?;
         let body = format_skill_body(skill);
         let (skill_path, skill_source) = match &skill.source {
@@ -242,14 +246,22 @@ fn ensure_native_skill_file_present(skill: &Skill) -> Result<(), ToolError> {
     Err(ToolError::execution_failed(message))
 }
 
+#[cfg(test)]
 fn ensure_reviewed_plugin_skill_is_current(
     skill: &Skill,
     workspace: &std::path::Path,
 ) -> Result<(), ToolError> {
+    ensure_reviewed_plugin_skill_is_current_for(skill, workspace, None)
+}
+fn ensure_reviewed_plugin_skill_is_current_for(
+    skill: &Skill,
+    workspace: &std::path::Path,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> Result<(), ToolError> {
     let Some(provenance) = skill.source.provenance() else {
         return Ok(());
     };
-    provenance.verify(workspace).map_err(|reason| ToolError::execution_failed(format!(
+    provenance.verify_for(workspace,plugins).map_err(|reason| ToolError::execution_failed(format!(
         "Plugin skill `{}` was denied: {reason}. Reload and select the skill again before retrying", skill.name)))
 }
 

@@ -611,7 +611,7 @@ pub(crate) fn test_app_with_options(options: crate::tui::app::TuiOptions) -> cra
     // Pin the route identity: without this, a machine with customized
     // settings computes context-window assertions against a different model
     // than the requested deepseek-v4-pro.
-    app.set_provider_identity(crate::config::ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(crate::config::ProviderKind::Deepseek, "deepseek");
     app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     app.model = "deepseek-v4-pro".to_string();
     app.auto_model = false;

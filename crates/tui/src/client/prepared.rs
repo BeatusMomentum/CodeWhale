@@ -28,7 +28,7 @@ use serde_json::Value;
 
 use codewhale_config::provider::WireFormat;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 /// The wire protocol a prepared request speaks.
 ///
@@ -114,7 +114,7 @@ impl RouteShape {
 /// deployment secret.
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointIdentity {
-    /// Stable provider id (`ApiProvider::as_str`).
+    /// Stable provider id (`ProviderKind::as_str`).
     pub(crate) provider_id: String,
     /// Human-facing provider name.
     pub(crate) provider_display: String,
@@ -678,12 +678,12 @@ fn count_attachments(dialect: WireDialect, item: &Value) -> (usize, usize) {
 
 /// Classify the provider-specific shape of a prepared Chat Completions body.
 pub(crate) fn chat_route_shape(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     url: &str,
 ) -> RouteShape {
-    if provider == ApiProvider::OpencodeZen {
+    if provider == ProviderKind::OpencodeZen {
         return RouteShape::OpencodeZen;
     }
     if url.contains("/beta/chat/completions") {
@@ -695,7 +695,7 @@ pub(crate) fn chat_route_shape(
     if crate::config::is_exact_direct_moonshot_k3_route(provider, base_url, wire_model) {
         return RouteShape::DirectMoonshotK3;
     }
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         return RouteShape::CustomCompatible;
     }
     RouteShape::Standard
@@ -1592,7 +1592,8 @@ mod dialect_seam_tests {
             ..Config::default()
         };
         config
-            .provider_config_for_mut(ApiProvider::OpenaiCodex)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::OpenaiCodex))
+            .unwrap()
             .model = Some("gpt-5-codex".into());
         crate::oauth::install_test_chatgpt_registration(&mut config).expect("official test grant");
         CodewhaleClient::new(&config).expect("official ChatGPT client")
@@ -1622,7 +1623,7 @@ mod dialect_seam_tests {
 
         let reference = super::super::responses::build_responses_body_for_provider(
             &preprocessed(&client, request("gpt-5-codex")),
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             client.chatgpt_reasoning_api.as_deref(),
         );
         assert_eq!(prepared.body_sha256(), sha256(&canonical_json(&reference)));

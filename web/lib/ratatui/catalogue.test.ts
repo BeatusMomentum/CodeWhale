@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { motionId, previewAssetPath, readCatalogue, searchEntries } from "./catalogue";
+import { discoveryText } from "./learning";
 
 const catalogue = readCatalogue();
 const publicRoot = join(process.cwd(), "public", "ratatui");
@@ -19,6 +20,30 @@ describe("Ratatui explorer", () => {
     expect(searchEntries(catalogue.entries, "fish", "habitat").map((entry) => entry.name)).toContain("fish-school");
     expect(searchEntries(catalogue.entries, "fish", "input")).toHaveLength(0);
     expect(searchEntries(catalogue.entries, "" )).toHaveLength(catalogue.entries.length);
+  });
+
+  it("finds studio scenes by their displayed composed APIs instead of private fixture inputs", () => {
+    const studio = catalogue.entries.filter((entry) => entry.family === "studio");
+    const shells = searchEntries(studio, "TerminalShell").map((entry) => entry.name);
+    expect(shells).toHaveLength(3);
+    expect(shells).toEqual(expect.arrayContaining(["showcase-work", "showcase-decision", "showcase-narrow"]));
+    expect(searchEntries(studio, "NativeComposer").map((entry) => entry.name))
+      .toEqual(expect.arrayContaining(["showcase-work", "showcase-narrow"]));
+    expect(searchEntries(studio, "ApprovalCard").map((entry) => entry.name)).toEqual(["showcase-decision"]);
+    expect(searchEntries(studio, "Inputs")).toHaveLength(0);
+    for (const name of ["showcase-work", "showcase-decision", "showcase-narrow"]) {
+      const text = discoveryText(studio.find((entry) => entry.name === name)!);
+      expect(text).toContain("terminalshell");
+      expect(text).not.toContain("inputs");
+    }
+  });
+
+  it("keeps the hub hero entry available with its wide and narrow renders", () => {
+    const hero = catalogue.entries.find((entry) => entry.name === "showcase-work");
+    expect(hero).toBeDefined();
+    const data = JSON.parse(readFileSync(join(publicRoot, hero!.previewPath), "utf8"));
+    expect(data.previews["dark-truecolor"]["native"]).toContain("viewBox=");
+    expect(data.previews["dark-truecolor"]["40"]).toContain('viewBox="0 0 400 ');
   });
 
   it("rejects an asset path outside the generated component directory", () => {

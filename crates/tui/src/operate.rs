@@ -692,21 +692,23 @@ fn keepalive_route(
     } else {
         (
             config
-                .active_provider_identity(config.api_provider())
+                .active_provider_identity()
                 .map_err(anyhow::Error::msg)?,
             config.default_model(),
         )
     };
     if model.trim().eq_ignore_ascii_case("auto") {
         let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
-        let credentials = crate::config::has_api_key_for(&scoped, identity.provider);
+        scoped
+            .scope_to_provider_identity(&identity)
+            .map_err(anyhow::Error::msg)?;
+        let credentials = crate::config::has_api_key_for(&scoped, &identity);
         return Ok((identity, "auto".to_string(), credentials));
     }
     let route =
         crate::route_runtime::resolve_runtime_route_for_identity(config, &identity, Some(&model))
             .map_err(anyhow::Error::msg)?;
-    let credentials = crate::config::has_api_key_for(&route.config, route.identity.provider);
+    let credentials = crate::config::has_api_key_for(&route.config, &route.identity);
     Ok((route.identity, route.model, credentials))
 }
 

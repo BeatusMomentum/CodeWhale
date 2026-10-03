@@ -670,7 +670,10 @@ impl FleetManager {
             return Ok(());
         };
         let state = self.ledger.rebuild_state()?;
-        for record in guard.list_worker_records() {
+        for record in guard
+            .fleet_worker_records_for_workspace(&self.workspace)
+            .map_err(anyhow::Error::msg)?
+        {
             let current = state
                 .tasks
                 .values()
@@ -1075,28 +1078,35 @@ impl FleetManager {
 
         // Enrich only a live lease with its in-memory worker projection. A
         // terminal durable task always wins over a lagging runtime record.
-        let runtime_state = current
-            .as_ref()
-            .filter(|task| task.status == FleetTaskLedgerStatus::Leased)
-            .and(self.sub_agent_manager.as_ref())
-            .and_then(|mgr| {
-                mgr.try_read()
-                    .ok()
-                    .and_then(|guard| guard.get_worker_record(worker_id))
-                    .map(|record| FleetWorkerRuntimeProjection {
-                        agent_status: format!("{:?}", record.status).to_lowercase(),
-                        steps_taken: record.steps_taken,
-                        latest_message: record.latest_message,
-                        error: record.error,
-                        result_summary: record.result_summary,
-                        has_session: !matches!(
-                            record.status,
-                            crate::tools::subagent::AgentWorkerStatus::Completed
-                                | crate::tools::subagent::AgentWorkerStatus::Failed
-                                | crate::tools::subagent::AgentWorkerStatus::Cancelled
-                        ),
-                    })
-            });
+        let runtime_record = match (current.as_ref(), self.sub_agent_manager.as_ref()) {
+            (Some(task), Some(manager)) if task.status == FleetTaskLedgerStatus::Leased => {
+                match manager.try_read() {
+                    Ok(guard) => guard
+                        .fleet_worker_records_for_workspace(&self.workspace)
+                        .map_err(anyhow::Error::msg)?
+                        .into_iter()
+                        .find(|record| {
+                            record.spec.worker_id == worker_id
+                                && record.spec.run_id == task.entry.run_id.0
+                        }),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let runtime_state = runtime_record.map(|record| FleetWorkerRuntimeProjection {
+            agent_status: format!("{:?}", record.status).to_lowercase(),
+            steps_taken: record.steps_taken,
+            latest_message: record.latest_message,
+            error: record.error,
+            result_summary: record.result_summary,
+            has_session: !matches!(
+                record.status,
+                crate::tools::subagent::AgentWorkerStatus::Completed
+                    | crate::tools::subagent::AgentWorkerStatus::Failed
+                    | crate::tools::subagent::AgentWorkerStatus::Cancelled
+            ),
+        });
 
         Ok(FleetWorkerInspection {
             worker_id: worker_id.to_string(),
@@ -1259,8 +1269,15 @@ impl FleetManager {
             task.entry.attempts,
         );
         let record = coordination
-            .get_worker_record(worker_id)
-            .ok_or_else(|| anyhow!("Fleet worker {worker_id} has no registered launch spec"))?;
+            .fleet_worker_records_for_workspace(&self.workspace)
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .find(|record| {
+                record.spec.worker_id == worker_id && record.spec.run_id == task.entry.run_id.0
+            })
+            .ok_or_else(|| {
+                anyhow!("Fleet worker {worker_id} has no registered launch spec in its origin")
+            })?;
         let current_generation = task.entry.attempts.max(1);
         let next_generation = current_generation
             .checked_add(1)
@@ -1390,6 +1407,9 @@ impl FleetManager {
             .find(|worker| worker.id == worker_id)
             .cloned()
             .unwrap_or_else(|| default_local_worker(worker_id));
+        // Capture selected owner scope before cwd/worktree resolution. The
+        // execution target cannot manufacture a different worker origin.
+        let origin_workspace = self.workspace.clone();
         let worker_workspace = resolve_task_cwd(&self.workspace, task_spec)?;
         validate_task_cwd_for_host(&self.workspace, &worker_spec.host, &worker_workspace)?;
         let roster = self.agent_roster();
@@ -1422,7 +1442,12 @@ impl FleetManager {
                 let Ok(mut guard) = manager.try_write() else {
                     return Ok(false);
                 };
-                if let Err(error) = guard.preflight_worker_coordination(&sub_agent_worker) {
+                let origin = guard
+                    .capture_fleet_worker_origin(&origin_workspace)
+                    .map_err(anyhow::Error::msg)?;
+                if let Err(error) =
+                    guard.preflight_worker_coordination_in_origin(&sub_agent_worker, &origin)
+                {
                     tracing::debug!(
                         worker_id,
                         run_id = %entry.run_id.0,
@@ -1439,6 +1464,11 @@ impl FleetManager {
         let registration_snapshot = coordination_guard
             .as_ref()
             .map(|guard| guard.coordination_registration_snapshot());
+        let worker_origin = coordination_guard
+            .as_ref()
+            .map(|guard| guard.capture_fleet_worker_origin(&origin_workspace))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
         let mut registration_succeeded = false;
         let now = timestamp();
         let start_result = self.ledger.start_task_if_enqueued(
@@ -1461,7 +1491,12 @@ impl FleetManager {
                 // cancellation cannot win between claim and projection setup.
                 if let Some(guard) = coordination_guard.as_mut() {
                     guard
-                        .register_worker_with_coordination(sub_agent_worker)
+                        .register_worker_with_coordination_in_origin(
+                            sub_agent_worker,
+                            worker_origin
+                                .clone()
+                                .expect("coordination guard captured worker origin"),
+                        )
                         .map_err(anyhow::Error::msg)?;
                     registration_succeeded = true;
                 }
@@ -1529,7 +1564,16 @@ impl FleetManager {
                 let Ok(guard) = manager.try_read() else {
                     continue;
                 };
-                Some(guard.get_worker_record(worker_id))
+                Some(
+                    guard
+                        .fleet_worker_records_for_workspace(&self.workspace)
+                        .map_err(anyhow::Error::msg)?
+                        .into_iter()
+                        .find(|record| {
+                            record.spec.worker_id == worker_id
+                                && record.spec.run_id == task.entry.run_id.0
+                        }),
+                )
             } else {
                 None
             };
@@ -2746,6 +2790,80 @@ mod tests {
             timeout_seconds: None,
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn selected_owner_origin_survives_task_cwd_and_requires_actual_fleet_lease() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let original = root.join("original");
+        let selected = root.join("selected");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(selected.join("nested")).unwrap();
+        let coordination = crate::tools::subagent::new_shared_subagent_manager(original.clone(), 2);
+        {
+            let mut owner = coordination.try_write().unwrap();
+            for workspace in [&original, &selected] {
+                let (canonical, held) =
+                    crate::runtime_api::open_workspace_directory(workspace).unwrap();
+                owner
+                    .admit_coordination_workspace(
+                        workspace.clone(),
+                        canonical,
+                        std::sync::Arc::new(held),
+                    )
+                    .unwrap();
+            }
+        }
+        let manager = test_manager(&selected)
+            .unwrap()
+            .with_sub_agent_manager(coordination.clone());
+        let mut nested = task("nested");
+        nested.workspace = Some(FleetWorkspaceRequirements {
+            root: Some(PathBuf::from("nested")),
+            ..FleetWorkspaceRequirements::default()
+        });
+        let report = manager
+            .create_run(
+                FleetTaskSpecDocument {
+                    name: Some("captured origin".into()),
+                    labels: BTreeMap::new(),
+                    security_policy: None,
+                    workers: Vec::new(),
+                    tasks: vec![nested],
+                    usage_ceiling: None,
+                },
+                1,
+            )
+            .unwrap();
+        let ledger = manager.rebuild_state().unwrap();
+        let owner = coordination.try_read().unwrap();
+        assert!(
+            owner
+                .fleet_worker_records_for_workspace(&original)
+                .unwrap()
+                .is_empty()
+        );
+        let rows = owner.fleet_worker_records_for_workspace(&selected).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].spec.workspace, selected.join("nested"));
+        let lease = ledger.tasks.values().next().unwrap();
+        assert_eq!(rows[0].spec.run_id, report.run_id.0);
+        assert_eq!(
+            lease.leased_to.as_deref(),
+            Some(rows[0].spec.worker_id.as_str())
+        );
+        assert_eq!(lease.entry.run_id.0, rows[0].spec.run_id);
+        drop(owner);
+        std::fs::rename(&selected, root.join("retired-selected")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        assert!(
+            coordination
+                .try_read()
+                .unwrap()
+                .fleet_worker_records_for_workspace(&selected)
+                .is_err()
+        );
     }
 
     #[test]

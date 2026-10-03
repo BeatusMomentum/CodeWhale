@@ -2683,6 +2683,9 @@ pub enum MessageId {
     AuthReplacedPreviousSignIn,
     AuthSameAccountAsBefore,
     AuthEnvTokenOutranksSignIn,
+    /// Hover label for the pinned user-prompt header above the transcript:
+    /// clicking the header jumps to the user message it names.
+    PinnedPromptJumpToMessage,
 }
 
 #[allow(dead_code)]
@@ -5136,6 +5139,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::AuthReplacedPreviousSignIn,
     MessageId::AuthSameAccountAsBefore,
     MessageId::AuthEnvTokenOutranksSignIn,
+    MessageId::PinnedPromptJumpToMessage,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> Cow<'static, str> {
@@ -5560,6 +5564,38 @@ mod tests {
                 "{} fell back to the English coordination metrics note",
                 locale.tag()
             );
+        }
+    }
+
+    #[test]
+    fn context_inspector_and_command_hints_are_explicitly_localized() {
+        let ids = [
+            MessageId::CtxInspRowCompaction,
+            MessageId::CtxInspRowAnchors,
+            MessageId::CtxInspCompactionNever,
+            MessageId::CtxInspCompactionDetail,
+            MessageId::CtxInspCompactionRestored,
+            MessageId::CtxInspCompactionPathSummary,
+            MessageId::CtxInspCompactionPathPrune,
+            MessageId::CtxInspCompactionAssistantKept,
+            MessageId::CtxInspAnchorsNone,
+            MessageId::CtxInspAnchorsPresent,
+            MessageId::KbReasoningDetail,
+            MessageId::CmdTurnInspectDescription,
+            MessageId::CmdAdvisorDescription,
+        ];
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            for id in ids {
+                assert_ne!(
+                    tr(*locale, id),
+                    tr(Locale::En, id),
+                    "{} ships the English text for {id:?}",
+                    locale.tag()
+                );
+            }
         }
     }
 

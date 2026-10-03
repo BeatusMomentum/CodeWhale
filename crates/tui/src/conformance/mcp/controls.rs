@@ -23,9 +23,18 @@ use super::{
 use crate::conformance::golden;
 use crate::tools::spec::{RichToolResult, ToolError};
 
-/// Run `name` with `mutate` applied to its case, against the Rust pool.
+/// Run `name` with `mutate` against both actual production backends.
 fn mutated(name: &str, mutate: impl FnOnce(&mut Value)) -> Result<(), String> {
-    mutated_via(name, McpPoolDispatch::boxed, mutate)
+    let mut case = golden::read_case(FAMILY, name);
+    mutate(&mut case);
+    let mut errors = Vec::new();
+    for (dispatch, factory) in super::DISPATCHES {
+        match run_case(name, &case, *factory, CALL_DEADLINE, true) {
+            Ok(()) => return Ok(()), // one implementation missed the mutation
+            Err(error) => errors.push(format!("{dispatch}: {error}")),
+        }
+    }
+    Err(errors.join("\n"))
 }
 
 fn mutated_via(

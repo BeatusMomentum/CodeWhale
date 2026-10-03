@@ -2,11 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { Icon } from "@/components/icon";
 import type { RatatuiCopy } from "@/lib/content/ratatui";
 import { pickText } from "@/lib/i18n/dictionaries";
 import { motionId, previewAssetPath, searchEntries, type Catalogue, type EntryPreview } from "@/lib/ratatui/catalogue";
-import { TASKS, filterByTask, getGuidance } from "@/lib/ratatui/learning";
+import { TASKS, displayApi, filterByTask, getGuidance } from "@/lib/ratatui/learning";
+import { CodeBlock } from "./highlight";
 import { getRecipe, recipeSourceUrl, learningGuideUrl } from "@/lib/ratatui/recipes";
 import "./explorer.css";
 
@@ -20,8 +22,6 @@ type MotionTrack = {
   frames: string[];
   source: string;
 };
-
-const REPOSITORY = "https://github.com/Hmbown/codewhale-ratatui";
 
 export function CopyButton({ text, copy }: { text: string; copy: RatatuiCopy }) {
   const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");
@@ -49,10 +49,13 @@ function TerminalImage({ svg, label, fit, width, height }: { svg: string; label:
     setUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
   }, [svg]);
-  return <div className={`rat-terminal ${fit ? "rat-terminal-fit" : ""}`} role="region" aria-label={label} tabIndex={0} dir="ltr">
+  // Small buffers would sit tiny in a wide panel; vector SVGs scale without blur.
+  // Stylesheet width beats the sizing attributes, so scaled renders set it.
+  const scale = fit && width <= 60 ? 2 : 1;
+  return <div className={`rat-terminal${fit ? " rat-terminal-fit" : ""}${scale > 1 ? " rat-terminal-scaled" : ""}`} role="region" aria-label={label} tabIndex={0} dir="ltr">
     {/* next/image cannot optimize browser-owned blob URLs; the SVG retains its precise cell grid. */}
     {/* eslint-disable-next-line @next/next/no-img-element */}
-    {url && <img src={url} alt={label} width={width * 10} height={height * 20} />}
+    {url && <img src={url} alt={label} width={width * 10 * scale} height={height * 20 * scale} style={scale > 1 ? { width: width * 10 * scale, height: "auto" } : undefined} />}
   </div>;
 }
 
@@ -104,8 +107,9 @@ function MotionPlayer({ id, copy, fit }: { id: string; copy: RatatuiCopy; fit: b
 }
 
 /** This explorer switches captured library output; the interactive native host is the Cargo example. */
-export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { catalogue: Catalogue; locale: string; copy: RatatuiCopy; initialEntry?: string }) {
+export function RatatuiExplorer({ catalogue, locale, copy, initialEntry, detail }: { catalogue: Catalogue; locale: string; copy: RatatuiCopy; initialEntry?: string; detail?: boolean }) {
   const first = catalogue.entries.find((entry) => entry.name === (initialEntry ?? "showcase-work")) ?? catalogue.entries[0];
+  const router = useRouter();
   const [selected, setSelected] = useState(first.name);
   const [query, setQuery] = useState("");
   const [family, setFamily] = useState("all");
@@ -116,11 +120,25 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
   const [size, setSize] = useState("native");
   const [fit, setFit] = useState(true);
   const [tab, setTab] = useState<"preview" | "use" | "code" | "motion">("preview");
+  useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get("tab");
+    if (requested === "use" || requested === "code" || requested === "motion") setTab(requested);
+  }, []);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (tab === "preview") url.searchParams.delete("tab");
+    else url.searchParams.set("tab", tab);
+    window.history.replaceState(null, "", url);
+  }, [tab]);
   const [data, setData] = useState<EntryPreview | null>(null);
   const [error, setError] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const searchRef = useRef<HTMLInputElement>(null);
-  const filtered = useMemo(() => searchEntries(filterByTask(catalogue.entries, task), query, family), [catalogue.entries, query, family, task]);
+  const familyEntries = useMemo(() => catalogue.entries.filter((item) => item.family === first.family), [catalogue.entries, first.family]);
+  const filtered = useMemo(() => detail
+    ? familyEntries
+    : searchEntries(filterByTask(catalogue.entries, task), query, family),
+    [catalogue.entries, query, family, task, detail, familyEntries]);
   const entry = filtered.find((item) => item.name === selected) ?? filtered[0] ?? first;
   const collection = catalogue.families.find((item) => item.id === entry.family);
   const guidance = getGuidance(entry, locale);
@@ -159,12 +177,19 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
     update(); media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
-  const choose = (name: string) => { setSelected(name); setTab("preview"); if (mobile) setBrowserExpanded(false); };
+  const choose = (name: string) => {
+    if (detail) {
+      const params = tab === "preview" ? "" : `?tab=${tab}`;
+      router.push(`/${locale}/ratatui/${name}${params}`);
+      return;
+    }
+    setSelected(name); setTab("preview"); if (mobile) setBrowserExpanded(false);
+  };
   const helpers = data?.fixture.helpers?.map((helper) => helper.code).join("\n\n") ?? "";
   const example = data ? [data.fixture.imports, data.fixture.code, helpers].filter(Boolean).join("\n\n") : "";
   const clearFilters = () => { setQuery(""); setFamily("all"); setTask("all"); };
-  return <section className="rat-explorer" aria-label={copy.title}>
-    <div className="rat-task-picker">
+  return <section id="ratatui-explorer" className={`rat-explorer${detail ? " rat-detail" : ""}`} aria-label={copy.title}>
+    {!detail && <div className="rat-task-picker">
       <div><h2>{copy.tasksTitle}</h2><p>{copy.tasksDescription}</p></div>
       <div className="rat-task-options" role="group" aria-label={copy.tasksTitle}>
         <button type="button" className="rat-button" aria-pressed={task === "all"} onClick={clearFilters}>{copy.allComponents}</button>
@@ -174,8 +199,15 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
         }}>{pickText(item.label, locale)}</button>)}
       </div>
       {task !== "all" && <p className="rat-task-description">{pickText(TASKS.find((item) => item.id === task)!.description, locale)}</p>}
-    </div>
-    <aside className="rat-browser" aria-label={copy.componentNavLabel}>
+    </div>}
+    {detail ? <aside className="rat-browser rat-family-index" aria-label={collection?.title ?? copy.componentNavLabel}>
+      <h2>{collection?.title}</h2>
+      <p className="rat-count" role="status">{copy.familyPosition.replace("{index}", String(currentIndex + 1)).replace("{count}", String(filtered.length))}</p>
+      <nav className="rat-entry-list" aria-label={collection?.title}>
+        {filtered.map((candidate) => <Link key={candidate.name} href={`/${locale}/ratatui/${candidate.name}`} className="rat-entry" aria-current={candidate.name === entry.name ? "page" : undefined}><span>{candidate.title}</span><span className="rat-entry-width">{candidate.width}</span></Link>)}
+      </nav>
+      <Link href={`/${locale}/ratatui`} className="rat-link rat-index-back">{copy.back}<Icon name="arrow-right" className="rat-prev-icon" /></Link>
+    </aside> : <aside className="rat-browser" aria-label={copy.componentNavLabel}>
       <label className="rat-search" htmlFor="rat-search"><span>{copy.searchLabel}</span><div><Icon name="search" /><input id="rat-search" ref={searchRef} type="search" value={query} placeholder={copy.searchPlaceholder} onChange={(event) => { setQuery(event.target.value); if (mobile) setBrowserExpanded(true); }} onKeyDown={(event) => { if (event.key === "Escape") setQuery(""); }} /><kbd>/</kbd></div></label>
       <label className="rat-family-field" htmlFor="rat-family">{copy.families}<select id="rat-family" value={family} onChange={(event) => { setFamily(event.target.value); setTask("all"); if (mobile) setBrowserExpanded(true); }}><option value="all">{copy.allComponents}</option>{catalogue.families.map((item) => <option key={item.id} value={item.id}>{item.title} ({item.count})</option>)}</select></label>
       <p className="rat-count" role="status">{copy.visibleCount.replace("{visible}", String(filtered.length)).replace("{total}", String(catalogue.entries.length))}</p>
@@ -183,13 +215,13 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
       <nav className="rat-entry-list" aria-label={copy.resultsLabel}>
         {catalogue.families.map((item) => {
           const entries = filtered.filter((candidate) => candidate.family === item.id);
-          return entries.length ? <div className="rat-family" key={item.id}><h3>{item.title}</h3>{entries.map((candidate) => <button type="button" key={candidate.name} className="rat-entry" aria-current={candidate.name === entry.name ? "true" : undefined} onClick={() => choose(candidate.name)}><span>{candidate.title}</span><span className="rat-entry-width">{candidate.width}</span></button>)}</div> : null;
+          return entries.length ? <div className="rat-family" key={item.id}><h3>{item.title} <span className="rat-family-count">{entries.length}</span></h3>{entries.map((candidate) => <button type="button" key={candidate.name} className="rat-entry" aria-current={candidate.name === entry.name ? "true" : undefined} onClick={() => choose(candidate.name)}><span>{candidate.title}</span><span className="rat-entry-width">{candidate.width}</span></button>)}</div> : null;
         })}
       </nav></details>
-    </aside>
+    </aside>}
     {filtered.length === 0 ? <div className="rat-study rat-empty-study"><h2>{copy.emptyTitle}</h2><p>{copy.emptyDescription}</p><button className="rat-button" onClick={clearFilters}>{copy.clearSearch}</button></div> : <div className="rat-study">
-      <div className="rat-study-heading"><div><p>{collection?.title}</p><h2>{entry.title}</h2></div><Link href={`/${locale}/ratatui/${entry.name}`} className="rat-link" title={copy.share}>{copy.share}<Icon name="external" /></Link></div>
-      <p className="rat-description">{entry.description}</p>
+      {!detail && <><div className="rat-study-heading"><div><p>{collection?.title}</p><h2>{entry.title}</h2></div>{initialEntry !== entry.name && <Link href={`/${locale}/ratatui/${entry.name}`} className="rat-link" title={copy.share}>{copy.share}<Icon name="arrow-right" /></Link>}</div>
+      <p className="rat-description">{entry.description}</p></>}
       <div className="rat-study-tabs" role="group" aria-label={copy.preview}>
         <button type="button" aria-pressed={activeTab === "preview"} onClick={() => setTab("preview")}>{copy.preview}</button>
         <button type="button" aria-pressed={activeTab === "use"} onClick={() => setTab("use")}>{copy.use}</button>
@@ -199,18 +231,17 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
       </div>
       {(activeTab === "preview" || activeTab === "motion") && <div className="rat-preview-controls">{(activeTab !== "motion" || !["whale", "habitat"].includes(animation ?? "")) && <label className="rat-field">{copy.profile}<select aria-label={copy.profile} value={profile} onChange={(event) => setProfile(event.target.value)}>{catalogue.profiles.filter((item) => activeTab !== "motion" || ["dark-truecolor", "light-truecolor"].includes(item.id)).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}{activeTab === "preview" && <label className="rat-field">{copy.size}<select aria-label={copy.size} value={size} onChange={(event) => setSize(event.target.value)}>{catalogue.sizes.map((item) => <option key={item.id} value={item.id}>{item.id === "native" ? copy.nativeSize : copy.columns.replace("{count}", item.id)}</option>)}</select></label>}<button type="button" className="rat-button rat-scale" onClick={() => setFit(!fit)} aria-pressed={!fit}>{fit ? copy.actualSize : copy.fit}</button></div>}
       {activeTab === "use" ? <div className="rat-code-panel rat-usage-panel">
-        <h3>{guidance.title}</h3><p>{guidance.description}</p><p className="rat-note">{guidance.hostNote}</p>
-        {recipe && <><div className="rat-code-heading"><h4>{copy.use}</h4><CopyButton text={recipe.code} copy={copy} /></div><pre tabIndex={0} dir="ltr"><code>{recipe.code}</code></pre><p className="rat-note">{copy.recipeNote} <a href={recipeSourceUrl(recipe.line)}>{copy.openSource}<Icon name="external" /></a></p></>}
+        <p>{guidance.description}</p><p className="rat-note">{guidance.hostNote}</p>
+        {recipe && <><div className="rat-code-heading"><h4>{copy.use}</h4><CopyButton text={recipe.code} copy={copy} /></div><CodeBlock code={recipe.code} language="rust" /><p className="rat-note">{copy.recipeNote} <a href={recipeSourceUrl(recipe.line)}>{copy.openSource}<Icon name="external" /></a></p></>}
         <div className="rat-usage-links"><a className="rat-link" href={learningGuideUrl(guidance.guideAnchor)}>{copy.guide}<Icon name="external" /></a><Link className="rat-link" href={`/${locale}/ratatui#ratatui-install`}>{copy.gettingStarted}<Icon name="arrow-right" /></Link></div>
-        <p className="rat-note">{copy.runExample}</p><pre tabIndex={0} dir="ltr"><code>{`cargo run --locked --example ${recipe ? "recipes" : guidance.example.replace(/^examples\//, "").replace(/\.rs$/, "")}`}</code></pre>{recipe && <p className="rat-note">{copy.recipeControls}</p>}
+        <p className="rat-note">{copy.runExample}</p><CodeBlock code={`cargo run --locked --example ${recipe ? "recipes" : guidance.example.replace(/^examples\//, "").replace(/\.rs$/, "")}`} language="sh" />{recipe && <p className="rat-note">{copy.recipeControls}</p>}
       </div> :
-      activeTab === "motion" && animation ? <MotionPlayer key={animation} id={animation} copy={copy} fit={fit} /> : activeTab === "code" ? <div className="rat-code-panel"><div className="rat-code-heading"><h3>{copy.fixtureTitle}</h3><CopyButton text={example} copy={copy} /></div>{data ? <pre tabIndex={0} dir="ltr"><code>{example}</code></pre> : <div className="rat-load" role={error ? "alert" : "status"}><p>{error ? copy.previewError : copy.loading}</p>{error && <button className="rat-button" onClick={() => setAttempt((value) => value + 1)}>{copy.retry}</button>}</div>}<p className="rat-note">{copy.fixtureNote} <a href={sourceUrl}>{copy.openSource}<Icon name="external" /></a></p></div> : <>
+      activeTab === "motion" && animation ? <MotionPlayer key={animation} id={animation} copy={copy} fit={fit} /> : activeTab === "code" ? <div className="rat-code-panel"><div className="rat-code-heading"><h3>{copy.fixtureTitle}</h3><CopyButton text={example} copy={copy} /></div>{data ? <CodeBlock code={example} language="rust" /> : <div className="rat-load" role={error ? "alert" : "status"}><p>{error ? copy.previewError : copy.loading}</p>{error && <button className="rat-button" onClick={() => setAttempt((value) => value + 1)}>{copy.retry}</button>}</div>}<p className="rat-note">{copy.fixtureNote} <a href={sourceUrl}>{copy.openSource}<Icon name="external" /></a></p></div> : <>
         {error ? <div className="rat-load" role="alert"><p>{copy.previewError}</p><button className="rat-button" type="button" onClick={() => setAttempt((value) => value + 1)}>{copy.retry}</button></div> : svg ? <TerminalImage svg={svg} label={label} fit={fit} width={columns} height={entry.height} /> : <div className="rat-load" role="status">{copy.previewLoading}</div>}
         <div className="rat-preview-meta"><span>{columns} × {entry.height}</span><span>{profile}</span>{svg && <a className="rat-link" href={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`} download={`${entry.name}.${profile}.${size}.svg`}>{copy.downloadSvg}<Icon name="external" /></a>}</div>
         <p className="rat-note">{copy.renderedPreviewNote}</p>
       </>}
-      <div className="rat-api"><h3>{copy.api}</h3><div>{entry.api.map((symbol) => <a key={symbol} href={sourceUrl}><code>{symbol}</code></a>)}</div><p>{copy.hostNote}</p></div>
-      <div className="rat-project"><h3>{copy.projectStatus}</h3><div className="rat-project-links"><a href={`${REPOSITORY}/commit/${catalogue.source.revision}`}>{copy.sourceRevision}<code>{catalogue.source.revision.slice(0, 7)}</code></a><a href={`${REPOSITORY}/actions/workflows/ci.yml?query=branch%3Amain`}>{copy.buildChecks}<Icon name="external" /></a><a href={`${REPOSITORY}/actions/workflows/gallery.yml?query=branch%3Amain`}>{copy.galleryChecks}<Icon name="external" /></a><a href={`${REPOSITORY}/releases`}>{copy.releaseHistory}<Icon name="external" /></a></div></div>
+      <div className="rat-api"><h3>{copy.api}</h3><div>{displayApi(entry).map((symbol) => <a key={symbol} href={sourceUrl}><code>{symbol}</code></a>)}</div><p>{copy.hostNote}</p></div>
     </div>}
   </section>;
 }

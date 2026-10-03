@@ -152,6 +152,9 @@ pub struct ExtensionCommandRef {
     /// The workspace whose user registry loaded the command: what the handler
     /// is told as the place the user ran it.
     pub workspace: std::path::PathBuf,
+    pub selection: Option<super::composition_scope::SelectionRevision>,
+    pub scope: Option<super::protocol::EntryRef>,
+    pub content_hash: String,
 }
 
 /// One live command as the user registry loads it.
@@ -163,6 +166,7 @@ pub struct ExtensionCommandEntry {
     pub authority: PluginAuthority,
     /// The workspace this entry was loaded for.
     pub workspace: std::path::PathBuf,
+    pub selection: Option<super::composition_scope::SelectionRevision>,
 }
 
 impl ExtensionCommandEntry {
@@ -174,6 +178,9 @@ impl ExtensionCommandEntry {
             generation: self.registration.owner.generation,
             origin: format!("extension:{}", self.registration.plugin_name),
             workspace: self.workspace.clone(),
+            selection: self.selection,
+            scope: self.registration.scope.clone(),
+            content_hash: self.registration.content_hash.clone(),
         }
     }
 }
@@ -237,7 +244,26 @@ pub(crate) async fn run(
     raw_input: &str,
     session_id: Option<&str>,
 ) -> Result<CommandOutcome, String> {
+    let bound = command
+        .selection
+        .and_then(|revision| shared.plugins_for_selection(revision, session_id));
+    let caller = bound.as_ref().map(|(plugins, _)| Arc::clone(plugins));
+    let agent_id = bound.and_then(|(_, agent_id)| agent_id);
+    shared.check_selection(
+        command.selection,
+        caller.as_deref(),
+        &command.plugin_id,
+        &command.content_hash,
+        command.scope.as_ref(),
+    )?;
     let (host, registration) = shared.live_host_for_command(command).await?;
+    shared.check_selection(
+        command.selection,
+        caller.as_deref(),
+        &command.plugin_id,
+        &command.content_hash,
+        command.scope.as_ref(),
+    )?;
     let deadline = shared.options.supervision.command_run_deadline;
     let request = CoreRequest::CommandRun(CommandRunParams {
         handle: registration.handle,
@@ -246,13 +272,28 @@ pub(crate) async fn run(
         deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
         workspace: command.workspace.to_str().map(str::to_owned),
         session_id: session_id.filter(|id| !id.is_empty()).map(str::to_owned),
-        agent_id: None,
+        agent_id,
         origin_turn_id: None,
     });
     let value: Value = host
         .call(request, Some(registration.owner.plugin_id.clone()))
         .await
         .map_err(map_call_error)?;
+    shared.check_selection(
+        command.selection,
+        caller.as_deref(),
+        &command.plugin_id,
+        &command.content_hash,
+        command.scope.as_ref(),
+    )?;
+    shared.live_host_for_command(command).await?;
+    shared.check_selection(
+        command.selection,
+        caller.as_deref(),
+        &command.plugin_id,
+        &command.content_hash,
+        command.scope.as_ref(),
+    )?;
     let wire: CommandResultWire = serde_json::from_value(value)
         .map_err(|error| format!("returned a malformed result: {error}"))?;
     match wire {

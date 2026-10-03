@@ -30,6 +30,20 @@ fn params_schema(method: &str, generator: &mut SchemaGenerator) -> Schema {
         "tool/call" => generator.subschema_for::<ToolCallParams>(),
         "command/run" => generator.subschema_for::<CommandRunParams>(),
         "hook/evaluate" => generator.subschema_for::<HookEvaluateParams>(),
+        "harness/run" => generator.subschema_for::<HarnessRunParams>(),
+        "exec/redeem" => generator.subschema_for::<ExecutionRedeemParams>(),
+        "mcp/open" => generator.subschema_for::<McpOpenParams>(),
+        "mcp/request" => generator.subschema_for::<McpRequestParams>(),
+        "mcp/close" => generator.subschema_for::<McpCloseParams>(),
+        "proc/launch" => generator.subschema_for::<ProcLaunchParams>(),
+        "proc/read" => generator.subschema_for::<ProcSessionParams>(),
+        "proc/write" => generator.subschema_for::<ProcWriteParams>(),
+        "proc/close" => generator.subschema_for::<ProcSessionParams>(),
+        "net/start" => generator.subschema_for::<ProcLaunchParams>(),
+        "net/fetch" => generator.subschema_for::<NetFetchParams>(),
+        "net/read" | "net/release" => generator.subschema_for::<NetReadParams>(),
+        "net/close" => generator.subschema_for::<ProcSessionParams>(),
+
         "$/cancel" => generator.subschema_for::<CancelParams>(),
         "host/hello" => generator.subschema_for::<HelloParams>(),
         "registry/register" => generator.subschema_for::<RegisterParams>(),
@@ -86,6 +100,25 @@ fn parse_ty(at: &str, schema: &Value) -> Ty {
     };
     if let Some(name) = ref_name(schema) {
         return Ty::Ref(name);
+    }
+    // Optional object fields use anyOf(ref, null), while scalar options use a
+    // nullable type array below. Normalize both to the present field's type:
+    // Rust omits None and the host requires a valid value when a field exists.
+    if let Some(variants) = object.get("anyOf").and_then(Value::as_array)
+        && variants.len() == 2
+        && variants
+            .iter()
+            .filter(|variant| variant.get("type").and_then(Value::as_str) == Some("null"))
+            .count()
+            == 1
+    {
+        return parse_ty(
+            at,
+            variants
+                .iter()
+                .find(|variant| variant.get("type").and_then(Value::as_str) != Some("null"))
+                .expect("one non-null variant"),
+        );
     }
     if let Some(value) = object.get("const").and_then(Value::as_str) {
         return Ty::Const(value.to_string());
@@ -463,6 +496,76 @@ const CORE_ONLY: &[&str] = &[
 /// Every method, with why it gives the host no core authority. Adding a
 /// method means adding its row here, in review, with that reason.
 const REVIEWED: &[(&str, &str, &str)] = &[
+    (
+        "core_to_host",
+        "harness/run",
+        "pinned Builtin orchestration of an opaque exact Rust-gated job; no launch, environment, approval or session writer",
+    ),
+    (
+        "host_to_core",
+        "exec/redeem",
+        "Builtin-only host:harness; one single-use Execution grant for a Rust-held caller and prepared launch, current owner/generation/selection checks and bounded process cleanup",
+    ),
+    (
+        "host_to_core",
+        "net/start",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/fetch",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/read",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/release",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "host_to_core",
+        "net/close",
+        "builtin only; opaque Rust HTTP session selectors and exact decoded operation tickets, shared OAuth/egress authority, bounded revocable response reads, no credential exposure",
+    ),
+    (
+        "core_to_host",
+        "mcp/open",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "core_to_host",
+        "mcp/request",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "core_to_host",
+        "mcp/close",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/launch",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/read",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/write",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
+    (
+        "host_to_core",
+        "proc/close",
+        "builtin only; Rust mints exact owner/host-generation operation tickets, owns spawn and validates the decoded frame before a pipe write; the SDK only executes the admitted protocol exchange",
+    ),
     (
         "core_to_host",
         "host/initialize",

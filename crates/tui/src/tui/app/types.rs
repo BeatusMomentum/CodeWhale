@@ -90,7 +90,7 @@ impl AppModeUi for AppMode {
 /// intentionally do not persist raw endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheReplayTarget {
-    pub(crate) provider: ApiProvider,
+    pub(crate) provider: ProviderKind,
     pub(crate) provider_identity: String,
     /// Additive exact provider id used by persisted-route resolution.
     /// `None` is meaningful for the legacy root-level `custom` route.
@@ -553,7 +553,7 @@ pub enum AppAction {
     /// Open the `/provider` picker in setup/catalog mode, optionally focused on
     /// a built-in provider that needs credentials before first use.
     OpenProviderSetup {
-        provider: Option<ApiProvider>,
+        provider: Option<codewhale_config::ProviderId>,
     },
     /// Open the named, keyless DS4 local-runtime preset for review and save.
     OpenDs4Setup,
@@ -585,6 +585,11 @@ pub enum AppAction {
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.
     OpenFeedbackPicker,
+    /// Read/review a scoped immutable issue draft without parking the UI.
+    ReviewIssueReport {
+        id: String,
+        change: Option<String>,
+    },
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
     /// Open the `/skills manage` manager — audit inventory + owned mutations.
@@ -727,13 +732,13 @@ pub enum AppAction {
     /// the updated config. `model` overrides the post-switch model
     /// (already normalized but not yet provider-prefixed).
     SwitchProvider {
-        provider: ApiProvider,
+        provider: codewhale_config::ProviderId,
         model: Option<String>,
     },
     /// Switch provider+model through the same apply path as a `/model` route
     /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
     SwitchModelRoute {
-        provider: ApiProvider,
+        identity: crate::config::ProviderIdentity,
         model: String,
     },
     UpdateCompaction(CompactionConfig),

@@ -357,7 +357,27 @@ impl SkillProvenance {
             Self::NativeRoot(source) => &source.authority,
         }
     }
+    pub(crate) fn verify_for(
+        &self,
+        workspace: &Path,
+        plugins: Option<&crate::plugins::PluginRegistry>,
+    ) -> Result<(), String> {
+        if let Self::NativeRoot(source) = self {
+            crate::extension_host::manager().shared.check_selection(
+                source.registration.selection,
+                plugins,
+                source.authority.plugin_id.as_str(),
+                &source.authority.content_hash,
+                source.registration.scope.as_ref(),
+            )?;
+        }
+        self.verify_current(workspace)
+    }
+    #[cfg(test)]
     pub(crate) fn verify(&self, workspace: &Path) -> Result<(), String> {
+        self.verify_for(workspace, None)
+    }
+    fn verify_current(&self, workspace: &Path) -> Result<(), String> {
         let authority = self.authority();
         if authority.workspace != workspace {
             return Err("plugin skill belongs to a different workspace".to_string());

@@ -13,12 +13,16 @@ import * as schemastery from '@deepseek-ai/schemastery'
 import * as cosmokit from '@deepseek-ai/cosmokit'
 import * as dshUtilValues from '@deepseek-ai/dsh-util-values'
 import * as dshToolsCompat from './dsh/dsh-tools-compat.js'
+import * as dshComposition from './dsh/composition.ts'
+import * as dshLoader from './dsh/upstream/loader/src/index.ts'
+import * as dshInclude from './dsh/upstream/include/src/index.ts'
 import { installResolveHooks } from './dsh/resolve-hooks.ts'
-import { ErrorCode, FrameDecoder, encodeFrame, PROTOCOL_VERSION, type Message } from './protocol.ts'
+import { ErrorCode, FrameDecoder, encodeFrame, PROTOCOL_VERSION, type Message, type HarnessRunParams, type McpOpenParams, type McpRequestParams, type McpCloseParams } from './protocol.ts'
 import { RpcError, RpcPeer } from './rpc.ts'
 import { HostRoot, ownerStorage } from './root.ts'
 import { RUNTIME, applyMemoryLimit, denyNativeCode } from './runtime.ts'
 import { builtinModuleDigests, parseTier } from './tier.ts'
+import { windowsSandboxProbe } from './windows-sandbox-probe.mjs'
 
 export const HOST_VERSION = '0.1.0'
 
@@ -33,6 +37,19 @@ const TIER = (() => {
     return process.exit(64)
   }
 })()
+
+// Fixed diagnostic mode is selected only by Core before Native admission. It
+// works in the compiled image too, without inventing a second host executable.
+if (process.argv.includes('--windows-sandbox-probe')) {
+  if (process.platform !== 'win32' || TIER !== 'plugin') process.exit(64)
+  try {
+    process.stdout.write(JSON.stringify(await windowsSandboxProbe()) + '\n')
+    process.exit(0)
+  } catch (error) {
+    process.stderr.write(`Windows sandbox probe: ${(error as Error).message}\n`)
+    process.exit(70)
+  }
+}
 
 // 0b. The kernel memory limit the core asked for (macOS + Bun). This may
 //     re-execute the process in place (argv, and so the tier, are kept), so it
@@ -65,11 +82,20 @@ installResolveHooks({
   cosmokit: cosmokit as unknown as Record<string, unknown>,
   'dsh-util-values': dshUtilValues as unknown as Record<string, unknown>,
   'dsh-tools': dshToolsCompat as unknown as Record<string, unknown>,
+  'dsh-composition': dshComposition as unknown as Record<string, unknown>,
+  'dsh-loader': dshLoader as unknown as Record<string, unknown>,
+  'dsh-include': dshInclude as unknown as Record<string, unknown>,
+  'dsh-group': { default: dshLoader.Group },
   // `@deepseek-ai/dsh-commands/brand`: the brands are plain strings at runtime.
   'dsh-commands-brand': { CommandDefinitionId: (id: string) => id, CommandId: (id: string) => id },
 })
 
+// Only the release compiler defines this constant. Runtime environments never
+// supply it: the compiled image still identifies the canonical embedded source.
+declare const CODEWHALE_COMPILED_BUNDLE_SHA256: string | undefined
+
 function bundleDigest(): string {
+  if (typeof CODEWHALE_COMPILED_BUNDLE_SHA256 === 'string') return CODEWHALE_COMPILED_BUNDLE_SHA256
   try {
     return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex')
   } catch {
@@ -155,7 +181,7 @@ rpc.onRequest('ext/activate', async (params: any) => {
 
 rpc.onRequest('ext/deactivate', async (params: any) => {
   requireInitialized()
-  return host.deactivate(params.owner)
+  return host.deactivate(params.owner, params.entry)
 })
 
 rpc.onRequest('tool/call', async (params: any, cx) => {
@@ -172,6 +198,11 @@ rpc.onRequest('hook/evaluate', async (params: any, cx) => {
   requireInitialized()
   return host.evaluateHook(params, cx.signal)
 })
+
+rpc.onRequest('harness/run', async (params, cx) => { requireInitialized(); return host.harnessRun(params as HarnessRunParams, cx.signal) })
+rpc.onRequest('mcp/open', async (params, cx) => { requireInitialized(); return host.mcpOpen(params as McpOpenParams, cx.signal) })
+rpc.onRequest('mcp/request', async (params, cx) => { requireInitialized(); return host.mcpRequest(params as McpRequestParams, cx.signal) })
+rpc.onRequest('mcp/close', async (params) => { requireInitialized(); return host.mcpClose(params as McpCloseParams) })
 
 rpc.onRequest('host/shutdown', async () => {
   await host.deactivateAll(2_000)

@@ -202,20 +202,20 @@ Sessions, settings, pickers and work panels built from reusable native parts.
 
 <a id="the-native-composer-and-footer"></a>
 <details>
-<summary>The native composer and footer · 20 examples</summary>
+<summary>The native composer and footer · 22 examples</summary>
 
 Composer geometry, permission and mode, workflow rows and model/context metrics.
 
-![Native composer, Native composer narrow, Native composer quiet, Native composer target, Workflow progress live, Workflow progress settled, Workflow progress queued, Workflow progress narrow, Posture bar, Posture narrow, Posture context cap, Posture compact, Metrics line, Metrics narrow, Metrics compact, Metrics startup, Workflow tree, Workflow tree selected — dark truecolor](<assets/readme/native-chrome.dark-truecolor-1.svg>)
+![Native composer rich selection, Native composer rich search, Native composer, Native composer narrow, Native composer quiet, Native composer target, Workflow progress live, Workflow progress settled, Workflow progress queued, Workflow progress narrow, Posture bar, Posture narrow, Posture context cap, Posture compact, Metrics line — dark truecolor](<assets/readme/native-chrome.dark-truecolor-1.svg>)
 
-![Workflow tree clipped, Workflow tree long — dark truecolor](<assets/readme/native-chrome.dark-truecolor-2.svg>)
+![Metrics narrow, Metrics compact, Metrics startup, Workflow tree, Workflow tree selected, Workflow tree clipped, Workflow tree long — dark truecolor](<assets/readme/native-chrome.dark-truecolor-2.svg>)
 
 <details>
 <summary>Light appearance</summary>
 
-![Native composer, Native composer narrow, Native composer quiet, Native composer target, Workflow progress live, Workflow progress settled, Workflow progress queued, Workflow progress narrow, Posture bar, Posture narrow, Posture context cap, Posture compact, Metrics line, Metrics narrow, Metrics compact, Metrics startup, Workflow tree, Workflow tree selected — light truecolor](<assets/readme/native-chrome.light-truecolor-1.svg>)
+![Native composer rich selection, Native composer rich search, Native composer, Native composer narrow, Native composer quiet, Native composer target, Workflow progress live, Workflow progress settled, Workflow progress queued, Workflow progress narrow, Posture bar, Posture narrow, Posture context cap, Posture compact, Metrics line — light truecolor](<assets/readme/native-chrome.light-truecolor-1.svg>)
 
-![Workflow tree clipped, Workflow tree long — light truecolor](<assets/readme/native-chrome.light-truecolor-2.svg>)
+![Metrics narrow, Metrics compact, Metrics startup, Workflow tree, Workflow tree selected, Workflow tree clipped, Workflow tree long — light truecolor](<assets/readme/native-chrome.light-truecolor-2.svg>)
 
 </details>
 
@@ -283,7 +283,7 @@ Sixteen source presets with their actual backgrounds, status, permission and mod
 
 <a id="codewhale-water-and-ombres"></a>
 <details>
-<summary>Codewhale water and ombres · 9 examples</summary>
+<summary>Codewhale water and ombres · 10 examples</summary>
 
 The current TUI ocean, plus optional Lagoon, Dusk, Coral and Graphite treatments.
 
@@ -305,6 +305,8 @@ The current TUI ocean, plus optional Lagoon, Dusk, Coral and Graphite treatments
 
 ![Ocean reduced — dark truecolor](<assets/readme/water.dark-truecolor-9.svg>)
 
+![Ocean native guarded — dark truecolor](<assets/readme/water.dark-truecolor-10.svg>)
+
 <details>
 <summary>Light appearance</summary>
 
@@ -325,6 +327,8 @@ The current TUI ocean, plus optional Lagoon, Dusk, Coral and Graphite treatments
 ![Ocean context — light truecolor](<assets/readme/water.light-truecolor-8.svg>)
 
 ![Ocean reduced — light truecolor](<assets/readme/water.light-truecolor-9.svg>)
+
+![Ocean native guarded — light truecolor](<assets/readme/water.light-truecolor-10.svg>)
 
 </details>
 
@@ -391,16 +395,16 @@ Headings, tabs, toggles and keyboard maps.
 
 <a id="conversation-and-queued-input"></a>
 <details>
-<summary>Conversation and queued input · 10 examples</summary>
+<summary>Conversation and queued input · 12 examples</summary>
 
 Rich prose, code, attached context and the next instruction.
 
-![Pending queued, Pending steering, Pending paused, Pending context, Pending native mixed, Pending native queued, Transcript prose, Transcript list table, Transcript code, Transcript links — dark truecolor](<assets/readme/transcript.dark-truecolor.svg>)
+![Pending queued, Pending steering, Pending paused, Pending context, Pending native mixed, Pending native queued, Transcript mounted, Transcript mounted focus, Transcript prose, Transcript list table, Transcript code, Transcript links — dark truecolor](<assets/readme/transcript.dark-truecolor.svg>)
 
 <details>
 <summary>Light appearance</summary>
 
-![Pending queued, Pending steering, Pending paused, Pending context, Pending native mixed, Pending native queued, Transcript prose, Transcript list table, Transcript code, Transcript links — light truecolor](<assets/readme/transcript.light-truecolor.svg>)
+![Pending queued, Pending steering, Pending paused, Pending context, Pending native mixed, Pending native queued, Transcript mounted, Transcript mounted focus, Transcript prose, Transcript list table, Transcript code, Transcript links — light truecolor](<assets/readme/transcript.light-truecolor.svg>)
 
 </details>
 
@@ -746,19 +750,19 @@ on their next paint; components hold roles rather than cached colors.
 |---|---|---|
 | Optional workspace composition | `WorkspaceFrame`, `WorkspaceAreas`, `PaneHeader`, `ContextRibbon`, `ContextItem` | Responsive conversation and dock regions, one quiet module header, composer-adjacent facts folded by priority with explicit counts |
 | Native shell | `TerminalShell`, `ShellAreas` | Current conversation → pending input → composer → posture → workflows → metrics → workbar ordering |
-| Native workbar | `Workbar`, `WorkbarPanel`, `WorkbarRow`, `WorkbarState` | All eight panels, goals, row selection, keyboard outcomes, scrolling, hitboxes and bottom/top/side placement |
+| Native workbar | `Workbar`, `WorkbarPanel`, `WorkbarRow`, `WorkbarState`, `WorkbarLayout`, `WorkbarScrollbar`, `DockTabRow`, `DockTabPlan`, `DockTabStyles`, `DockTabTarget` | All eight panels, goals, row selection, keyboard outcomes, scrolling, hitboxes and bottom/top/side placement |
 | Native composer and workflow rows | `NativeComposer`, `WorkflowProgress`, `WorkflowRun` | Rounded input enclosure, prompt, submit control, target chip and borderless workflow progress |
 | Native footer | `PostureBar`, `MetricsLine`, `MetricSegment` | Permission and mode, clocks, live counts, context warnings and width-aware model/usage facts |
 | Native views | `InstrumentSurface`, `SessionList`, `SessionRow` | TUI title/action rails, quiet gutters, session selection, ranges, search and rename presentation |
 | TUI themes | `TuiPalette`, `TuiInk` | All 16 fixed source palettes, exact grounds and distinct native permission/mode/status inks |
 | Attention and results | `AttentionQueue`, `AttentionItem`, `ArtifactShelf`, `Artifact` | Project-aware decisions, selected action hints, review/file/run/link results and reported receipts |
 | Marine life | `Habitat`, `FishSchool`, `Jellyfish`, `BubbleField`, `HabitatDensity` | Native braille poses and ASCII silhouettes, caller-clock motion, bounded populations, complete visitors and text-safe open-water collision |
-| Water and palette | `OceanColumn`, `OceanRamp`, `OceanPhase`, `Ombre`, `WaterPalette` | Native TUI depth column, context rise, steady attention tint, completion breath and five spatial materials; contrast and fallback guards |
+| Water and palette | `OceanColumn`, `OceanRamp`, `OceanPhase`, `OceanPaintFacts`, `OceanCausticFacts`, `OceanContrastInks`, `ocean_semantic_surfaces`, `Ombre`, `WaterPalette` | Native TUI depth column, context rise, steady attention tint, completion breath and five spatial materials; contrast and fallback guards |
 | Living whale | `whale_motion::Stage`, `Director`, `ColoredGrid` | One session performance, authored clips and springs, native colored props, shared terminal cadence and hide/resume boundaries |
 | Session surfaces | `Message`, `ToolCard`, `Composer`, `AgentCard`, `Fleet` | Speaker anchors, output rails, honest omission counts, caller-owned prompts and each agent's own state, route and task |
 | Pending input | `PendingInputPreview`, `PendingInputItem`, `ContextPreviewItem`, `PendingCard` | Queued, steering, editing, paused and in-flight input; native composer preview over localized caller facts; context and host-dispatched actions |
 | Rich transcript | `Transcript`, `TranscriptBlock`, `TranscriptSpan`, `CodeBlock` | Authored headings, prose, quotes, lists, tables and numbered code; exact copy source and out-of-band links |
-| Identity and state | `Whale`, `WhaleState`, `Icon`, `StatusMark`, `StateWords` | The v2 whale's 17 actions and pods; marks always paired with words; localized state labels |
+| Identity and state | `BrailleFrame`, `Whale`, `WhaleState`, `Icon`, `StatusMark`, `StateWords` | The v2 whale's 17 actions and pods; marks always paired with words; localized state labels |
 | Surfaces | `Panel`, `Depth`, `Dialog`, `Sheet`, `HorizonRule` | Deep, stage, raised and overlay grounds; centered decisions, edge-anchored sheets and the composer ledge |
 | Navigation | `Heading`, `Tabs`, `KeyHints`, `Keymap`, `Picker`, `List` | Shared heading hierarchy, selection, scrolling, keyboard labels and caller-owned outcomes |
 | Input and controls | `TextInput`, `Form`, `Toggle`, `Segmented` | Unicode-aware editing, masked fields, validation and controls that explain disabled state |
@@ -971,3 +975,84 @@ The gallery's `approval-native-band` and collapsed companion use this real API.
 The existing bordered `ApprovalCard` keeps its verbatim-subject and caller-key
 contract. The band accepts host-projected display lines; it does not reparse
 commands, infer policy or construct permission rules.
+
+### Mounted composer row plan
+
+`NativeComposerFrame` projects host-owned scalar cursor/selection, localized
+styled copy, completion/history menu facts and live styles through one pure
+layout/paint/caret/viewport/pointer plan. Raw source positions retain hidden
+characters; display content is guarded before width measurement and paint.
+`NativeComposer` uses the same plan and keeps its existing grapheme cursor
+API. The actual `native-composer-rich-selection` and `native-composer-rich-search` gallery
+entries show both presentations. Editing, bindings, IME, completion filtering
+and submit dispatch stay with the host.
+
+
+### Mounted transcript viewport
+
+`TranscriptViewport` projects host-parsed styled rows through one clipped
+content/chrome plan, retaining pinned rows, offsets, semantic styles and exact
+scrollbar/jump geometry. `TranscriptViewportPlan::link_rects` returns only
+visible cells and excludes opaque jump chrome; targets never enter kit data.
+The measured selection helper accepts a host's existing terminal column grammar
+without owning its parser, clipboard, streaming cache or selection state.
+Staged content/chrome paint lets a host retain semantic Ocean finishing between
+them. The actual `transcript-mounted` and `transcript-mounted-focus` gallery
+entries use this API. Existing authored `Transcript`/`TranscriptBlock` remain
+the structured content option; this viewport does not reparse native rows.
+
+
+`ocean::OceanPaintFacts` carries cached absolute-row colors and protected
+semantic rectangles into `OceanColumn::apply_native`; its ink callback returns
+the exact color the host backend would show over the proposed water without
+changing source cells. `OceanContrastInks` maps the same decorative/supporting
+contrast floors to actual live palette colors. `ocean_semantic_surfaces`
+projects display-safe prewrapped styled rows using the host's column grammar;
+`TranscriptViewportPlan::display_rows()` supplies its exact pinned/offset rows;
+explicit backgrounds remain semantic even if their RGB equals a pane base.
+`apply_caustics` finishes only already painted ordinary water, shares capability
+and reduced-motion gates, and spares visible symbols, reversed cells and
+semantic padding. Both methods retain the existing measured dark truecolor
+Ocean gate; facts and an explicit ramp do not grant terminal capability. The
+`ocean-native-guarded` gallery entry exercises cached water, caustics, selected
+source, blank semantic padding and reverse protection across all profiles.
+
+### Host-owned Dock tabs and character frames
+
+`DockTabRow` is the tab row used by `Workbar` and the native Engine Dock
+adapter. Give it the caller's available `WorkbarTab` facts, active panel,
+pressed/hovered targets, five live `DockTabStyles` and the close text that matches
+your actual action. `row.plan(area).hitboxes()` and `(&row).render(area, buf)` use
+the same fitting rules. The host owns focus, Esc handling and action dispatch.
+The Engine's full Dock body remains separate from this tab presentation slice.
+
+For a small companion or an externally simulated frame with a raw caption:
+
+```rust
+use codewhale_ratatui::BrailleFrame;
+use ratatui::{style::Style, widgets::Widget};
+
+// Row-major packed cells from your existing simulation; zero is transparent.
+BrailleFrame { cells: &cells, caption: "resting", style: Style::default() }
+    .render(area, buf);
+```
+
+The last viewport row holds the centered caption. Tiny viewports keep the
+complete wrapped text cue. Ink and modifiers are supplied by the caller; the
+component has no clock or activity model. The Engine cameo and live embedded
+world both use this path. `Whale::paint_frame` shares its cell painter and keeps
+its own semantic caption, admission rules and theme gradient. This API does not
+replace the Engine's character controller or accessibility policy.
+
+The guarded Ocean gallery uses `OceanPaintFacts`, `OceanCausticFacts` and
+`ocean_semantic_surfaces`; `OceanContrastInks` supplies host role mapping for
+native finishing through the existing guarded
+`OceanColumn` methods. Their facts preserve host protection and ink roles;
+terminal capability, motion and semantic contrast guards still apply.
+
+`WorkbarLayout::for_body` fits the already-admitted body viewport from current
+row counts and header facts. `WorkbarScrollbar` paints its rail using the same
+current offset/counts and caller-supplied symbols/styles. Both Workbar and the
+Engine body use these calculations. No remembered selection, focus or scrolling
+state lives in the kit; native row composition and action receipts stay with
+the host.

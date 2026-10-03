@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use super::protocol::{OwnerRef, RegisterKind, RegisterParams};
+use super::protocol::{EntryRef, OwnerRef, RegisterKind, RegisterParams};
 use super::tier::HostTier;
 use crate::plugins::types::PluginAuthority;
 
@@ -78,6 +78,7 @@ pub struct OwnerEntry {
     /// activation: reconcile revokes the owner and activates a new generation.
     pub config_hash: String,
     pub state: OwnerState,
+    pub scopes: HashMap<EntryRef, OwnerState>,
 }
 
 /// Most schema violations one refused call reports back to the model.
@@ -160,6 +161,7 @@ impl std::fmt::Debug for InputValidator {
 pub struct ToolRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    pub scope: Option<EntryRef>,
     /// The tier of `owner`'s host.
     pub tier: HostTier,
     pub plugin_name: String,
@@ -179,6 +181,7 @@ pub struct ToolRegistration {
 pub struct CommandRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    pub scope: Option<EntryRef>,
     /// The tier of `owner`'s host.
     pub tier: HostTier,
     pub plugin_name: String,
@@ -195,6 +198,7 @@ pub struct CommandRegistration {
 pub struct HookRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    pub scope: Option<EntryRef>,
     pub tier: HostTier,
     pub plugin_name: String,
     pub content_hash: String,
@@ -205,11 +209,31 @@ pub struct HookRegistration {
 pub struct PromptSectionRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    pub scope: Option<EntryRef>,
     pub tier: HostTier,
     pub plugin_name: String,
     pub content_hash: String,
     pub id: String,
     pub text: String,
+    pub interpolate: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShellHookRegistration {
+    pub handle: u64,
+    pub owner: OwnerRef,
+    pub scope: Option<EntryRef>,
+    pub content_hash: String,
+    pub hook: crate::hooks::Hook,
+}
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellSpec {
+    dialect: String,
+    point: String,
+    #[serde(default)]
+    matcher: Option<String>,
+    hook: crate::hooks::Hook,
 }
 
 #[derive(Debug, Default)]
@@ -225,8 +249,10 @@ pub struct OwnerRegistry {
     /// tool is called by the model, a command by the user.
     commands_by_name: HashMap<String, u64>,
     hooks: BTreeMap<u64, HookRegistration>,
+    shell_hooks: BTreeMap<u64, ShellHookRegistration>,
     prompt_sections: BTreeMap<u64, PromptSectionRegistration>,
     skill_roots: BTreeMap<u64, super::skills::SkillRootRegistration>,
+    mcp_servers: BTreeMap<u64, super::native_mcp::McpRegistration>,
     /// Lower-cased names of every native tool any engine's turn build has
     /// reported, plus the static set. Only ever grows: engines in one
     /// process build different native surfaces, and a name that is native
@@ -371,6 +397,7 @@ impl OwnerRegistry {
                 content_hash: content_hash.to_string(),
                 config_hash: String::new(),
                 state: OwnerState::Activating,
+                scopes: HashMap::new(),
             },
         );
         Ok(owner)
@@ -406,6 +433,7 @@ impl OwnerRegistry {
         match self.owners.get_mut(&owner.plugin_id) {
             Some(entry) if entry.owner == *owner && entry.state == OwnerState::Activating => {
                 entry.state = OwnerState::Active;
+                super::native_mcp::changed();
                 super::command::bump_epoch();
                 true
             }
@@ -428,17 +456,227 @@ impl OwnerRegistry {
         matches
     }
 
+    /// Only core invokes this after the existing Native inventory/receipt check.
+    pub(super) fn begin_scope(&mut self, owner: &OwnerRef, scope: EntryRef) -> Result<(), String> {
+        let entry = self
+            .owners
+            .get_mut(&owner.plugin_id)
+            .filter(|entry| entry.owner == *owner)
+            .ok_or("scope owner was withdrawn")?;
+        if entry.tier != HostTier::Plugin || entry.authority.is_none() {
+            return Err("scope requires reviewed Native authority".into());
+        }
+        if entry.scopes.contains_key(&scope) {
+            return Err("scope is already admitted".into());
+        }
+        entry.scopes.insert(scope, OwnerState::Activating);
+        Ok(())
+    }
+    pub(super) fn mark_scope_active(&mut self, owner: &OwnerRef, scope: &EntryRef) -> bool {
+        let Some(entry) = self
+            .owners
+            .get_mut(&owner.plugin_id)
+            .filter(|entry| entry.owner == *owner)
+        else {
+            return false;
+        };
+        let Some(state) = entry.scopes.get_mut(scope) else {
+            return false;
+        };
+        if *state != OwnerState::Activating {
+            return false;
+        }
+        *state = OwnerState::Active;
+        super::native_mcp::changed();
+        super::command::bump_epoch();
+        true
+    }
+    pub(super) fn check_scope(
+        &self,
+        owner: &OwnerRef,
+        scope: Option<&EntryRef>,
+        active: bool,
+    ) -> Result<(), String> {
+        let entry = self.current(owner).ok_or("scope owner was withdrawn")?;
+        if scope.is_none() && entry.tier == HostTier::Plugin && !entry.scopes.is_empty() {
+            return Err("Native contribution must name its core-admitted entry scope".into());
+        }
+        if let Some(scope) = scope {
+            let state = entry
+                .scopes
+                .get(scope)
+                .ok_or("scope was not admitted by core")?;
+            if !matches!(state, OwnerState::Active)
+                && (active || !matches!(state, OwnerState::Activating))
+            {
+                return Err("scope was withdrawn or is not ready".into());
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn fail_scope(&mut self, owner: &OwnerRef, scope: &EntryRef) {
+        let _ = self.revoke_scope(owner, scope);
+        if let Some(entry) = self
+            .owners
+            .get_mut(&owner.plugin_id)
+            .filter(|entry| entry.owner == *owner)
+        {
+            entry.scopes.insert(
+                scope.clone(),
+                OwnerState::Failed("Native entry activation failed".into()),
+            );
+        }
+    }
+    pub(super) fn revoke_scope(&mut self, owner: &OwnerRef, scope: &EntryRef) -> Vec<u64> {
+        if let Some(entry) = self
+            .owners
+            .get_mut(&owner.plugin_id)
+            .filter(|entry| entry.owner == *owner)
+        {
+            entry.scopes.remove(scope);
+        }
+        let handles: Vec<_> = self
+            .tools
+            .values()
+            .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+            .map(|r| r.handle)
+            .chain(
+                self.commands
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+                    .map(|r| r.handle),
+            )
+            .chain(
+                self.hooks
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+                    .map(|r| r.handle),
+            )
+            .chain(
+                self.shell_hooks
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+                    .map(|r| r.handle),
+            )
+            .chain(
+                self.prompt_sections
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+                    .map(|r| r.handle),
+            )
+            .chain(
+                self.skill_roots
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope.as_ref() == Some(scope))
+                    .map(|r| r.handle),
+            )
+            .chain(
+                self.mcp_servers
+                    .values()
+                    .filter(|r| r.owner == *owner && r.scope == *scope)
+                    .map(|r| r.handle),
+            )
+            .collect();
+        for handle in &handles {
+            self.unregister(owner, *handle);
+        }
+        super::command::bump_epoch();
+        handles
+    }
+
     /// Admit or refuse one `registry/register`, whatever its kind.
     pub fn register(&mut self, params: &RegisterParams) -> Result<u64, String> {
         match params.kind {
             RegisterKind::Tool => self.register_tool(params),
             RegisterKind::Command => self.register_command(params),
             RegisterKind::Hook => self.register_hook(params),
-            RegisterKind::PromptSection => self.register_prompt_section(params),
+            RegisterKind::ShellHook => self.register_shell_hook(params),
+            RegisterKind::PromptSection | RegisterKind::PromptTemplate => {
+                self.register_prompt_section(params)
+            }
+            RegisterKind::McpServer => {
+                Err("MCP definitions require reviewed snapshot admission".into())
+            }
             RegisterKind::SkillRoot => {
                 Err("skill roots require reviewed snapshot admission".to_string())
             }
         }
+    }
+
+    pub(super) fn register_mcp(
+        &mut self,
+        params: &RegisterParams,
+        config: crate::mcp::McpServerConfig,
+        host_generation: u64,
+    ) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
+        params.check_spec()?;
+        if params.kind != RegisterKind::McpServer
+            || params.spec.description.len() > super::native_mcp::MAX_DEFINITION_BYTES
+        {
+            return Err("Invalid MCP definition".into());
+        }
+        let scope = params
+            .scope
+            .clone()
+            .ok_or("MCP definition requires an entry scope")?;
+        let owner = self.current(&params.owner).ok_or("MCP owner is stale")?;
+        if owner.tier != HostTier::Plugin {
+            return Err("MCP definition owner must be Native".into());
+        }
+        let content_hash = owner.content_hash.clone();
+        let owned = self
+            .mcp_servers
+            .values()
+            .filter(|r| r.owner == params.owner)
+            .collect::<Vec<_>>();
+        if owned.len() >= super::native_mcp::MAX_PER_OWNER
+            || self.mcp_servers.len() >= super::native_mcp::MAX_PER_HOST
+        {
+            return Err("MCP owner or host definition limit reached".into());
+        }
+        if owned
+            .iter()
+            .any(|r| r.name == params.spec.name && r.scope == scope)
+        {
+            return Err("MCP server is already registered in this entry".into());
+        }
+        self.next_handle += 1;
+        let handle = self.next_handle;
+        self.mcp_servers.insert(
+            handle,
+            super::native_mcp::McpRegistration {
+                handle,
+                owner: params.owner.clone(),
+                scope,
+                content_hash,
+                host_generation,
+                name: params.spec.name.clone(),
+                config,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+        );
+        super::native_mcp::changed();
+        Ok(handle)
+    }
+    pub(super) fn live_mcp(&self) -> Vec<super::native_mcp::McpRegistration> {
+        self.mcp_servers
+            .values()
+            .filter(|r| self.is_live_mcp(r))
+            .cloned()
+            .collect()
+    }
+    pub(super) fn is_live_mcp(&self, r: &super::native_mcp::McpRegistration) -> bool {
+        self.mcp_servers.get(&r.handle).is_some_and(|current| {
+            current.owner == r.owner
+                && current.scope == r.scope
+                && current.host_generation == r.host_generation
+                && current.content_hash == r.content_hash
+        }) && self.owners.get(&r.owner.plugin_id).is_some_and(|owner| {
+            owner.owner == r.owner
+                && owner.state == OwnerState::Active
+                && self.check_scope(&r.owner, Some(&r.scope), true).is_ok()
+        })
     }
 
     pub(crate) fn register_skill_root(
@@ -447,6 +685,7 @@ impl OwnerRegistry {
         snapshots: Vec<crate::plugins::types::PluginSkillSnapshot>,
         host_generation: u64,
     ) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
         use super::skills::*;
         params.check_spec()?;
         root_path(&params.spec.name)?;
@@ -466,7 +705,11 @@ impl OwnerRegistry {
             .filter(|root| root.owner == params.owner)
             .collect();
         let bytes = snapshots.iter().map(snapshot_bytes).sum::<usize>();
-        if snapshots.is_empty() || owned.iter().any(|root| root.path == params.spec.name) {
+        if snapshots.is_empty()
+            || owned
+                .iter()
+                .any(|root| root.path == params.spec.name && root.scope == params.scope)
+        {
             return Err(
                 "skill root is empty or already registered; dispose it before registering it again"
                     .to_string(),
@@ -474,6 +717,7 @@ impl OwnerRegistry {
         }
         let names: HashSet<_> = owned
             .iter()
+            .filter(|root| root.scope == params.scope)
             .flat_map(|root| root.snapshots.iter().map(|skill| &skill.name))
             .collect();
         if snapshots.iter().any(|skill| names.contains(&skill.name)) {
@@ -510,6 +754,7 @@ impl OwnerRegistry {
             SkillRootRegistration {
                 handle,
                 owner: params.owner.clone(),
+                scope: params.scope.clone(),
                 host_generation,
                 content_hash,
                 path: params.spec.name.clone(),
@@ -526,7 +771,11 @@ impl OwnerRegistry {
             .values()
             .filter(|root| {
                 self.owners.get(&root.owner.plugin_id).is_some_and(|entry| {
-                    entry.owner == root.owner && entry.state == OwnerState::Active
+                    entry.owner == root.owner
+                        && entry.state == OwnerState::Active
+                        && self
+                            .check_scope(&root.owner, root.scope.as_ref(), true)
+                            .is_ok()
                 })
             })
             .cloned()
@@ -547,6 +796,9 @@ impl OwnerRegistry {
                 && root.owner.generation == generation
                 && root.host_generation == host_generation
                 && root.content_hash == content_hash
+                && self
+                    .check_scope(&root.owner, root.scope.as_ref(), true)
+                    .is_ok()
                 && self.owners.get(plugin_id).is_some_and(|entry| {
                     entry.owner == root.owner
                         && entry.state == OwnerState::Active
@@ -562,13 +814,23 @@ impl OwnerRegistry {
         &mut self,
         params: &RegisterParams,
     ) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
         use super::prompt::{
             MAX_PROMPT_HOST_BYTES, MAX_PROMPT_OWNER_BYTES, MAX_PROMPT_SECTION_BYTES,
             MAX_PROMPT_SECTIONS_PER_HOST, MAX_PROMPT_SECTIONS_PER_OWNER,
         };
         params.check_spec()?;
+        if !matches!(
+            params.kind,
+            RegisterKind::PromptSection | RegisterKind::PromptTemplate
+        ) {
+            return Err("prompt registration has an invalid kind".to_string());
+        }
         let id = &params.spec.name;
         let text = &params.spec.description;
+        if params.kind == RegisterKind::PromptTemplate {
+            super::prompt::validate_prompt_template(text)?;
+        }
         if !valid_command_name(id)
             || id.len() > 64
             || text.trim().is_empty()
@@ -587,7 +849,10 @@ impl OwnerRegistry {
             .values()
             .filter(|section| section.owner == params.owner)
             .collect();
-        if owned.iter().any(|section| &section.id == id) {
+        if owned
+            .iter()
+            .any(|section| &section.id == id && section.scope == params.scope)
+        {
             return Err(
                 "prompt section id is already registered; dispose it before registering it again"
                     .to_string(),
@@ -614,18 +879,130 @@ impl OwnerRegistry {
         let section = PromptSectionRegistration {
             handle: self.next_handle + 1,
             owner: params.owner.clone(),
+            scope: params.scope.clone(),
             tier: entry.tier,
             plugin_name: entry.plugin_name.clone(),
             content_hash: entry.content_hash.clone(),
             id: id.clone(),
             text: text.clone(),
+            interpolate: params.kind == RegisterKind::PromptTemplate,
         };
         self.next_handle += 1;
         self.prompt_sections.insert(section.handle, section);
         Ok(self.next_handle)
     }
 
+    fn register_shell_hook(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
+        params.check_spec()?;
+        let entry = self
+            .current(&params.owner)
+            .ok_or("shell hook owner is stale")?;
+        if entry.tier != HostTier::Plugin {
+            return Err("shell hooks require reviewed Native code".into());
+        }
+        if params.spec.description.len() > 64 * 1024 || params.spec.name.len() > 256 {
+            return Err("shell hook definition is oversized".into());
+        }
+        let mut spec: ShellSpec = serde_json::from_str(&params.spec.description)
+            .map_err(|_| "invalid shell hook definition")?;
+        let expected = match spec.point.as_str() {
+            "SessionStart" => crate::hooks::HookEvent::SessionStart,
+            "UserPromptSubmit" => crate::hooks::HookEvent::MessageSubmit,
+            "PreToolUse" => crate::hooks::HookEvent::ToolCallBefore,
+            "PostToolUse" => crate::hooks::HookEvent::ToolCallAfter,
+            "Stop" => crate::hooks::HookEvent::TurnEnd,
+            "SubagentStart" => crate::hooks::HookEvent::SubagentSpawn,
+            "SubagentStop" => crate::hooks::HookEvent::SubagentComplete,
+            _ => return Err("unsupported dialect hook point".into()),
+        };
+        if !matches!(spec.dialect.as_str(), "claude-code" | "codex")
+            || spec.hook.event != expected
+            || (spec.dialect == "codex"
+                && matches!(spec.point.as_str(), "SubagentStart" | "SubagentStop"))
+        {
+            return Err("dialect hook point does not match its core event".into());
+        }
+        if spec.matcher.as_ref().is_some_and(|m| m.len() > 1024)
+            || spec.hook.command.len() > 32 * 1024
+            || spec.hook.timeout_secs == 0
+            || spec.hook.timeout_secs > 86_400
+            || spec.hook.background
+        {
+            return Err("shell hook command/matcher/timeout is not bounded".into());
+        }
+        if self.shell_hooks.len() >= 1024
+            || self
+                .shell_hooks
+                .values()
+                .filter(|h| h.owner == params.owner)
+                .count()
+                >= 128
+        {
+            return Err("shell hook registration cap reached".into());
+        }
+        let authority = entry
+            .authority
+            .clone()
+            .ok_or("Native shell hook authority is absent")?;
+        let content_hash = entry.content_hash.clone();
+        let handle = self.next_handle + 1;
+        spec.hook.native_shell = Some(crate::hooks::config::NativeShellHook {
+            owner: params.owner.clone(),
+            scope: params.scope.clone(),
+            handle,
+            dialect: spec.dialect,
+            point: spec.point,
+            matcher: spec.matcher,
+        });
+        spec.hook.plugin_authority = Some(authority);
+        spec.hook.project_authority = None;
+        spec.hook.continue_on_error = false;
+        self.next_handle = handle;
+        self.shell_hooks.insert(
+            handle,
+            ShellHookRegistration {
+                handle,
+                owner: params.owner.clone(),
+                scope: params.scope.clone(),
+                content_hash,
+                hook: spec.hook,
+            },
+        );
+        Ok(handle)
+    }
+    pub(crate) fn live_shell_hooks(&self) -> Vec<ShellHookRegistration> {
+        self.shell_hooks
+            .values()
+            .filter(|h| {
+                self.check_shell_hook(h.hook.native_shell.as_ref().expect("Native reference"))
+                    .is_ok()
+            })
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn check_shell_hook(
+        &self,
+        native: &crate::hooks::config::NativeShellHook,
+    ) -> Result<(), String> {
+        self.check_scope(&native.owner, native.scope.as_ref(), true)?;
+        let owner = self
+            .current(&native.owner)
+            .filter(|o| o.state == OwnerState::Active)
+            .ok_or("Native shell hook owner is not active")?;
+        self.shell_hooks
+            .get(&native.handle)
+            .filter(|h| {
+                h.owner == native.owner
+                    && h.scope == native.scope
+                    && h.content_hash == owner.content_hash
+            })
+            .ok_or("Native shell hook was withdrawn")?;
+        Ok(())
+    }
+
     fn register_hook(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
         params.check_spec()?;
         if params.spec.name != "tools/pre-execute" {
             return Err("only `tools/pre-execute` admission listeners are supported".to_string());
@@ -646,6 +1023,7 @@ impl OwnerRegistry {
         let registration = HookRegistration {
             handle: self.next_handle + 1,
             owner: params.owner.clone(),
+            scope: params.scope.clone(),
             tier: entry.tier,
             plugin_name: entry.plugin_name.clone(),
             content_hash: entry.content_hash.clone(),
@@ -662,6 +1040,7 @@ impl OwnerRegistry {
     /// user registry loads (the markdown command wins and the extension
     /// command is not loaded), because only that registry knows the workspace.
     pub fn register_command(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
         let entry = self
             .current(&params.owner)
             .ok_or_else(|| "stale or unknown owner".to_string())?;
@@ -721,7 +1100,11 @@ impl OwnerRegistry {
         let mut replaced = None;
         if let Some(existing) = self
             .commands_by_name
-            .get(name)
+            .get(&super::composition_scope::name_key(
+                &params.owner.plugin_id,
+                name,
+                params.scope.as_ref(),
+            ))
             .and_then(|handle| self.commands.get(handle))
         {
             if existing.owner.plugin_id != params.owner.plugin_id {
@@ -759,6 +1142,7 @@ impl OwnerRegistry {
             CommandRegistration {
                 handle,
                 owner: params.owner.clone(),
+                scope: params.scope.clone(),
                 tier,
                 plugin_name,
                 content_hash,
@@ -767,13 +1151,21 @@ impl OwnerRegistry {
                 argument_hint: hint.map(str::to_string),
             },
         );
-        self.commands_by_name.insert(name.to_string(), handle);
+        self.commands_by_name.insert(
+            super::composition_scope::name_key(
+                &params.owner.plugin_id,
+                name,
+                params.scope.as_ref(),
+            ),
+            handle,
+        );
         super::command::bump_epoch();
         Ok(handle)
     }
 
     /// Admit or refuse one tool registration.
     pub fn register_tool(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        self.check_scope(&params.owner, params.scope.as_ref(), false)?;
         let entry = self
             .current(&params.owner)
             .ok_or_else(|| "stale or unknown owner".to_string())?;
@@ -788,16 +1180,21 @@ impl OwnerRegistry {
                 crate::safe_label::SafeLabel::identifier(name)
             ));
         }
-        let key = name.to_ascii_lowercase();
+        let plain_key = name.to_ascii_lowercase();
+        let key = super::composition_scope::name_key(
+            &params.owner.plugin_id,
+            &plain_key,
+            params.scope.as_ref(),
+        );
         if RESERVED_PREFIXES
             .iter()
-            .any(|prefix| key.starts_with(prefix))
+            .any(|prefix| plain_key.starts_with(prefix))
         {
             return Err(format!(
                 "tool name `{name}` uses a reserved prefix; {NAME_HINT}"
             ));
         }
-        if self.native_names.contains(&key) {
+        if self.native_names.contains(&plain_key) {
             return Err(format!(
                 "tool name `{name}` collides with a built-in tool; extensions never shadow core tools; {NAME_HINT}"
             ));
@@ -874,6 +1271,7 @@ impl OwnerRegistry {
             ToolRegistration {
                 handle,
                 owner: params.owner.clone(),
+                scope: params.scope.clone(),
                 tier,
                 plugin_name,
                 content_hash,
@@ -889,6 +1287,26 @@ impl OwnerRegistry {
 
     /// Undo exactly one registration. Idempotent; a stale or foreign handle is a no-op.
     pub fn unregister(&mut self, owner: &OwnerRef, handle: u64) {
+        if self
+            .mcp_servers
+            .get(&handle)
+            .is_some_and(|r| r.owner == *owner)
+        {
+            if let Some(r) = self.mcp_servers.remove(&handle) {
+                r.cancel.cancel();
+            }
+            super::native_mcp::changed();
+            return;
+        }
+
+        if self
+            .shell_hooks
+            .get(&handle)
+            .is_some_and(|h| h.owner == *owner)
+        {
+            self.shell_hooks.remove(&handle);
+            return;
+        }
         if self
             .skill_roots
             .get(&handle)
@@ -920,8 +1338,21 @@ impl OwnerRegistry {
             .is_some_and(|command| command.owner == *owner)
             && let Some(command) = self.commands.remove(&handle)
         {
-            if self.commands_by_name.get(&command.name) == Some(&handle) {
-                self.commands_by_name.remove(&command.name);
+            if self
+                .commands_by_name
+                .get(&super::composition_scope::name_key(
+                    &command.owner.plugin_id,
+                    &command.name,
+                    command.scope.as_ref(),
+                ))
+                == Some(&handle)
+            {
+                self.commands_by_name
+                    .remove(&super::composition_scope::name_key(
+                        &command.owner.plugin_id,
+                        &command.name,
+                        command.scope.as_ref(),
+                    ));
             }
             super::command::bump_epoch();
             return;
@@ -934,7 +1365,11 @@ impl OwnerRegistry {
             return;
         }
         if let Some(tool) = self.tools.remove(&handle) {
-            let key = tool.name.to_ascii_lowercase();
+            let key = super::composition_scope::name_key(
+                &tool.owner.plugin_id,
+                &tool.name.to_ascii_lowercase(),
+                tool.scope.as_ref(),
+            );
             if self.by_name.get(&key) == Some(&handle) {
                 self.by_name.remove(&key);
             }
@@ -952,15 +1387,42 @@ impl OwnerRegistry {
             .collect();
         for handle in handles {
             if let Some(command) = self.commands.remove(&handle)
-                && self.commands_by_name.get(&command.name) == Some(&handle)
+                && self
+                    .commands_by_name
+                    .get(&super::composition_scope::name_key(
+                        &command.owner.plugin_id,
+                        &command.name,
+                        command.scope.as_ref(),
+                    ))
+                    == Some(&handle)
             {
-                self.commands_by_name.remove(&command.name);
+                self.commands_by_name
+                    .remove(&super::composition_scope::name_key(
+                        &command.owner.plugin_id,
+                        &command.name,
+                        command.scope.as_ref(),
+                    ));
             }
         }
         super::command::bump_epoch();
     }
 
     fn remove_registrations_of(&mut self, plugin_id: &str) -> Vec<u64> {
+        let count = self.mcp_servers.len();
+        self.mcp_servers.retain(|_, r| {
+            if r.owner.plugin_id == plugin_id {
+                r.cancel.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        if count != self.mcp_servers.len() {
+            super::native_mcp::changed()
+        }
+
+        self.shell_hooks
+            .retain(|_, h| h.owner.plugin_id != plugin_id);
         self.skill_roots
             .retain(|_, root| root.owner.plugin_id != plugin_id);
         self.prompt_sections
@@ -976,7 +1438,11 @@ impl OwnerRegistry {
             .collect();
         for handle in &handles {
             if let Some(tool) = self.tools.remove(handle) {
-                let key = tool.name.to_ascii_lowercase();
+                let key = super::composition_scope::name_key(
+                    &tool.owner.plugin_id,
+                    &tool.name.to_ascii_lowercase(),
+                    tool.scope.as_ref(),
+                );
                 if self.by_name.get(&key) == Some(handle) {
                     self.by_name.remove(&key);
                 }
@@ -1003,6 +1469,11 @@ impl OwnerRegistry {
     /// Forget owners that are not live (failed, faulted, revoked) so a new
     /// explicit plugin mutation retries them.
     pub fn forget_inactive(&mut self) {
+        for owner in self.owners.values_mut() {
+            owner
+                .scopes
+                .retain(|_, state| matches!(state, OwnerState::Activating | OwnerState::Active));
+        }
         self.owners
             .retain(|_, entry| matches!(entry.state, OwnerState::Activating | OwnerState::Active));
     }
@@ -1010,11 +1481,22 @@ impl OwnerRegistry {
     /// Drop every registration owned by `tier`'s host: the host that held
     /// them is gone, and the other tier's host is not.
     fn clear_tier_registrations(&mut self, tier: HostTier) {
+        if tier == HostTier::Plugin && !self.mcp_servers.is_empty() {
+            for r in self.mcp_servers.values() {
+                r.cancel.cancel();
+            }
+            self.mcp_servers.clear();
+            super::native_mcp::changed()
+        }
+
         if tier == HostTier::Plugin {
             self.skill_roots.clear();
         }
         self.prompt_sections
             .retain(|_, section| section.tier != tier);
+        if tier == HostTier::Plugin {
+            self.shell_hooks.clear();
+        }
         self.hooks.retain(|_, hook| hook.tier != tier);
         self.tools.retain(|_, tool| tool.tier != tier);
         let tools = &self.tools;
@@ -1069,7 +1551,11 @@ impl OwnerRegistry {
             .values()
             .filter(|tool| {
                 self.owners.get(&tool.owner.plugin_id).is_some_and(|entry| {
-                    entry.owner == tool.owner && entry.state == OwnerState::Active
+                    entry.owner == tool.owner
+                        && entry.state == OwnerState::Active
+                        && self
+                            .check_scope(&tool.owner, tool.scope.as_ref(), true)
+                            .is_ok()
                 })
             })
             .cloned()
@@ -1098,23 +1584,24 @@ impl OwnerRegistry {
     }
 
     pub fn is_live_prompt_section(&self, handle: u64, owner: &OwnerRef) -> bool {
-        self.prompt_sections
-            .get(&handle)
-            .is_some_and(|section| section.owner == *owner)
-            && self
-                .owners
-                .get(&owner.plugin_id)
-                .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
+        self.prompt_sections.get(&handle).is_some_and(|section| {
+            section.owner == *owner
+                && self
+                    .check_scope(owner, section.scope.as_ref(), true)
+                    .is_ok()
+        }) && self
+            .owners
+            .get(&owner.plugin_id)
+            .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
     }
 
     pub fn is_live_hook(&self, handle: u64, owner: &OwnerRef) -> bool {
-        self.hooks
-            .get(&handle)
-            .is_some_and(|hook| hook.owner == *owner)
-            && self
-                .owners
-                .get(&owner.plugin_id)
-                .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
+        self.hooks.get(&handle).is_some_and(|hook| {
+            hook.owner == *owner && self.check_scope(owner, hook.scope.as_ref(), true).is_ok()
+        }) && self
+            .owners
+            .get(&owner.plugin_id)
+            .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
     }
 
     /// Commands of active owners, in handle order.
@@ -1126,7 +1613,11 @@ impl OwnerRegistry {
                 self.owners
                     .get(&command.owner.plugin_id)
                     .is_some_and(|entry| {
-                        entry.owner == command.owner && entry.state == OwnerState::Active
+                        entry.owner == command.owner
+                            && entry.state == OwnerState::Active
+                            && self
+                                .check_scope(&command.owner, command.scope.as_ref(), true)
+                                .is_ok()
                     })
             })
             .cloned()
@@ -1146,7 +1637,11 @@ impl OwnerRegistry {
         (command.owner.plugin_id == plugin_id
             && command.owner.generation == generation
             && self.owners.get(plugin_id).is_some_and(|entry| {
-                entry.owner == command.owner && entry.state == OwnerState::Active
+                entry.owner == command.owner
+                    && entry.state == OwnerState::Active
+                    && self
+                        .check_scope(&command.owner, command.scope.as_ref(), true)
+                        .is_ok()
             }))
         .then(|| command.clone())
     }
@@ -1154,13 +1649,12 @@ impl OwnerRegistry {
     /// Whether `handle` is still admitted for exactly this owner generation.
     #[must_use]
     pub fn is_live(&self, handle: u64, owner: &OwnerRef) -> bool {
-        self.tools
-            .get(&handle)
-            .is_some_and(|tool| tool.owner == *owner)
-            && self
-                .owners
-                .get(&owner.plugin_id)
-                .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
+        self.tools.get(&handle).is_some_and(|tool| {
+            tool.owner == *owner && self.check_scope(owner, tool.scope.as_ref(), true).is_ok()
+        }) && self
+            .owners
+            .get(&owner.plugin_id)
+            .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
     }
 
     /// Active owners other than `plugin_id` sharing its host process (the
@@ -1190,5 +1684,79 @@ impl OwnerRegistry {
     #[must_use]
     pub fn tier_of(&self, owner: &OwnerRef) -> Option<HostTier> {
         self.current(owner).map(|entry| entry.tier)
+    }
+}
+
+#[cfg(test)]
+mod shell_hook_tests {
+    use super::super::protocol::RegisterSpecWire;
+    use super::*;
+    fn spec(owner: &OwnerRef, scope: Option<EntryRef>) -> RegisterParams {
+        RegisterParams {owner:owner.clone(),scope,kind:RegisterKind::ShellHook,spec:RegisterSpecWire {name:"claude:PreToolUse:1".into(),description:serde_json::json!({"dialect":"claude-code","point":"PreToolUse","matcher":"write","hook":{"event":"tool_call_before","command":"true","timeout_secs":3,"background":false,"continue_on_error":false}}).to_string(),input_schema:None,argument_hint:None}}
+    }
+    fn new_owner(registry: &mut OwnerRegistry, id: &str) -> OwnerRef {
+        registry
+            .begin_owner(
+                HostTier::Plugin,
+                id,
+                id,
+                Some(super::super::tests::fake_authority(id)),
+                "build",
+            )
+            .unwrap()
+    }
+    #[test]
+    fn native_shell_hooks_withdraw_exact_scope_and_host_exit_releases_budget() {
+        let mut registry = OwnerRegistry::new();
+        let owner = new_owner(&mut registry, "hook-a");
+        let scope = EntryRef {
+            path: "/reviewed/a.mjs".into(),
+            sha256: "a".repeat(64),
+        };
+        registry.begin_scope(&owner, scope.clone()).unwrap();
+        let handle = registry
+            .register(&spec(&owner, Some(scope.clone())))
+            .unwrap();
+        assert!(registry.live_shell_hooks().is_empty());
+        registry.mark_scope_active(&owner, &scope);
+        registry.mark_active(&owner);
+        let native = registry.live_shell_hooks()[0]
+            .hook
+            .native_shell
+            .clone()
+            .unwrap();
+        assert_eq!(native.handle, handle);
+        registry.host_exited(HostTier::Builtin, "builtin test exit");
+        assert!(registry.check_shell_hook(&native).is_ok());
+        registry.revoke_scope(&owner, &scope);
+        assert!(registry.check_shell_hook(&native).is_err());
+        assert!(registry.shell_hooks.is_empty());
+        let other = new_owner(&mut registry, "hook-b");
+        let admitted = registry.register(&spec(&other, None)).unwrap();
+        registry.mark_active(&other);
+        assert_eq!(registry.live_shell_hooks()[0].handle, admitted);
+        registry.host_exited(HostTier::Plugin, "test crash");
+        assert!(registry.shell_hooks.is_empty());
+    }
+    #[test]
+    fn native_shell_registration_refuses_wrong_event_oversized_and_foreign_withdrawal() {
+        let mut registry = OwnerRegistry::new();
+        let a = new_owner(&mut registry, "a");
+        let b = new_owner(&mut registry, "b");
+        let mut wrong = spec(&a, None);
+        wrong.spec.description = wrong
+            .spec
+            .description
+            .replace("tool_call_before", "shell_env");
+        assert!(registry.register(&wrong).is_err());
+        let mut huge = spec(&a, None);
+        huge.spec.description = "x".repeat(65537);
+        assert!(registry.register(&huge).is_err());
+        let handle = registry.register(&spec(&a, None)).unwrap();
+        registry.mark_active(&a);
+        registry.unregister(&b, handle);
+        assert_eq!(registry.live_shell_hooks().len(), 1);
+        registry.unregister(&a, handle);
+        assert!(registry.live_shell_hooks().is_empty());
     }
 }

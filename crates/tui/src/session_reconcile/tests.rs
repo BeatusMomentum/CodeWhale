@@ -94,6 +94,7 @@ impl Fixture {
             RuntimeThreadManagerConfig {
                 data_dir: path.clone(),
                 task_data_dir: self.home.path().join("tasks"),
+                sessions_dir: None,
                 max_active_threads: 2,
             },
         )

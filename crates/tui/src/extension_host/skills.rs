@@ -28,12 +28,17 @@ pub struct NativeSkillRef {
     pub host_generation: u64,
     pub owner_generation: u64,
     pub handle: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<super::composition_scope::SelectionRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<super::protocol::EntryRef>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SkillRootRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    pub scope: Option<super::protocol::EntryRef>,
     pub host_generation: u64,
     pub content_hash: String,
     pub path: String,
@@ -101,7 +106,7 @@ pub(super) async fn admit_root(
             })?
             .ok_or_else(|| "skill owner has no reviewed authority".to_string())?;
         let snapshots =
-            bounded_root_check(Arc::clone(&shared.skill_admission), &cx.cancel, move || {
+            bounded_review_check(Arc::clone(&shared.skill_admission), &cx.cancel, move || {
                 // One permit covers every disk check, including the Native receipt
                 // phase; cancellation never leaves that phase outside the bound.
                 crate::plugins::registry::verify_plugin_component_authority(
@@ -149,23 +154,23 @@ pub(super) async fn admit_root(
     }
 }
 
-/// Every Native root disk phase uses this job. Its permit belongs to the
+/// Every Native root or MCP disk phase uses this job. Its permit belongs to the
 /// blocking closure, so RPC cancellation or abandonment cannot release it
 /// until receipt validation and parsing actually stop.
-async fn bounded_root_check<T: Send + 'static>(
+pub(super) async fn bounded_review_check<T: Send + 'static>(
     admission: Arc<tokio::sync::Semaphore>,
     cancel: &tokio_util::sync::CancellationToken,
     check: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     if cancel.is_cancelled() {
-        return Err("skill root admission cancelled".to_string());
+        return Err("Native review admission cancelled".to_string());
     }
     let permit = tokio::select! {
-        _ = cancel.cancelled() => return Err("skill root admission cancelled".to_string()),
-        permit = admission.acquire_owned() => permit.map_err(|_| "skill admission is unavailable".to_string())?,
+        _ = cancel.cancelled() => return Err("Native review admission cancelled".to_string()),
+        permit = admission.acquire_owned() => permit.map_err(|_| "Native review admission is unavailable".to_string())?,
     };
     if cancel.is_cancelled() {
-        return Err("skill root admission cancelled".to_string());
+        return Err("Native review admission cancelled".to_string());
     }
     let policy = super::activation::extension_host_policy_enabled();
     #[cfg(test)]
@@ -178,8 +183,8 @@ async fn bounded_root_check<T: Send + 'static>(
         check()
     });
     tokio::select! {
-        _ = cancel.cancelled() => Err("skill root admission cancelled".to_string()),
-        result = work => result.map_err(|error| format!("skill snapshot check failed: {error}"))?,
+        _ = cancel.cancelled() => Err("Native review admission cancelled".to_string()),
+        result = work => result.map_err(|error| format!("Native review check failed: {error}"))?,
     }
 }
 
@@ -226,6 +231,18 @@ pub(crate) fn verify_native_skill(
     reference: &NativeSkillRef,
 ) -> Result<(), String> {
     let manager = super::manager();
+    if reference.scope.is_some()
+        && !reference.selection.is_some_and(|selected| {
+            manager.shared.selection_current(
+                selected,
+                authority.plugin_id.as_str(),
+                &authority.content_hash,
+                reference.scope.as_ref(),
+            )
+        })
+    {
+        return Err("Native skill is no longer selected".into());
+    }
     live(&manager, authority, reference)?;
     crate::plugins::registry::verify_plugin_component_authority(
         authority,
@@ -233,7 +250,20 @@ pub(crate) fn verify_native_skill(
     )?;
     // Full receipt validation does disk I/O; do not accept a registration
     // removed while that check was in progress.
-    live(&manager, authority, reference)
+    live(&manager, authority, reference)?;
+    if reference.scope.is_some()
+        && !reference.selection.is_some_and(|selected| {
+            manager.shared.selection_current(
+                selected,
+                authority.plugin_id.as_str(),
+                &authority.content_hash,
+                reference.scope.as_ref(),
+            )
+        })
+    {
+        return Err("Native skill selection changed during verification".into());
+    }
+    Ok(())
 }
 
 /// Caller-snapshot scope, rather than the first workspace that activated an
@@ -254,7 +284,7 @@ pub(crate) fn roots_for_plugins(
         .lock()
         .expect("registry lock")
         .live_skill_roots();
-    roots
+    let mut selected: Vec<_> = roots
         .into_iter()
         .filter_map(|root| {
             let plugin = plugins.get(&root.owner.plugin_id)?;
@@ -265,16 +295,45 @@ pub(crate) fn roots_for_plugins(
             }
             let authority =
                 plugin.authority(state_path.to_path_buf(), plugins.workspace().to_path_buf())?;
+            let selected = plugins.caller_selection();
+            if root.scope.is_some()
+                && !selected.is_some_and(|selection| {
+                    manager.shared.selection_current(
+                        selection,
+                        &root.owner.plugin_id,
+                        &root.content_hash,
+                        root.scope.as_ref(),
+                    )
+                })
+            {
+                return None;
+            }
             let reference = NativeSkillRef {
                 boot_id: crate::session_manager::current_session_boot_id().to_string(),
                 host_generation: root.host_generation,
                 owner_generation: root.owner.generation,
                 handle: root.handle,
+                selection: selected,
+                scope: root.scope.clone(),
             };
             verify_native_skill(&authority, &reference).ok()?;
             Some((root, authority, reference))
         })
-        .collect()
+        .collect();
+    let mut counts = std::collections::BTreeMap::new();
+    for (root, _, _) in &selected {
+        for skill in &root.snapshots {
+            *counts
+                .entry((root.owner.plugin_id.clone(), skill.name.clone()))
+                .or_insert(0usize) += 1;
+        }
+    }
+    for (root, _, _) in &mut selected {
+        root.snapshots
+            .retain(|skill| counts[&(root.owner.plugin_id.clone(), skill.name.clone())] == 1);
+    }
+    selected.retain(|(root, _, _)| !root.snapshots.is_empty());
+    selected
 }
 
 #[cfg(test)]
@@ -290,6 +349,7 @@ mod tests {
 
     fn params(owner: &OwnerRef, path: &str) -> RegisterParams {
         RegisterParams {
+            scope: None,
             owner: owner.clone(),
             kind: RegisterKind::SkillRoot,
             spec: RegisterSpecWire {
@@ -339,7 +399,7 @@ mod tests {
             let running_admission = Arc::clone(&admission);
             let running_cancel = cancel.clone();
             let running = tokio::spawn(async move {
-                bounded_root_check(running_admission, &running_cancel, move || {
+                bounded_review_check(running_admission, &running_cancel, move || {
                     let _ = entered.send(());
                     wait.recv().map_err(|error| error.to_string())?;
                     Ok(7)
@@ -365,7 +425,7 @@ mod tests {
             let queued_admission = Arc::clone(&admission);
             let queued_token = queued_cancel.clone();
             let queued = tokio::spawn(async move {
-                bounded_root_check(queued_admission, &queued_token, move || {
+                bounded_review_check(queued_admission, &queued_token, move || {
                     queued_ran.store(true, Ordering::SeqCst);
                     Ok(9)
                 })
@@ -381,7 +441,7 @@ mod tests {
             release.send(()).unwrap();
             let resumed = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                bounded_root_check(
+                bounded_review_check(
                     Arc::clone(&admission),
                     &tokio_util::sync::CancellationToken::new(),
                     || Ok(11),
@@ -578,6 +638,8 @@ mod tests {
         let provenance = SkillProvenance::NativeRoot(crate::skills::NativeSkillProvenance {
             authority: authority.clone(),
             registration: NativeSkillRef {
+                selection: None,
+                scope: None,
                 boot_id: "earlier-process".into(),
                 host_generation: 1,
                 owner_generation: 1,
@@ -759,6 +821,7 @@ mod tests {
         let _manager = super::super::TestManagerGuard::install(Arc::clone(&manager));
         let engine = manager.attach(Arc::clone(&plugins));
         engine.sync().await.unwrap();
+        let plugins = engine.plugin_view();
         let skills_dir = fixture.workspace().join("empty-skills");
         let catalog = crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             fixture.workspace(),
@@ -771,7 +834,9 @@ mod tests {
             .expect("Native-only root merged into existing catalog");
         assert!(skill.invocation.user_invocable());
         let provenance = skill.source.provenance().unwrap();
-        provenance.verify(fixture.workspace()).unwrap();
+        provenance
+            .verify_for(fixture.workspace(), Some(&plugins))
+            .unwrap();
         let block = crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(fixture.workspace(), &skills_dir, SkillDiscoveryMode::CodeWhaleOnly, "en", Some(&plugins), 8192).unwrap();
         assert!(block.contains("skills-root:quick-check"));
         let context =
@@ -801,7 +866,11 @@ mod tests {
             .lock()
             .unwrap()
             .unregister(&root.owner, root.handle);
-        assert!(restored.verify(fixture.workspace()).is_err());
+        assert!(
+            restored
+                .verify_for(fixture.workspace(), Some(&plugins))
+                .is_err()
+        );
         let empty = crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             fixture.workspace(),
             &skills_dir,
@@ -830,6 +899,7 @@ mod tests {
         let _manager = super::super::TestManagerGuard::install(Arc::clone(&manager));
         let engine = manager.attach(Arc::clone(&plugins));
         engine.sync().await.unwrap();
+        let plugins = engine.plugin_view();
         let catalog = crate::skills::discover_in_workspace_with_mode_and_plugins(
             fixture.workspace(),
             SkillDiscoveryMode::CodeWhaleOnly,
@@ -842,7 +912,11 @@ mod tests {
             .provenance()
             .unwrap();
         manager.shutdown().await;
-        assert!(provenance.verify(fixture.workspace()).is_err());
+        assert!(
+            provenance
+                .verify_for(fixture.workspace(), Some(&plugins))
+                .is_err()
+        );
         let id = plugins.get("skills-root").unwrap().id.as_str();
         assert!(matches!(
             manager.owner_state(id),
@@ -869,7 +943,9 @@ mod tests {
             manager.diagnostics()
         );
         assert!(
-            provenance.verify(fixture.workspace()).is_err(),
+            provenance
+                .verify_for(fixture.workspace(), Some(&plugins))
+                .is_err(),
             "restart must not revive old handles"
         );
         let current = crate::skills::discover_in_workspace_with_mode_and_plugins(
@@ -897,14 +973,20 @@ mod tests {
         let reviewed = std::fs::read(&source_skill).unwrap();
         std::fs::write(&source_skill, "changed after review").unwrap();
         assert!(
-            current.verify(fixture.workspace()).is_err(),
+            current
+                .verify_for(fixture.workspace(), Some(&plugins))
+                .is_err(),
             "mutable source tamper fails before reconcile"
         );
         std::fs::write(&source_skill, reviewed).unwrap();
-        current.verify(fixture.workspace()).unwrap();
+        current
+            .verify_for(fixture.workspace(), Some(&plugins))
+            .unwrap();
         fixture.disable("skills-root");
         assert!(
-            current.verify(fixture.workspace()).is_err(),
+            current
+                .verify_for(fixture.workspace(), Some(&plugins))
+                .is_err(),
             "persisted disable wins before reconcile"
         );
         manager.shutdown().await;

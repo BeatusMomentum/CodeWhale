@@ -13,8 +13,8 @@ use super::task_projection::{
 };
 use super::*;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, DEFAULT_ZAI_MODEL,
-    ProviderConfig, ProvidersConfig,
+    Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, DEFAULT_ZAI_MODEL, ProviderConfig,
+    ProviderKind, ProvidersConfig,
 };
 use crate::core::engine::mock_engine_handle;
 use crate::core::ops::TurnSpec;
@@ -66,10 +66,10 @@ fn failed_engine_channel_settles_classifier_batch_once() {
     let _cost_scope = crate::cost_status::test_scope();
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek",
         "classifier-model",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         chrono::Utc::now(),
     );
     let batch = crate::cost_status::RuntimeUsageBatch {
@@ -86,6 +86,7 @@ fn failed_engine_channel_settles_classifier_batch_once() {
             },
         }],
         drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: "auto-router:dispatch-drop".to_string(),
             route,
         }],
@@ -684,7 +685,7 @@ async fn stale_remote_control_turn_never_cancels_the_current_engine_turn() {
 }
 
 fn test_mailbox_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
 ) -> crate::cost_status::EffectiveRouteEnvelope {
     crate::cost_status::EffectiveRouteEnvelope::capture(
@@ -692,7 +693,7 @@ fn test_mailbox_route(
         provider,
         provider.as_str(),
         model,
-        Some(provider.default_base_url()),
+        Some(provider.provider().default_base_url()),
         chrono::Utc::now(),
     )
 }
@@ -709,7 +710,7 @@ fn completed_turn_cost_receipt_uses_the_captured_effective_route() {
         ..Default::default()
     };
     let audit = crate::pricing::audit_turn_cost_for_route_at(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         &usage,
@@ -719,7 +720,7 @@ fn completed_turn_cost_receipt_uses_the_captured_effective_route() {
         turn_id: "completed-deepseek".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek-cn".to_string(),
             model: "deepseek-v4-flash".to_string(),
             auto_model: false,
@@ -735,7 +736,10 @@ fn completed_turn_cost_receipt_uses_the_captured_effective_route() {
                 billing_mode: crate::cost_status::RouteBillingMode::Metered,
                 dispatched_at: chrono::Utc::now(),
             }),
-            base_url: ApiProvider::Deepseek.default_base_url().to_string(),
+            base_url: ProviderKind::Deepseek
+                .provider()
+                .default_base_url()
+                .to_string(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
         auto_route_receipt: None,
@@ -1172,7 +1176,7 @@ fn launch_help_uses_the_same_toggle_and_shortcut_ordering_as_the_live_shell() {
 #[test]
 fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
     let mut app = create_test_app();
-    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.api_provider = crate::config::ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -1198,7 +1202,7 @@ fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
 #[test]
 fn ctrl_t_cycles_reasoning_effort_under_auto_model() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = true;
     app.reasoning_effort = ReasoningEffort::Auto;
 
@@ -2659,7 +2663,11 @@ impl SettingsHomeGuard {
     fn new() -> Self {
         let lock = crate::test_support::lock_test_env();
         let tmp = TempDir::new().expect("settings tempdir");
-        let codewhale_home = tmp.path().join(".codewhale");
+        let codewhale_home = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical settings home")
+            .join(".codewhale");
         Self {
             _home: crate::test_support::EnvVarGuard::set("HOME", tmp.path()),
             _userprofile: crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path()),
@@ -4884,6 +4892,81 @@ fn jump_to_latest_button_click_scrolls_to_tail() {
     assert!(!app.viewport.transcript_selection.dragging);
 }
 
+/// Clicking the pinned prompt header returns the viewport to the user
+/// message the header names, resolved against the current layout.
+#[test]
+fn pinned_prompt_click_jumps_to_the_message_it_names() {
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::User {
+        content: "jump target".to_string(),
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    app.collapsed_cell_map = vec![0];
+    app.viewport.transcript_scroll = TranscriptScroll::at_line(5);
+    app.viewport.pinned_prompt_area = Some(Rect {
+        x: 4,
+        y: 3,
+        width: 40,
+        height: 1,
+    });
+    app.viewport.pinned_prompt_message = Some(0);
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert_eq!(
+        app.viewport.transcript_scroll,
+        TranscriptScroll::at_line(0),
+        "the click must pin the viewport to the resolved message's first line"
+    );
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+    assert!(app.user_scrolled_during_stream);
+    assert!(!app.viewport.transcript_selection.dragging);
+}
+
+/// A click outside the header's row must not be captured by its hit box.
+#[test]
+fn pinned_prompt_click_only_claims_the_header_row() {
+    let mut app = create_test_app();
+    app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
+    app.viewport.pinned_prompt_area = Some(Rect {
+        x: 4,
+        y: 3,
+        width: 40,
+        height: 1,
+    });
+    app.viewport.pinned_prompt_message = Some(12);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.viewport.transcript_scroll.is_at_tail(),
+        "a click below the header must not trigger the jump"
+    );
+}
+
 /// Clicking the transcript scrollbar gutter starts a scrollbar drag (not
 /// text selection) so the visible thumb remains interactive for users who
 /// prefer mouse-based navigation.
@@ -5852,21 +5935,21 @@ fn credential_paste_content_never_enters_traces_or_rendered_status() {
     let secret = credential_paste_sentinel();
 
     let setup = ProviderPickerView::new_for_setup(
-        ApiProvider::Deepseek,
-        Some(ApiProvider::Anthropic),
+        ProviderKind::Deepseek,
+        Some(ProviderKind::Anthropic.as_str().into()),
         &config,
         None,
     );
     let missing_auth = ProviderPickerView::new_for_missing_auth(
-        ApiProvider::Deepseek,
-        ApiProvider::Anthropic,
+        ProviderKind::Deepseek,
+        &(config).test_identity_for_kind(ProviderKind::Anthropic),
         &config,
         None,
     )
     .expect("Anthropic missing-auth editor");
     let mut onboarding = ProviderPickerView::new_for_onboarding(
-        ApiProvider::Deepseek,
-        Some(ApiProvider::Anthropic),
+        ProviderKind::Deepseek,
+        Some(ProviderKind::Anthropic.as_str().into()),
         &config,
         None,
     );
@@ -5917,8 +6000,8 @@ fn ordinary_clipboard_text_routes_to_provider_picker_without_typing_shortcut_or_
     let config = Config::default();
     let secret = credential_paste_sentinel();
     let picker = ProviderPickerView::new_for_missing_auth(
-        ApiProvider::Deepseek,
-        ApiProvider::Openrouter,
+        ProviderKind::Deepseek,
+        &(config).test_identity_for_kind(ProviderKind::Openrouter),
         &config,
         None,
     )
@@ -5987,21 +6070,21 @@ fn cache_warmup_resolves_the_last_concrete_auto_route() {
     let mut app = create_test_app();
     app.model = "auto".to_string();
     app.auto_model = true;
-    app.last_effective_provider = Some(ApiProvider::Vllm);
-    app.last_effective_provider_identity = Some(ApiProvider::Vllm.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::Vllm);
+    app.last_effective_provider_identity = Some(ProviderKind::Vllm.as_str().to_string());
     app.last_effective_model = Some("auto-cache-model".to_string());
 
     let route = resolve_cache_replay_route(&app, &config).expect("last Auto route should resolve");
 
-    assert_eq!(route.identity.provider, ApiProvider::Vllm);
-    assert_eq!(route.identity.key, ApiProvider::Vllm.as_str());
+    assert_eq!(route.identity.provider, ProviderKind::Vllm);
+    assert_eq!(route.identity.key.as_str(), ProviderKind::Vllm.as_str());
     assert_eq!(route.model, "auto-cache-model");
     assert_eq!(
         route.candidate.endpoint().base_url,
         "http://127.0.0.1:18191/v1"
     );
 
-    app.last_effective_provider_identity = Some(ApiProvider::Openrouter.as_str().to_string());
+    app.last_effective_provider_identity = Some(ProviderKind::Openrouter.as_str().to_string());
     let error = resolve_cache_replay_route(&app, &config)
         .expect_err("a mismatched persisted identity must fail closed");
     assert!(
@@ -6027,13 +6110,13 @@ fn cache_warmup_rejects_an_auto_route_whose_endpoint_changed() {
     let mut app = create_test_app();
     app.model = "auto".to_string();
     app.auto_model = true;
-    app.last_effective_provider = Some(ApiProvider::Vllm);
-    app.last_effective_provider_identity = Some(ApiProvider::Vllm.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::Vllm);
+    app.last_effective_provider_identity = Some(ProviderKind::Vllm.as_str().to_string());
     app.last_effective_model = Some("auto-cache-model".to_string());
     app.session.last_base_url = Some("http://127.0.0.1:18191/v1".to_string());
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
-        provider: Some(ApiProvider::Vllm),
-        provider_identity: Some(ApiProvider::Vllm.as_str().to_string()),
+        provider: Some(ProviderKind::Vllm),
+        provider_identity: Some(ProviderKind::Vllm.as_str().to_string()),
         model: Some("auto-cache-model".to_string()),
         auto_model: true,
         input_tokens: 1,
@@ -9530,10 +9613,10 @@ fn apply_loaded_session_replaces_cost_coverage_with_the_loaded_total() {
         "subagent:agent-reload:step:1:response:late",
         &crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Anthropic,
+            ProviderKind::Anthropic,
             "anthropic-direct",
             "claude-sonnet-4-5",
-            Some(ApiProvider::Anthropic.default_base_url()),
+            Some(ProviderKind::Anthropic.provider().default_base_url()),
             chrono::Utc::now(),
         ),
         &Usage {
@@ -10434,11 +10517,7 @@ async fn operate_rejected_attach_does_not_reactivate_saved_keepalive() {
     let mut app = create_test_app();
     app.workspace = root.path().to_path_buf();
     app.runtime_services.automations = Some(automations.clone());
-    app.set_provider_identity_record(
-        config
-            .active_provider_identity(ApiProvider::Custom)
-            .expect("identity"),
-    );
+    app.set_provider_identity_record(config.active_provider_identity().expect("identity"));
     app.set_model_selection("startup-model".into());
     let engine = mock_engine_handle();
     apply_mode_update(&mut app, &engine.handle, &config, AppMode::Operate).await;
@@ -10526,20 +10605,26 @@ fn saved_default_provider_syncs_back_to_runtime_config() {
     settings.save().expect("save settings");
 
     let mut config = Config::default();
-    assert_eq!(config.api_provider(), ApiProvider::Deepseek);
+    assert_eq!(
+        config.active_provider_identity().unwrap().provider,
+        ProviderKind::Deepseek
+    );
 
     let app = App::new(create_test_options(), &config);
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
 
     sync_config_provider_from_app(&mut config, &app);
 
-    assert_eq!(config.api_provider(), ApiProvider::Ollama);
+    assert_eq!(
+        config.active_provider_identity().unwrap().provider,
+        ProviderKind::Ollama
+    );
 }
 
 #[test]
 fn provider_picker_reselecting_active_provider_preserves_current_model() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Ollama, "ollama");
+    app.set_provider_identity(ProviderKind::Ollama, "ollama");
     app.model = "deepseek-coder-v2:16b".to_string();
     let config = Config {
         provider: Some("ollama".to_string()),
@@ -10547,11 +10632,20 @@ fn provider_picker_reselecting_active_provider_preserves_current_model() {
     };
 
     assert_eq!(
-        provider_picker_model_override(&app, &config, ApiProvider::Ollama).as_deref(),
+        provider_picker_model_override(
+            &app,
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Ollama)
+        )
+        .as_deref(),
         Some("deepseek-coder-v2:16b")
     );
     assert_eq!(
-        provider_picker_model_override(&app, &config, ApiProvider::Deepseek),
+        provider_picker_model_override(
+            &app,
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         None
     );
 }
@@ -10583,16 +10677,19 @@ async fn provider_switch_clears_turn_cache_history() {
     let mut engine = mock_engine_handle();
     let mut config = Config::default();
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Ollama,
-        Some("fixture-local:tag".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Ollama);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("fixture-local:tag".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
     assert!(app.session.turn_cache_history.is_empty());
 }
 
@@ -10602,7 +10699,7 @@ async fn provider_switch_clears_turn_cache_history() {
 async fn reselecting_the_same_provider_says_connected_not_switched() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
@@ -10610,13 +10707,16 @@ async fn reselecting_the_same_provider_says_connected_not_switched() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
     let summary = app
@@ -10647,7 +10747,7 @@ async fn adopting_a_local_model_closes_the_connect_picker_and_names_it() {
     app.onboarding = crate::tui::app::OnboardingState::Provider;
     app.onboarding_needs_api_key = true;
     app.view_stack
-        .push(ProviderPickerView::new(ApiProvider::Deepseek, &config));
+        .push(ProviderPickerView::new(ProviderKind::Deepseek, &config));
     let catalog = crate::local_ollama::LiveLocalOllamaCatalog {
         endpoint_v1: "http://localhost:11434/v1".to_string(),
         tags: vec!["fixture-local:tag".to_string()],
@@ -10662,7 +10762,7 @@ async fn adopting_a_local_model_closes_the_connect_picker_and_names_it() {
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
     assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
     assert_ne!(
         app.view_stack.top_kind(),
@@ -10703,14 +10803,17 @@ fn first_run_route_starts_with_configured_provider_and_model() {
         let _provider = from_env.then(|| EnvVarGuard::set("CODEWHALE_PROVIDER", "openai"));
         let _model = from_env.then(|| EnvVarGuard::set("CODEWHALE_MODEL", "gpui-fixture"));
         let config = Config::load(None, None).expect("load fresh home config");
-        assert_eq!(config.api_provider(), ApiProvider::Openai);
+        assert_eq!(
+            config.active_provider_identity().unwrap().provider,
+            ProviderKind::Openai
+        );
         assert_eq!(config.default_model(), "gpui-fixture");
 
         // An options default must not replace the resolved config's model.
         let mut options = create_test_options();
         options.model = DEFAULT_TEXT_MODEL.to_string();
         let mut app = App::new(options, &config);
-        assert_eq!(app.api_provider, ApiProvider::Openai);
+        assert_eq!(app.api_provider, ProviderKind::Openai);
         assert_eq!(app.model, "gpui-fixture");
         assert!(!crate::local_ollama::should_adopt_live_local_ollama(
             &mut app
@@ -10733,7 +10836,7 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
         "[providers.deepseek]\nmodel = 'deepseek-v4-flash'\n",
     ] {
         let mut config = Config::from_saved_document(document, None).unwrap();
-        let provider = config.api_provider();
+        let provider = config.active_provider_identity().unwrap().provider;
         let model = config.default_model();
         let mut options = create_test_options();
         options.model = model.clone();
@@ -10761,7 +10864,10 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
 
         assert_eq!(app.api_provider, provider);
         assert_eq!(app.model, model);
-        assert_eq!(config.api_provider(), provider);
+        assert_eq!(
+            config.active_provider_identity().unwrap().provider,
+            provider
+        );
         assert!(codewhale_config::SetupState::load().unwrap().is_none());
     }
 }
@@ -10769,7 +10875,7 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
 #[test]
 fn first_run_route_context_is_empty_until_conversation_starts() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Ollama, "ollama");
+    app.set_provider_identity(ProviderKind::Ollama, "ollama");
     app.set_model_selection("qwen3:4b".into());
     app.active_route_limits = Some(codewhale_config::route::RouteLimits {
         context_tokens: Some(8192),
@@ -10877,7 +10983,7 @@ async fn first_run_route_generated_config_restart_keeps_local_discovery() {
                 first_run_route_catalog(),
             )
             .await;
-            assert_eq!(app.api_provider, ApiProvider::Ollama);
+            assert_eq!(app.api_provider, ProviderKind::Ollama);
             assert_eq!(app.model, "qwen3:4b");
         }
     }
@@ -10906,7 +11012,7 @@ async fn first_run_route_endpoint_only_keeps_route_when_credentials_are_missing(
         std::fs::write(&path, document).unwrap();
         let mut config = Config::load(None, None).expect("load endpoint-only config");
         assert!(config.active_route_endpoint_configured(), "{document:?}");
-        let provider = config.api_provider();
+        let provider = config.active_provider_identity().unwrap().provider;
         let mut options = create_test_options();
         options.model = config.default_model();
         let mut app = App::new(options, &config);
@@ -10925,7 +11031,11 @@ async fn first_run_route_endpoint_only_keeps_route_when_credentials_are_missing(
         )
         .await;
         assert_eq!(app.api_provider, provider, "{document:?}");
-        assert_eq!(config.api_provider(), provider, "{document:?}");
+        assert_eq!(
+            config.active_provider_identity().unwrap().provider,
+            provider,
+            "{document:?}"
+        );
     }
 }
 
@@ -10958,7 +11068,7 @@ async fn first_run_switch_to_keyed_route_clears_launch_missing_key_state() {
     let mut options = create_test_options();
     options.model = config.default_model();
     let mut app = App::new(options, &config);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(app.onboarding_needs_api_key);
     assert!(app.onboarding_missing_key_recovery);
     assert_eq!(app.onboarding, OnboardingState::Provider);
@@ -10966,17 +11076,20 @@ async fn first_run_switch_to_keyed_route_clears_launch_missing_key_state() {
 
     let mut engine = mock_engine_handle();
     assert!(
-        switch_provider(
-            &mut app,
-            &mut engine.handle,
-            &mut config,
-            ApiProvider::Openai,
-            None,
-        )
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openai);
+            switch_provider(
+                &mut app,
+                &mut engine.handle,
+                &mut config,
+                captured_fixture_identity,
+                None,
+            )
+        }
         .await
     );
 
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.onboarding_missing_key_recovery);
     assert!(!crate::local_ollama::should_adopt_live_local_ollama(
@@ -11002,7 +11115,7 @@ fn first_run_route_env_key_only_is_not_replaced() {
     let mut app = App::new(options, &config);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.onboarding_missing_key_recovery);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(!crate::local_ollama::should_adopt_live_local_ollama(
         &mut app
     ));
@@ -11012,7 +11125,7 @@ fn first_run_route_env_key_only_is_not_replaced() {
 async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     app.model = DEFAULT_OPENROUTER_MODEL.to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11022,16 +11135,19 @@ async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(!app.model_ids_passthrough);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
 }
@@ -11040,7 +11156,7 @@ async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
 async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     app.model_ids_passthrough = true;
     let mut engine = mock_engine_handle();
@@ -11062,16 +11178,19 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
         Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
     );
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(!app.model_ids_passthrough);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
@@ -11083,7 +11202,7 @@ async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispat
     let _home = SettingsHomeGuard::new();
     let _openrouter_key = crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     app.model_ids_passthrough = true;
     let mut engine = mock_engine_handle();
@@ -11105,16 +11224,20 @@ async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispat
         Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
     );
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Openrouter,
-        Some(crate::config::OPENROUTER_NEMOTRON_3_ULTRA_MODEL.to_string()),
-    )
+    app.set_provider_identity_record(config.active_provider_identity().unwrap());
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openrouter);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some(crate::config::OPENROUTER_NEMOTRON_3_ULTRA_MODEL.to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
     assert_eq!(app.model, "mimo-v2.5-pro");
     assert!(app.model_ids_passthrough);
     assert_eq!(config.provider.as_deref(), Some("xiaomi-mimo"));
@@ -11162,9 +11285,9 @@ async fn successful_custom_provider_activation_completes_onboarding() {
     )
     .await;
     assert!(switched);
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Custom, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Custom, switched);
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     let fixture_home = config_env._tmp.path().join(".codewhale");
     let fixture_settings = config_env
         .config_path()
@@ -11206,11 +11329,11 @@ async fn failed_custom_provider_activation_stays_in_onboarding_recovery() {
         None,
     )
     .await;
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Custom, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Custom, switched);
 
     assert!(!switched);
     assert_eq!(app.onboarding, OnboardingState::Provider);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(std::fs::read(global_config).ok(), startup_before);
     assert_eq!(
         crate::settings::Settings::load()
@@ -11253,20 +11376,20 @@ async fn successful_native_xai_oauth_activation_completes_onboarding() {
         "fixture xAI login complete",
     )
     .await;
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Xai, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Xai, switched);
 
     assert!(
         switched,
         "xAI switch failed: status={:?}, history={:?}, config={:?}, saved={:?}",
         app.status_message,
         app.history,
-        config.provider_config_for(ApiProvider::Xai),
+        config.provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai)),
         std::fs::read_to_string(config_env.config_path())
     );
-    assert_eq!(app.api_provider, ApiProvider::Xai);
+    assert_eq!(app.api_provider, ProviderKind::Xai);
     assert_ne!(app.onboarding, OnboardingState::Provider);
     let xai = config
-        .provider_config_for(ApiProvider::Xai)
+        .provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai))
         .expect("activated xAI slot");
     assert_eq!(xai.auth_mode.as_deref(), Some("oauth"));
     assert!(
@@ -11305,11 +11428,11 @@ async fn failed_native_xai_oauth_activation_stays_in_onboarding_recovery() {
         "fixture xAI login complete",
     )
     .await;
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Xai, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Xai, switched);
 
     assert!(!switched);
     assert_eq!(app.onboarding, OnboardingState::Provider);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
 }
 
 #[tokio::test]
@@ -11322,7 +11445,8 @@ async fn xai_api_key_confirmation_saves_only_the_selected_xai_slot() {
     app.config_path = Some(config_env.config_path());
     let mut engine = mock_engine_handle();
     let mut config = Config::default();
-    let identity = picker_provider_identity(&config, ApiProvider::Xai, None).expect("xAI identity");
+    let identity =
+        picker_provider_identity(&config, ProviderKind::Xai, None).expect("xAI identity");
 
     let switched = apply_provider_picker_setup_confirmed(
         &mut app,
@@ -11338,7 +11462,7 @@ async fn xai_api_key_confirmation_saves_only_the_selected_xai_slot() {
 
     assert!(switched, "provider switch failed: {:?}", app.history);
     let xai = config
-        .provider_config_for(ApiProvider::Xai)
+        .provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai))
         .expect("saved xAI slot");
     assert_eq!(xai.auth_mode.as_deref(), Some("api_key"));
     assert_eq!(xai.api_key.as_deref(), Some("violet-otter-key"));
@@ -11386,8 +11510,9 @@ fn setup_confirm_toast_names_secret_store_and_global_scope() {
                     let mut app = create_test_app();
                     let mut engine = mock_engine_handle();
                     let mut config = Config::default();
-                    let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
-                        .expect("OpenRouter identity");
+                    let identity =
+                        picker_provider_identity(&config, ProviderKind::Openrouter, None)
+                            .expect("OpenRouter identity");
 
                     let switched = apply_provider_picker_setup_confirmed(
                         &mut app,
@@ -11445,23 +11570,26 @@ api_key = "arcee-key"
     .expect("write config");
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Arcee;
+    app.api_provider = ProviderKind::Arcee;
     app.model = "auto".to_string();
     app.config_path = Some(config_path.clone());
 
     let mut engine = mock_engine_handle();
     let mut config = Config::load(Some(config_path.clone()), None).expect("load config");
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::XiaomiMimo,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::XiaomiMimo);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
     assert_eq!(config.provider.as_deref(), Some("xiaomi-mimo"));
 
     // The live session moved, but NOTHING was written: the config file on
@@ -11471,7 +11599,10 @@ api_key = "arcee-key"
     let reloaded = Config::load(Some(config_path.clone()), None).expect("reload config");
     // The on-disk config still resolves to the OLD provider's endpoint —
     // nothing changed for a restart or another folder.
-    assert_eq!(reloaded.api_provider(), ApiProvider::Arcee);
+    assert_eq!(
+        reloaded.active_provider_identity().unwrap().provider,
+        ProviderKind::Arcee
+    );
     assert_eq!(
         reloaded.active_route_base_url(),
         "https://api.arcee.ai/api/v1"
@@ -11494,11 +11625,11 @@ api_key = "arcee-key"
 fn local_ollama_probe_leaves_a_picker_the_person_is_using_alone() {
     let config = Config::default();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.onboarding_needs_api_key = true;
     app.onboarding = OnboardingState::Provider;
     app.view_stack.push(ProviderPickerView::new_for_onboarding(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         None,
         &config,
         None,
@@ -11542,17 +11673,17 @@ fn first_run_ollama_choice_survives_restart_from_canonical_config() {
     // `switch_provider` already has focused session-local coverage above.
     // Recreate its successful live-route result here so this regression stays
     // centered on the missing onboarding completion write and restart load.
-    app.set_provider_identity(ApiProvider::Ollama, ApiProvider::Ollama.as_str());
+    app.set_provider_identity(ProviderKind::Ollama, ProviderKind::Ollama.as_str());
     app.set_model_selection(crate::config::DEFAULT_OLLAMA_MODEL.to_string());
     app.note_session_route_change(
-        ApiProvider::Ollama.as_str(),
+        ProviderKind::Ollama.as_str(),
         crate::config::DEFAULT_OLLAMA_MODEL,
     );
     record_provider_model_setup_progress(&mut app, &config);
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
     assert_eq!(app.model, crate::config::DEFAULT_OLLAMA_MODEL);
 
-    complete_provider_picker_onboarding(&mut app, ApiProvider::Ollama);
+    complete_provider_picker_onboarding(&mut app, ProviderKind::Ollama);
 
     let saved = assert_saved_startup_route("ollama", "ollama", crate::config::DEFAULT_OLLAMA_MODEL);
     assert!(app.pending_route_save.is_none());
@@ -11616,7 +11747,7 @@ fn first_run_ollama_choice_survives_restart_from_canonical_config() {
     };
     assert_eq!(options.model, crate::config::DEFAULT_OLLAMA_MODEL);
     let restarted = Box::new(App::new(options, &restart_config));
-    assert_eq!(restarted.api_provider, ApiProvider::Ollama);
+    assert_eq!(restarted.api_provider, ProviderKind::Ollama);
     assert_eq!(restarted.model, crate::config::DEFAULT_OLLAMA_MODEL);
     assert_ne!(
         restarted.onboarding,
@@ -11644,17 +11775,17 @@ fn failed_first_run_route_persistence_keeps_provider_setup_active() {
     let mut app = Box::new(create_test_app());
     app.onboarding = OnboardingState::Provider;
     app.onboarding_needs_api_key = true;
-    app.set_provider_identity(ApiProvider::Ollama, ApiProvider::Ollama.as_str());
+    app.set_provider_identity(ProviderKind::Ollama, ProviderKind::Ollama.as_str());
     app.set_model_selection(crate::config::DEFAULT_OLLAMA_MODEL.to_string());
     app.note_session_route_change(
-        ApiProvider::Ollama.as_str(),
+        ProviderKind::Ollama.as_str(),
         crate::config::DEFAULT_OLLAMA_MODEL,
     );
 
-    complete_provider_picker_onboarding(&mut app, ApiProvider::Ollama);
+    complete_provider_picker_onboarding(&mut app, ProviderKind::Ollama);
 
     assert_eq!(app.onboarding, OnboardingState::Provider);
-    assert_eq!(app.onboarding_provider, ApiProvider::Ollama);
+    assert_eq!(app.onboarding_provider, ProviderKind::Ollama);
     assert!(app.onboarding_needs_api_key);
     assert!(
         app.pending_route_save.is_some(),
@@ -11673,7 +11804,7 @@ fn failed_first_run_route_persistence_keeps_provider_setup_active() {
 async fn provider_switch_model_override_updates_target_provider_model_slot() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11691,16 +11822,19 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("deepseek-v4-flash".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash");
     assert_eq!(
         config
@@ -11741,7 +11875,7 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
     let _home = SettingsHomeGuard::new();
     let tmp = TempDir::new().expect("config tempdir");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     app.config_path = Some(tmp.path().to_path_buf());
     let mut engine = mock_engine_handle();
@@ -11760,16 +11894,19 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("deepseek-v4-flash".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash");
     // The switch writes nothing, so an unwritable config path cannot fail a
     // switch, and the receipt must not claim a partial persistence that never
@@ -11801,7 +11938,7 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
 async fn provider_switch_without_model_uses_target_default_not_previous_provider_model() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     app.model = "deepseek/deepseek-v4-pro".to_string();
     app.model_ids_passthrough = true;
     let mut engine = mock_engine_handle();
@@ -11823,16 +11960,19 @@ async fn provider_switch_without_model_uses_target_default_not_previous_provider
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Zai,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Zai);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Zai);
+    assert_eq!(app.api_provider, ProviderKind::Zai);
     assert_eq!(app.model, DEFAULT_ZAI_MODEL);
     assert_eq!(config.provider.as_deref(), Some("zai"));
     assert_eq!(
@@ -11855,7 +11995,7 @@ async fn provider_switch_without_model_uses_target_default_not_previous_provider
 async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11876,16 +12016,19 @@ async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Zai,
-        Some("deepseek-v4-pro".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Zai);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("deepseek-v4-pro".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
     assert_eq!(
@@ -11909,7 +12052,7 @@ async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
     let _home = SettingsHomeGuard::new();
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::Off;
     app.reasoning_effort_preference = Some(ReasoningEffort::Off);
@@ -11927,16 +12070,25 @@ async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
         ..Default::default()
     };
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::OpenaiCodex,
-        None,
+    crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster(
+        &config,
+        &[crate::config::DEFAULT_OPENAI_CODEX_MODEL],
     )
+    .unwrap();
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::OpenaiCodex);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
     assert_eq!(app.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
     assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
     assert_eq!(app.reasoning_effort_preference, Some(ReasoningEffort::Off));
@@ -11947,7 +12099,7 @@ async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
 async fn provider_switch_to_openrouter_canonicalizes_deepseek_default_model() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11963,16 +12115,19 @@ async fn provider_switch_to_openrouter_canonicalizes_deepseek_default_model() {
         ..Default::default()
     };
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Openrouter,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openrouter);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.api_provider, ProviderKind::Openrouter);
     assert_eq!(app.model, DEFAULT_OPENROUTER_MODEL);
 }
 
@@ -12014,7 +12169,7 @@ async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {
     let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-test-key");
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Zai, "zai");
+    app.set_provider_identity(ProviderKind::Zai, "zai");
     app.reasoning_effort = ReasoningEffort::Low;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
     app.set_model_selection("auto".to_string());
@@ -12038,7 +12193,7 @@ async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {
         app.pending_turn_route
             .as_ref()
             .map(|(provider, model, auto)| (*provider, model.as_str(), *auto)),
-        Some((ApiProvider::Zai, crate::config::DEFAULT_ZAI_MODEL, true,))
+        Some((ProviderKind::Zai, crate::config::DEFAULT_ZAI_MODEL, true,))
     );
     assert_eq!(
         app.last_auto_route_receipt, app.pending_auto_route_receipt,
@@ -12181,7 +12336,7 @@ async fn real_engine_client_preflight_failure_leaves_dispatch_state_atomic() {
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
 
@@ -12264,7 +12419,7 @@ async fn immediate_submit_custom_provider_preflight_restores_exact_message() {
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.input = "preserve 用户 input".to_string();
     app.cursor_position = app.input.chars().count();
@@ -12328,7 +12483,7 @@ async fn remote_preflight_failure_releases_the_account_owned_run() {
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     let journal_root = tempfile::tempdir().expect("remote dispatch journal root");
     app.remote_control
@@ -12377,7 +12532,7 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
     let mut app = create_test_app();
     // A returning user: the saved route lost its key.
     app.onboarding_had_provider_step = false;
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.input = "preserve 用户 input".to_string();
     app.cursor_position = app.input.chars().count();
@@ -12468,7 +12623,7 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
         ..Default::default()
     };
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let mut engine = mock_engine_handle();
 
@@ -12483,9 +12638,9 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
 
     match engine.rx_op.recv().await.expect("send message op") {
         Op::SendMessage(TurnSpec { route, .. }) => {
-            assert_eq!(route.identity.provider, ApiProvider::Custom);
-            assert_eq!(route.identity.key, "custom-a");
-            assert_eq!(route.identity.exact_id.as_deref(), Some("custom-a"));
+            assert_eq!(route.identity.provider, ProviderKind::Custom);
+            assert_eq!(route.identity.key.as_str(), "custom-a");
+            assert_eq!(route.identity.persisted_id(), Some("custom-a"));
             assert_eq!(route.model, "model-a");
             assert_eq!(
                 route.config.active_route_base_url(),
@@ -12498,7 +12653,63 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
 }
 
 #[tokio::test]
-async fn dispatch_idless_custom_identity_uses_the_literal_table() {
+async fn dispatch_captured_root_identity_keeps_absent_id_and_rejects_replaced_table() {
+    let root = Config::from_saved_document(
+        "provider = 'custom'\nbase_url = 'http://127.0.0.1:18180/v1'\ndefault_text_model = 'root-model'\n", None
+    ).unwrap();
+    let captured = root.active_provider_identity().unwrap();
+    assert!(captured.persisted_id().is_none());
+    let mut app = create_test_app();
+    app.set_provider_identity_record(captured.clone());
+    app.set_model_selection("root-model".into());
+    let mut engine = mock_engine_handle();
+    dispatch_user_message(
+        &mut app,
+        &root,
+        &engine.handle,
+        QueuedMessage::new("same captured root".into(), None),
+    )
+    .await
+    .unwrap();
+    match engine.rx_op.recv().await.unwrap() {
+        Op::SendMessage(TurnSpec { route, .. }) => {
+            assert!(route.identity.persisted_id().is_none());
+            assert_eq!(route.identity.key.as_str(), "custom");
+            route
+                .config
+                .verify_provider_identity(&route.identity)
+                .unwrap();
+            assert_eq!(
+                route.config.base_url_for_route(&route.identity),
+                "http://127.0.0.1:18180/v1"
+            );
+        }
+        other => panic!("expected captured root send, got {other:?}"),
+    }
+    let mut replaced = root.clone();
+    replaced
+        .providers
+        .as_mut()
+        .unwrap()
+        .custom
+        .get_mut("custom")
+        .unwrap()
+        .base_url = Some("http://127.0.0.1:19191/v1".into());
+    assert!(
+        dispatch_user_message(
+            &mut app,
+            &replaced,
+            &engine.handle,
+            QueuedMessage::new("must not retarget".into(), None)
+        )
+        .await
+        .is_err()
+    );
+    assert!(engine.rx_op.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn dispatch_requires_exact_selection_when_root_conflicts_with_table() {
     let config = Config {
         provider: Some("custom".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
@@ -12522,8 +12733,13 @@ async fn dispatch_idless_custom_identity_uses_the_literal_table() {
         Some("http://127.0.0.1:18180/v1".to_string()),
     );
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom");
-    app.set_model_selection("legacy-root-model".to_string());
+    let absent = config.resolve_persisted_provider_identity(Some("custom"), None);
+    assert!(
+        absent.is_err(),
+        "conflicting root cannot supply missing-id authority"
+    );
+    app.set_provider_identity_record(config.resolve_provider_pin_identity("custom").unwrap());
+    app.set_model_selection("literal-table-model".to_string());
     let mut engine = mock_engine_handle();
 
     dispatch_user_message(
@@ -12537,12 +12753,11 @@ async fn dispatch_idless_custom_identity_uses_the_literal_table() {
 
     match engine.rx_op.recv().await.expect("send message op") {
         Op::SendMessage(TurnSpec { route, .. }) => {
-            // Beside a literal `[providers.custom]` table, the older
-            // top-level endpoint is DeepSeek's (#6394); the literal route is
-            // the table.
-            assert_eq!(route.identity.provider, ApiProvider::Custom);
-            assert_eq!(route.identity.key, "custom");
-            assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+            // Explicit exact selection admits the literal table despite the
+            // conflicting root; missing-id replay was refused above.
+            assert_eq!(route.identity.provider, ProviderKind::Custom);
+            assert_eq!(route.identity.key.as_str(), "custom");
+            assert_eq!(route.identity.persisted_id(), Some("custom"));
             assert_eq!(
                 route.config.active_route_base_url(),
                 "http://127.0.0.1:18181/v1"
@@ -12565,7 +12780,7 @@ async fn failed_real_preflight_preserves_paused_command_state_and_engine_gate() 
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.paused = true;
     app.pausable = true;
@@ -12604,7 +12819,7 @@ async fn failed_real_preflight_preserves_paused_command_state_and_engine_gate() 
 #[test]
 fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     let mut named_app = create_test_app();
-    named_app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    named_app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     let mut named_config = Config {
         provider: Some("lm-studio".to_string()),
         providers: Some(ProvidersConfig {
@@ -12624,7 +12839,9 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     }
     .with_legacy_root(Some("deepseek-root-key".to_string()), None);
 
-    clear_active_provider_api_key_from_memory(&named_app, &mut named_config);
+    named_app.set_provider_identity_record(named_config.active_provider_identity().unwrap());
+    clear_active_provider_api_key_from_memory(&named_app, &mut named_config)
+        .expect("exact named route");
 
     assert_eq!(
         named_config.deepseek_table_api_key(),
@@ -12640,7 +12857,7 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     );
 
     let mut legacy_app = create_test_app();
-    legacy_app.set_provider_identity(ApiProvider::Custom, "custom");
+    legacy_app.set_provider_identity(ProviderKind::Custom, "custom");
     let mut legacy_config = Config {
         provider: Some("custom".to_string()),
         default_text_model: Some("legacy-model".to_string()),
@@ -12651,7 +12868,9 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
         Some("http://127.0.0.1:18180/v1".to_string()),
     );
 
-    clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config);
+    legacy_app.set_provider_identity_record(legacy_config.active_provider_identity().unwrap());
+    clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config)
+        .expect("captured legacy root route");
 
     // The literal route's key lives in `[providers.custom]` (#6394); the
     // memory clear empties exactly that slot.
@@ -12671,7 +12890,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
     let mut app = create_test_app();
     app.auto_model = true;
     app.model = "auto".to_string();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.active_route_limits = Some(codewhale_config::route::RouteLimits {
         context_tokens: Some(32_000),
         ..Default::default()
@@ -12691,7 +12910,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
         }),
         ..Default::default()
     };
-    let route = resolve_runtime_route(&config, ApiProvider::Openrouter, Some("vendor/model-b"))
+    let route = resolve_runtime_route(&config, ProviderKind::Openrouter, Some("vendor/model-b"))
         .expect("resolve auto-selected route")
         .validate()
         .expect("preflight auto-selected route");
@@ -12705,7 +12924,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
     assert_eq!(
         compaction.token_threshold,
         crate::route_budget::compaction_threshold_for_route_at_percent(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "vendor/model-b",
             route_limits,
             75.0,
@@ -12722,7 +12941,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
         crate::core::ops::Op::CompactContext {
             route, compaction, ..
         } => {
-            assert_eq!(route.identity.provider, ApiProvider::Openrouter);
+            assert_eq!(route.identity.provider, ProviderKind::Openrouter);
             assert_eq!(route.model, "vendor/model-b");
             assert_eq!(compaction.model, "vendor/model-b");
             assert_eq!(compaction.effective_context_window, Some(196_000));
@@ -12732,7 +12951,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
 }
 
 fn configure_manual_compaction_test_route(app: &mut App) -> Config {
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     Config {
         provider: Some("deepseek".to_string()),
@@ -12988,17 +13207,19 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
         }),
         ..Config::default()
     };
-    let route = resolve_runtime_route(&config, ApiProvider::Moonshot, Some("kimi-k3"))
+    let route = resolve_runtime_route(&config, ProviderKind::Moonshot, Some("kimi-k3"))
         .expect("resolve configured 256K route");
     let override_limits = crate::route_budget::known_route_limits(route.candidate.limits())
         .expect("configured route limits");
     assert_eq!(
-        config.context_window_for_provider_config(ApiProvider::Moonshot),
+        config.context_window_for_provider_config(
+            &config.test_identity_for_kind(ProviderKind::Moonshot)
+        ),
         Some(262_144)
     );
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Moonshot;
+    app.api_provider = ProviderKind::Moonshot;
     app.model = "kimi-k3".to_string();
     app.auto_model = false;
     app.auto_compact_threshold_percent = 80.0;
@@ -13011,7 +13232,7 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
     assert_eq!(
         compaction.token_threshold,
         crate::route_budget::compaction_threshold_for_route_at_percent(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-k3",
             Some(override_limits),
             80.0,
@@ -13020,7 +13241,7 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
     assert!(
         compaction.token_threshold
             < crate::route_budget::compaction_threshold_for_route_at_percent(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "kimi-k3",
                 None,
                 80.0,
@@ -13038,14 +13259,14 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
     assert_eq!(meter_window, 262_144);
 
     let override_budget = crate::route_budget::route_context_budget(
-        ApiProvider::Moonshot,
+        ProviderKind::Moonshot,
         "kimi-k3",
         Some(override_limits),
         0,
     )
     .expect("override preflight budget");
     let catalog_budget =
-        crate::route_budget::route_context_budget(ApiProvider::Moonshot, "kimi-k3", None, 0)
+        crate::route_budget::route_context_budget(ProviderKind::Moonshot, "kimi-k3", None, 0)
             .expect("catalog preflight budget");
     assert_eq!(override_budget.window_tokens, 262_144);
     assert!(override_budget.input_budget_ceiling < catalog_budget.input_budget_ceiling);
@@ -13059,7 +13280,7 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
 #[test]
 fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Custom;
+    app.api_provider = ProviderKind::Custom;
     app.model = "qwen3-32b-256k".to_string();
     app.auto_model = false;
     app.active_route_limits = None;
@@ -13068,7 +13289,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
 
     // Every budget surface resolves the same number from the same chokepoint.
     let ladder = crate::route_runtime::resolve_context_window(
-        ApiProvider::Custom,
+        ProviderKind::Custom,
         "qwen3-32b-256k",
         None,
         None,
@@ -13085,7 +13306,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
     assert_eq!(
         compaction.token_threshold,
         crate::route_budget::compaction_threshold_for_route_at_percent(
-            ApiProvider::Custom,
+            ProviderKind::Custom,
             "qwen3-32b-256k",
             None,
             app.auto_compact_threshold_percent,
@@ -14237,7 +14458,7 @@ printf '%s\n' '{"text":"after soft failure"}'
 #[tokio::test]
 async fn dispatch_route_failure_leaves_loading_and_transcript_unchanged() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.api_messages_mut()
         .push(text_message("assistant", "existing conversation"));
@@ -14979,7 +15200,7 @@ fn turn_liveness_watchdog_clears_stale_dispatch() {
     app.dispatch_started_at =
         Some(Instant::now() - DISPATCH_WATCHDOG_TIMEOUT - Duration::from_millis(1));
     app.turn_started_at = Some(Instant::now());
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), false));
     app.suppress_stream_events_until_turn_complete = true;
 
     let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
@@ -15550,12 +15771,12 @@ fn turn_liveness_recovers_stalled_in_progress_turn() {
     app.turn_started_at = Some(now - turn_stall_watchdog_timeout(&app) - Duration::from_millis(1));
     app.streaming_message_index = Some(0);
     app.user_scrolled_during_stream = true;
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), false));
     app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
         turn_id: "stale-turn-id".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
@@ -15603,12 +15824,12 @@ fn engine_event_disconnect_recovers_live_turn_immediately() {
     app.turn_started_at = Some(Instant::now());
     app.dispatch_started_at = Some(Instant::now());
     app.user_scrolled_during_stream = true;
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), false));
     app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
         turn_id: "turn_dead".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
@@ -15685,7 +15906,7 @@ fn engine_event_disconnect_cleans_cancelled_turn_metadata() {
         turn_id: "cancelled-turn".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
@@ -16023,7 +16244,9 @@ fn hotbar_dispatches_route_switch_slot() {
         .strip_prefix("route.")
         .expect("route id prefix");
     let (provider_key, model) = route_suffix.split_once('.').expect("route id shape");
-    let provider = ApiProvider::parse(provider_key).expect("provider key parses");
+    let identity = Config::default()
+        .resolve_provider_selection_identity(provider_key)
+        .expect("admitted route");
     let model = model.to_string();
     let config = Config {
         hotbar: Some(vec![codewhale_config::HotbarBindingToml {
@@ -16037,7 +16260,7 @@ fn hotbar_dispatches_route_switch_slot() {
     assert_eq!(
         dispatch_hotbar_slot(&mut app, &config, 1).expect("route slot dispatch"),
         Some(HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
-            provider,
+            identity,
             model,
         }))
     );
@@ -16314,6 +16537,7 @@ fn make_subagent(
         git_branch: None,
         agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
+            native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },
@@ -16625,7 +16849,7 @@ fn subagent_token_usage_updates_live_cost_counter_without_card_change() {
             agent_id: "agent-a".to_string(),
             source_id: "response-a".to_string(),
             route: Box::new(test_mailbox_route(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-v4-flash",
             )),
             usage: codewhale_models::Usage {
@@ -16646,7 +16870,7 @@ fn subagent_token_usage_updates_live_cost_counter_without_card_change() {
 #[test]
 fn subagent_token_usage_prices_the_child_route_not_the_parent_route() {
     let mut app = create_test_app();
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
 
     handle_subagent_mailbox(
         &mut app,
@@ -16654,7 +16878,7 @@ fn subagent_token_usage_prices_the_child_route_not_the_parent_route() {
         &crate::tools::subagent::MailboxMessage::TokenUsage {
             agent_id: "agent-codex".to_string(),
             source_id: "response-codex".to_string(),
-            route: Box::new(test_mailbox_route(ApiProvider::OpenaiCodex, "gpt-5.5")),
+            route: Box::new(test_mailbox_route(ProviderKind::OpenaiCodex, "gpt-5.5")),
             usage: codewhale_models::Usage {
                 input_tokens: 10_000,
                 output_tokens: 1_000,
@@ -16676,7 +16900,7 @@ fn subagent_token_usage_is_deduped_by_response_source() {
         agent_id: "agent-a".to_string(),
         source_id: "response-a".to_string(),
         route: Box::new(test_mailbox_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
         )),
         usage: codewhale_models::Usage {
@@ -16727,7 +16951,7 @@ fn active_deleted_origin_mailbox_usage_does_not_accrue_or_restore_the_session() 
         "origin-turn",
         &manager,
     );
-    let route = test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash");
+    let route = test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash");
     let usage = codewhale_models::Usage {
         input_tokens: 10_000,
         output_tokens: 1_000,
@@ -16798,7 +17022,7 @@ fn subagent_token_usage_source_is_stable_across_engine_turns() {
         agent_id: "agent-a".to_string(),
         source_id: "response-a".to_string(),
         route: Box::new(test_mailbox_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
         )),
         usage: codewhale_models::Usage {
@@ -18184,7 +18408,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     let mut app = create_test_app();
     app.suppress_stream_events_until_turn_complete = true;
     app.ocean_completion_started_at = Some(Instant::now());
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), true));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), true));
     app.pending_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
         tier: crate::model_routing::AutoRouteTier::Fast,
         pair: crate::model_routing::AutoRoutePair {
@@ -18205,7 +18429,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
         created_at,
         submission_id: None,
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: true,
@@ -18229,7 +18453,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     assert_eq!(active_turn.turn_id, "turn_cancel_race");
     assert_eq!(active_turn.created_at, created_at);
     let route = active_turn.route.as_ref().expect("captured route");
-    assert_eq!(route.provider, ApiProvider::Openai);
+    assert_eq!(route.provider, ProviderKind::Openai);
     assert_eq!(route.model, "gpt-5.5");
     assert!(route.auto_model);
     assert_eq!(
@@ -18261,7 +18485,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
 fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
     let mut app = create_test_app();
     let receipt = crate::route_receipt::TurnRouteReceipt::new(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek",
         "deepseek-chat",
         "https://api.deepseek.com/v1",
@@ -18271,7 +18495,7 @@ fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
         turn_id: "turn_route_receipt".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-chat".to_string(),
             auto_model: false,
@@ -18297,7 +18521,7 @@ fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
         .suggestion_authority
         .as_ref()
         .expect("the route receipt is the authority, so no config lookup is required");
-    assert_eq!(authority.provider(), ApiProvider::Deepseek);
+    assert_eq!(authority.provider(), ProviderKind::Deepseek);
     assert_eq!(authority.provider_identity(), "deepseek");
     assert_eq!(authority.model(), "deepseek-chat");
     assert_eq!(authority.endpoint_identity(), "https://api.deepseek.com/v1");
@@ -18316,7 +18540,7 @@ fn turn_started_without_a_route_receipt_captures_no_suggestion_authority() {
         turn_id: "turn_no_receipt".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-chat".to_string(),
             auto_model: false,
@@ -18349,17 +18573,23 @@ fn turn_started_without_a_route_receipt_captures_no_suggestion_authority() {
 #[test]
 fn engine_error_health_accounting_uses_active_turn_route() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "current-model".to_string();
     let event = EngineEvent::TurnStarted {
         turn_id: "routed-turn".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: true,
-            receipt: None,
+            receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
+                ProviderKind::Openai,
+                "openai",
+                "gpt-5.5",
+                "https://api.openai.com/v1",
+                "fixture-key",
+            )),
             billing: Some(crate::core::events::RouteBillingEnvelope {
                 openrouter_vendor: None,
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -18375,9 +18605,10 @@ fn engine_error_health_accounting_uses_active_turn_route() {
     };
     capture_turn_started_metadata(&mut app, &event);
 
-    let route = error_health_route(&app, app.api_provider);
+    let route = error_health_route(&app).expect("captured active turn health route");
 
-    assert_eq!(route, (ApiProvider::Openai, "gpt-5.5".to_string()));
+    assert_eq!(route.0.provider, ProviderKind::Openai);
+    assert_eq!(route.1, "gpt-5.5");
 }
 
 #[test]
@@ -18802,7 +19033,7 @@ fn visible_slash_menu_starts_with_six_tasks_and_still_lists_the_rest() {
 #[test]
 fn visible_slash_model_completions_are_provider_scoped() {
     let mut app = create_test_app();
-    app.api_provider = crate::config::ApiProvider::Together;
+    app.api_provider = crate::config::ProviderKind::Together;
     app.model = crate::config::DEFAULT_TOGETHER_MODEL.to_string();
     app.provider_models.insert(
         "openrouter".to_string(),
@@ -20470,17 +20701,17 @@ fn external_grant_reuse_completes_provider_onboarding() {
     app.onboarding_missing_key_recovery = true;
     app.offline_mode = true;
     app.trust_mode = true;
-    app.set_provider_identity(ApiProvider::Xai, ApiProvider::Xai.as_str());
+    app.set_provider_identity(ProviderKind::Xai, ProviderKind::Xai.as_str());
     app.set_model_selection(crate::config::DEFAULT_XAI_MODEL.to_string());
 
-    complete_provider_picker_onboarding(&mut app, crate::config::ApiProvider::Xai);
+    complete_provider_picker_onboarding(&mut app, crate::config::ProviderKind::Xai);
 
     assert_ne!(
         app.onboarding,
         OnboardingState::Provider,
         "a satisfied provider must not return to the provider step"
     );
-    assert_eq!(app.onboarding_provider, crate::config::ApiProvider::Xai);
+    assert_eq!(app.onboarding_provider, crate::config::ProviderKind::Xai);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.offline_mode);
     assert_saved_startup_route("xai", "xai", crate::config::DEFAULT_XAI_MODEL);
@@ -22005,7 +22236,7 @@ fn legacy_child_usage_metadata_fails_closed_without_parent_route_fallback() {
         turn_id: "turn-child-usage".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-v4-flash".to_string(),
             auto_model: false,
@@ -22075,7 +22306,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // The shared producer emits every class.
     let priced_route = crate::cost_status::EffectiveRouteEnvelope {
         openrouter_vendor: None,
-        provider: crate::config::ApiProvider::Anthropic,
+        provider: crate::config::ProviderKind::Anthropic,
         provider_identity: "anthropic-api".to_string(),
         model: "claude-haiku-4-5".to_string(),
         billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -22105,7 +22336,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // The parent deliberately stays DeepSeek: only the frozen child envelope
     // may control this price.
     let mut priced_app = create_test_app();
-    priced_app.api_provider = crate::config::ApiProvider::Deepseek;
+    priced_app.api_provider = crate::config::ProviderKind::Deepseek;
     priced_app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     let mut metadata = serde_json::json!({});
     crate::cost_status::attach_child_usage_metadata(&mut metadata, &priced_route, &child_usage);
@@ -22131,11 +22362,11 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // closed and name the class, rather than pricing "completely" at 0 for the
     // write tokens.
     let mut unpriced_app = create_test_app();
-    unpriced_app.api_provider = crate::config::ApiProvider::Deepseek;
+    unpriced_app.api_provider = crate::config::ProviderKind::Deepseek;
     unpriced_app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     let unpriced_route = crate::cost_status::EffectiveRouteEnvelope {
         openrouter_vendor: None,
-        provider: crate::config::ApiProvider::Moonshot,
+        provider: crate::config::ProviderKind::Moonshot,
         provider_identity: "moonshot-api".to_string(),
         model: "kimi-k2.7-code".to_string(),
         billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -22164,12 +22395,12 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // A child reporting more reasoning than output is contradicting the subset
     // invariant; the figure is discarded rather than inflating billable output.
     let mut pathological = create_test_app();
-    pathological.api_provider = crate::config::ApiProvider::Deepseek;
+    pathological.api_provider = crate::config::ProviderKind::Deepseek;
     pathological.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     let mut metadata = serde_json::json!({});
     crate::cost_status::attach_child_usage_metadata(
         &mut metadata,
-        &test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash"),
+        &test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash"),
         &codewhale_models::Usage {
             input_tokens: 1_000,
             output_tokens: 100,
@@ -22181,7 +22412,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     handle_tool_call_complete(&mut pathological, "rlm-2", "rlm", &result);
     // Cost is that of 1000 input / 100 output, with no reasoning surcharge.
     let sane = crate::pricing::calculate_turn_cost_estimate_for_provider(
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "deepseek-v4-flash",
         &codewhale_models::Usage {
             input_tokens: 1_000,
@@ -22200,7 +22431,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
 #[test]
 fn zero_usage_model_child_still_records_priced_receipt() {
     let mut app = create_test_app();
-    let route = test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash");
+    let route = test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash");
     let mut metadata = serde_json::json!({});
     crate::cost_status::attach_child_usage_metadata(
         &mut metadata,
@@ -22220,9 +22451,10 @@ fn zero_usage_model_child_still_records_priced_receipt() {
 #[test]
 fn routed_missing_usage_batch_prices_exact_routes_and_only_residual_as_generic() {
     let mut app = create_test_app();
-    let mut metered_route = test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash");
+    let mut metered_route = test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash");
     metered_route.billing_mode = crate::cost_status::RouteBillingMode::Metered;
     let mut local_route = metered_route.clone();
+    local_route.provider = ProviderKind::Custom;
     local_route.provider_identity = "local-computer".to_string();
     local_route.billing_mode = crate::cost_status::RouteBillingMode::Local;
     let batch = crate::cost_status::RuntimeUsageBatch {
@@ -22230,10 +22462,12 @@ fn routed_missing_usage_batch_prices_exact_routes_and_only_residual_as_generic()
         records: Vec::new(),
         drop_records: vec![
             crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
                 source_id: "rlm:missing:metered".to_string(),
                 route: metered_route,
             },
             crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
                 source_id: "rlm:missing:local".to_string(),
                 route: local_route,
             },
@@ -22418,7 +22652,7 @@ fn picker_rename_of_inactive_session_does_not_touch_active_metadata() {
 #[test]
 fn codex_tool_child_usage_does_not_inherit_public_api_pricing() {
     let mut app = create_test_app();
-    app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+    app.api_provider = crate::config::ProviderKind::OpenaiCodex;
     app.billing_presentation =
         crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
     let result = Ok(crate::tools::spec::ToolResult::success("ok").with_metadata(
@@ -22548,12 +22782,8 @@ fn automatic_session_snapshot_records_the_literal_custom_table_id() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
-    let config = Config {
-        provider: Some("custom".to_string()),
-        default_text_model: Some("legacy-root-model".to_string()),
-        ..Config::default()
-    }
-    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
+    let config =
+        named_custom_session_config("custom", "http://127.0.0.1:18180/v1", "legacy-root-model");
     let mut app = App::new(create_test_options(), &config);
     app.api_messages_mut()
         .push(text_message("user", "persist root"));
@@ -22561,8 +22791,8 @@ fn automatic_session_snapshot_records_the_literal_custom_table_id() {
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     let serialized = serde_json::to_string(&snapshot).expect("serialize session");
 
-    // The literal route is the `[providers.custom]` table since #6394, so
-    // the snapshot records its exact id. Older id-less records still load.
+    // An explicitly declared literal table has an exact identity; root-only
+    // legacy records retain their separately captured absent-id provenance.
     assert_eq!(snapshot.metadata.model_provider, "custom");
     assert_eq!(
         snapshot.metadata.model_provider_id.as_deref(),
@@ -22846,7 +23076,7 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     app.current_session_id = Some("current-session".to_string());
     app.workspace = PathBuf::from("/tmp/current-workspace");
     app.set_model_selection("deepseek-v4-pro".to_string());
-    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
     app.add_message(HistoryCell::System {
         content: "existing receipt".to_string(),
     });
@@ -22874,7 +23104,7 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
     assert_eq!(app.api_messages.len(), 1);
     assert_eq!(app.workspace, PathBuf::from("/tmp/current-workspace"));
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.provider_identity_for_persistence(), "deepseek");
     assert_eq!(app.model_selection_for_persistence(), "deepseek-v4-pro");
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
@@ -22894,7 +23124,7 @@ fn custom_session_resume_requires_structural_route_not_client_construction() {
     app.current_session_id = Some("current-session".to_string());
     app.workspace = PathBuf::from("/tmp/current-workspace");
     app.set_model_selection("deepseek-v4-pro".to_string());
-    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
     app.add_message(HistoryCell::System {
         content: "existing receipt".to_string(),
     });
@@ -22925,7 +23155,7 @@ fn custom_session_resume_requires_structural_route_not_client_construction() {
     assert!(app.input.is_empty());
     assert!(app.queued_draft.is_none());
     assert_eq!(app.workspace, PathBuf::from("/tmp/other-workspace"));
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
     assert_eq!(app.model_selection_for_persistence(), "local-code-model");
     assert!(
@@ -22955,7 +23185,7 @@ fn named_custom_provider_resume_uses_exact_live_endpoint_model_and_workspace() {
 
     apply_loaded_session(&mut app, &mut config, &session).expect("restore exact custom route");
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
     assert_eq!(app.model_selection_for_persistence(), "local-code-model");
     assert_eq!(app.workspace, resumed_workspace.path());
@@ -22985,7 +23215,7 @@ fn same_workspace_named_custom_switch_requires_engine_respawn() {
     let workspace = PathBuf::from("/tmp/same-workspace-custom-switch");
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let previous_provider = app.api_provider;
     let previous_identity = app.provider_identity_for_persistence().to_string();
@@ -22997,8 +23227,8 @@ fn same_workspace_named_custom_switch_requires_engine_respawn() {
     session.metadata.workspace = workspace;
     apply_loaded_session(&mut app, &mut config, &session).expect("restore custom B");
 
-    assert_eq!(previous_provider, ApiProvider::Custom);
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(previous_provider, ProviderKind::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert!(loaded_session_requires_engine_respawn(
         &app,
@@ -23017,7 +23247,7 @@ fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
         named_custom_session_config("custom-b", "http://127.0.0.1:18182/v1", "model-b");
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     app.api_messages_mut()
         .push(text_message("user", "old conversation"));
@@ -23066,18 +23296,14 @@ fn session_load_resolves_an_idless_custom_record_to_the_literal_table() {
     session.metadata.model_provider_id = None;
     session.metadata.model = "legacy-saved-model".to_string();
 
-    // An older top-level endpoint beside a `[providers.custom]` table belongs
-    // to DeepSeek (#6394); the id-less literal record is the table's route.
-    apply_loaded_session(&mut app, &mut config, &session)
-        .expect("id-less custom record resolves to the literal table");
-    assert_eq!(*app.api_messages, session.messages);
-    assert_eq!(app.api_provider, ApiProvider::Custom);
-    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    let previous_messages = app.api_messages.clone();
+    let previous_provider = app.provider_identity_for_persistence().to_string();
+    let error = apply_loaded_session(&mut app, &mut config, &session)
+        .expect_err("a conflicting root cannot authorize a missing custom id");
+    assert!(error.contains("will not guess or fall back"), "{error}");
+    assert_eq!(app.api_messages, previous_messages);
+    assert_eq!(app.provider_identity_for_persistence(), previous_provider);
     assert_eq!(config.active_route_base_url(), "http://127.0.0.1:18182/v1");
-    assert_eq!(
-        config.deepseek_table_base_url(),
-        Some("http://127.0.0.1:18181/v1")
-    );
 }
 
 #[test]
@@ -23122,7 +23348,7 @@ fn session_load_rejects_empty_custom_id_when_root_and_table_coexist() {
     let mut app = create_test_app();
     app.api_messages_mut()
         .push(text_message("user", "current conversation"));
-    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
     app.set_model_selection("deepseek-v4-pro".to_string());
     let previous_messages = app.api_messages.clone();
     let previous_provider = app.api_provider;
@@ -23176,7 +23402,7 @@ fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
 
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "new endpoint")]);
     session.metadata.model_provider = "custom-a".to_string();
@@ -23199,7 +23425,7 @@ fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
         "http://127.0.0.1:18199/v1"
     );
     let entry = stale_config
-        .provider_config_for(ApiProvider::Custom)
+        .provider_config_for(&stale_config.test_identity_for_kind(ProviderKind::Custom))
         .expect("fresh custom route");
     assert_eq!(entry.api_key.as_deref(), Some("rotated-key"));
     assert_eq!(
@@ -23243,7 +23469,7 @@ fn file_load_route_refresh_preserves_effective_permission_and_feature_overlays()
 
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "keep policy")]);
     session.metadata.model_provider = "custom-a".to_string();
@@ -23295,32 +23521,30 @@ fn session_picker_restore_rejects_active_turn_before_mutating() {
 #[test]
 fn session_restore_rebuilds_fresh_codex_route_limits() {
     let _lock = crate::test_support::lock_test_env();
-    let codex_home = tempfile::tempdir().expect("Codex home");
-    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
-    std::fs::write(
-        codex_home.path().join("models_cache.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "fetched_at": chrono::Utc::now(),
-            "models": [{
-                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
-                "priority": 1,
-                "context_window": 272000,
-                "supported_reasoning_levels": [{"effort": "high"}]
-            }]
-        }))
-        .expect("serialize cache"),
-    )
-    .expect("write cache");
+    let home = tempfile::tempdir().expect("owned registration home");
+    let root = home.path().canonicalize().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
     let mut app = create_test_app();
     let mut config = Config::default();
-    let mut session = saved_session_with_messages(vec![text_message("user", "resume Codex")]);
-    session.metadata.model_provider = ApiProvider::OpenaiCodex.as_str().to_string();
+    crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        vec![crate::codex_model_cache::CodexModelMetadata {
+            id: crate::config::DEFAULT_OPENAI_CODEX_MODEL.into(),
+            display_name: None,
+            context_window: Some(272_000),
+            reasoning: Some(true),
+            efforts: vec!["high".into()],
+        }],
+    )
+    .unwrap();
+    let mut session = saved_session_with_messages(vec![text_message("user", "resume ChatGPT")]);
+    session.metadata.model_provider = ProviderKind::OpenaiCodex.as_str().to_string();
     session.metadata.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
 
     apply_loaded_session(&mut app, &mut config, &session).expect("restore session");
 
-    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
-    assert_eq!(app.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
+    assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
     assert_eq!(
         app.active_route_limits
             .and_then(|limits| limits.context_tokens),
@@ -23426,7 +23650,7 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
     };
     let mut app = create_test_app();
     app.set_model_selection("auto".to_string());
-    app.last_effective_provider = Some(ApiProvider::Zai);
+    app.last_effective_provider = Some(ProviderKind::Zai);
     app.last_effective_provider_identity = Some("zai".to_string());
     app.last_effective_model = Some(crate::config::ZAI_GLM_5_2_MODEL.to_string());
     app.last_auto_route_receipt = Some(receipt.clone());
@@ -23457,7 +23681,7 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
         .last_auto_route
         .as_ref()
         .expect("persisted Auto route");
-    assert_eq!(saved.provider, ApiProvider::Zai);
+    assert_eq!(saved.provider, ProviderKind::Zai);
     assert_eq!(saved.provider_identity, "zai");
     assert_eq!(saved.model, crate::config::ZAI_GLM_5_2_MODEL);
     assert_eq!(saved.receipt, receipt);
@@ -23471,7 +23695,10 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
         .expect("restore session");
 
     assert!(restored_app.auto_model);
-    assert_eq!(restored_app.last_effective_provider, Some(ApiProvider::Zai));
+    assert_eq!(
+        restored_app.last_effective_provider,
+        Some(ProviderKind::Zai)
+    );
     assert_eq!(
         restored_app.last_effective_provider_identity.as_deref(),
         Some("zai")
@@ -23656,13 +23883,13 @@ async fn model_picker_apply_is_session_local_until_startup_default_is_requested(
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,
@@ -23744,18 +23971,20 @@ async fn model_picker_startup_default_overrides_configured_xai_route_after_resta
         ..crate::test_support::test_tui_options(PathBuf::from("."))
     };
     let mut app = App::new(initial_options, &config);
-    assert_eq!(app.api_provider, ApiProvider::Xai);
+    assert_eq!(app.api_provider, ProviderKind::Xai);
     assert_eq!(app.model, "grok-4.5");
     let previous_effort = app.reasoning_effort;
     let mut engine = mock_engine_handle();
 
+    let selected_identity = config
+        .builtin_provider_identity(ProviderKind::Deepseek)
+        .unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-flash".to_string(),
-        Some(ApiProvider::Deepseek),
-        None,
+        Some(selected_identity),
         previous_effort,
         "grok-4.5".to_string(),
         previous_effort,
@@ -23766,7 +23995,7 @@ async fn model_picker_startup_default_overrides_configured_xai_route_after_resta
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash");
     assert!(
         app.status_message
@@ -23789,7 +24018,7 @@ async fn model_picker_startup_default_overrides_configured_xai_route_after_resta
         ..crate::test_support::test_tui_options(PathBuf::from("."))
     };
     let restarted = App::new(restart_options, &restart_config);
-    assert_eq!(restarted.api_provider, ApiProvider::Deepseek);
+    assert_eq!(restarted.api_provider, ProviderKind::Deepseek);
     assert_eq!(
         restarted.model, "deepseek-v4-flash",
         "the explicit startup default must replace config's xAI selection"
@@ -23809,13 +24038,13 @@ async fn model_picker_auto_commits_visible_implicit_fixed_model_thinking() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "auto".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::Max,
         "deepseek-v4-pro".to_string(),
         ReasoningEffort::Auto,
@@ -23842,7 +24071,7 @@ async fn model_picker_auto_commits_visible_implicit_fixed_model_thinking() {
 async fn model_picker_auto_restores_raw_preference_after_fixed_normalization() {
     let _guard = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.set_model_selection("deepseek-v4-pro".to_string());
     app.reasoning_effort = ReasoningEffort::High;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
@@ -23852,13 +24081,13 @@ async fn model_picker_auto_restores_raw_preference_after_fixed_normalization() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "auto".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::Low,
         "deepseek-v4-pro".to_string(),
         ReasoningEffort::Low,
@@ -23933,13 +24162,13 @@ async fn reselecting_live_model_and_thinking_is_session_local() {
         "the test home must start with no recorded setup progress"
     );
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::High,
         "deepseek-v4-pro".to_string(),
         ReasoningEffort::High,
@@ -24012,7 +24241,7 @@ async fn reselecting_live_thinking_only_persists_startup_default() {
 async fn model_picker_switches_between_exact_named_custom_routes() {
     let _guard = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let previous_effort = app.reasoning_effort;
     let mut custom = HashMap::new();
@@ -24043,13 +24272,13 @@ async fn model_picker_switches_between_exact_named_custom_routes() {
     };
     let mut engine = mock_engine_handle();
 
+    let selected_identity = config.resolve_provider_pin_identity("custom-b").unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "model-b".to_string(),
-        None,
-        Some("custom-b".to_string()),
+        Some(selected_identity),
         ReasoningEffort::High,
         "model-a".to_string(),
         previous_effort,
@@ -24057,7 +24286,7 @@ async fn model_picker_switches_between_exact_named_custom_routes() {
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert_eq!(app.model_selection_for_persistence(), "model-b");
     assert_eq!(config.provider.as_deref(), Some("custom-b"));
@@ -24068,7 +24297,7 @@ async fn model_picker_switches_between_exact_named_custom_routes() {
 async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
     let _guard = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     app.reasoning_effort = ReasoningEffort::Low;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
@@ -24099,13 +24328,13 @@ async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
     };
     let mut engine = mock_engine_handle();
 
+    let selected_identity = config.resolve_provider_pin_identity("custom-b").unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "auto".to_string(),
-        None,
-        Some("custom-b".to_string()),
+        Some(selected_identity),
         ReasoningEffort::Low,
         "model-a".to_string(),
         previous_effort,
@@ -24113,7 +24342,7 @@ async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert!(app.auto_model);
     assert_eq!(app.model_selection_for_persistence(), "auto");
@@ -24134,7 +24363,7 @@ async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
 #[test]
 fn dismissing_named_custom_model_picker_restores_app_owned_config_route() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     let mut config =
         named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
     config.providers.as_mut().expect("providers").custom.insert(
@@ -24178,13 +24407,13 @@ async fn model_picker_startup_default_reports_settings_write_failure() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,
@@ -24728,7 +24957,7 @@ async fn composer_send_anchors_new_message_at_tail() {
     let _env_lock = crate::test_support::lock_test_env();
     let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-test-key");
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Zai, "zai");
+    app.set_provider_identity(ProviderKind::Zai, "zai");
     app.set_model_selection("auto".to_string());
     let config = Config {
         provider: Some("zai".to_string()),
@@ -26194,9 +26423,19 @@ fn recoverable_engine_error_does_not_enter_offline_mode() {
 fn recoverable_provider_error_advances_fallback_chain() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
-    let mut app = create_test_app();
+    let config = Config {
+        fallback_providers: vec![ProviderKind::Openrouter],
+        providers: Some(ProvidersConfig {
+            openrouter: ProviderConfig {
+                api_key: Some("captured-fixture-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = App::new(create_test_options(), &config);
     app.ui_locale = codewhale_localization::Locale::Fr;
-    app.api_provider = ApiProvider::Deepseek;
     app.provider_chain = Some(codewhale_config::ProviderChain::new(
         codewhale_config::ProviderKind::Deepseek,
         &[codewhale_config::ProviderKind::Openrouter],
@@ -26213,7 +26452,7 @@ fn recoverable_provider_error_advances_fallback_chain() {
         ),
     );
 
-    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.api_provider, ProviderKind::Openrouter);
     assert!(app.is_fallback_active());
     assert!(!app.offline_mode);
     let toast = app.status_toasts.back().expect("fallback notice");
@@ -26243,7 +26482,7 @@ fn auth_error_does_not_trigger_provider_fallback() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     // Not env-only, so we exercise the category gate rather than the env-key
     // onboarding early-return.
     app.api_key_env_only = false;
@@ -26267,7 +26506,7 @@ fn auth_error_does_not_trigger_provider_fallback() {
 
     assert_eq!(
         app.api_provider,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "auth failure must not rotate providers"
     );
     assert!(!app.is_fallback_active());
@@ -26286,7 +26525,7 @@ fn fallback_switch_status_shows_one_based_position_and_reason() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.provider_chain = Some(codewhale_config::ProviderChain::new(
         codewhale_config::ProviderKind::Deepseek,
         &[codewhale_config::ProviderKind::Openrouter],
@@ -26303,7 +26542,7 @@ fn fallback_switch_status_shows_one_based_position_and_reason() {
         ),
     );
 
-    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.api_provider, ProviderKind::Openrouter);
     assert_eq!(
         app.fallback_chain_position(),
         Some(1),
@@ -26343,17 +26582,18 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
         Some("http://127.0.0.1:18180/v1".to_string()),
     );
     let previous_identity = ProviderIdentity {
-        provider: ApiProvider::Custom,
-        key: "custom".to_string(),
-        exact_id: Some("custom".to_string()),
+        provider: ProviderKind::Custom,
+        key: "custom".into(),
+        exact_id: Some("custom".into()),
         migrated_legacy_ollama_cloud_route: false,
+        legacy_root_custom_generation: None,
     };
     let mut app = create_test_app();
     app.set_provider_identity_record(previous_identity.clone());
     app.set_model_selection("literal-table-model".to_string());
     // Mirror `apply_engine_error_to_app`: the fallback chain has advanced the
     // enum while the previous exact route remains the rollback authority.
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     let mut engine = mock_engine_handle();
     let previous_chain = app.provider_chain.clone();
 
@@ -26368,10 +26608,11 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom");
     assert_eq!(app.provider_id_for_persistence(), Some("custom"));
-    let (restored_identity, restored_config) = app_scoped_runtime_config(&app, &config);
+    let (restored_identity, restored_config) =
+        app_scoped_runtime_config(&app, &config).expect("restored exact route");
     assert_eq!(restored_identity, previous_identity);
     let route = resolve_runtime_route_for_identity(
         &restored_config,
@@ -26379,7 +26620,7 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
         Some("literal-table-model"),
     )
     .expect("restored identity must still resolve the exact literal table");
-    assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+    assert_eq!(route.identity.persisted_id(), Some("custom"));
     assert_eq!(
         route.candidate.endpoint().base_url,
         "http://127.0.0.1:18181/v1"
@@ -26396,7 +26637,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
 
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "deepseek-v4-pro".to_string();
     app.model_ids_passthrough = false;
     app.onboarding = OnboardingState::None;
@@ -26424,15 +26665,18 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Moonshot,
-        Some("kimi-k2.6".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Moonshot);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("kimi-k2.6".to_string()),
+        )
+    }
     .await;
-    assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.api_provider, ProviderKind::Moonshot);
     assert_eq!(app.active_context_window_override, Some(262_144));
     assert_eq!(config.provider.as_deref(), Some("moonshot"));
     assert!(app.pending_provider_switch.is_some());
@@ -26444,7 +26688,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     let rollback_status = rollback_provider_after_auth_failure(&mut app, &mut config)
         .expect("auth failure after provider switch should roll back");
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
     assert_eq!(app.active_context_window_override, Some(1_000_000));
     assert!(!app.model_ids_passthrough);
@@ -26504,7 +26748,7 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     let _home = SettingsHomeGuard::new();
     let bad_config_path = TempDir::new().expect("bad config path");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "deepseek-v4-pro".to_string();
     app.model_ids_passthrough = false;
     app.onboarding = OnboardingState::None;
@@ -26529,13 +26773,16 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Moonshot,
-        Some("kimi-k2.6".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Moonshot);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("kimi-k2.6".to_string()),
+        )
+    }
     .await;
     let target_state = codewhale_config::SetupState::load()
         .expect("load target setup state")
@@ -26556,7 +26803,7 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     let rollback_status = rollback_provider_after_auth_failure(&mut app, &mut config)
         .expect("auth failure after provider switch should roll back");
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
     // The rollback itself writes nothing — there is no persistence step to
     // fail, and the receipt must not claim one.
@@ -27570,7 +27817,7 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
             images: Vec::new(),
             mode: AppMode::Agent,
             route: Box::new(
-                resolve_runtime_route(&config, ApiProvider::Deepseek, Some(&app.model))
+                resolve_runtime_route(&config, ProviderKind::Deepseek, Some(&app.model))
                     .expect("structural route resolution"),
             ),
             compaction: Box::default(),
@@ -27660,7 +27907,7 @@ fn env_only_auth_failure_reopens_provider_onboarding() {
     use crate::error_taxonomy::ErrorEnvelope;
     let mut app = create_test_app();
     app.ui_locale = codewhale_localization::Locale::Ja;
-    app.api_provider = crate::config::ApiProvider::Anthropic;
+    app.api_provider = crate::config::ProviderKind::Anthropic;
     app.config_path = Some(std::path::PathBuf::from("/tmp/codewhale-phase2.toml"));
     app.api_key_env_only = true;
     app.onboarding = crate::tui::app::OnboardingState::None;
@@ -27687,7 +27934,7 @@ fn env_only_auth_failure_reopens_provider_onboarding() {
         status,
         app.tr(MessageId::OnboardApiKeyRejectedEnv)
             .replace("{provider}", "anthropic")
-            .replace("{env}", &app.api_provider.env_vars_label())
+            .replace("{env}", &app.api_provider.provider().env_vars().join(" / "))
             .replace("{path}", "/tmp/codewhale-phase2.toml")
     );
     assert!(
@@ -27952,7 +28199,7 @@ fn default_footer_excludes_provider_specific_diagnostic_chips() {
 #[test]
 fn should_fetch_provider_balance_requires_balance_status_item() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.status_items = crate::config::StatusItem::default_footer();
 
     assert!(!should_fetch_provider_balance(&app));
@@ -27966,16 +28213,16 @@ fn should_fetch_provider_balance_covers_prepaid_providers() {
     let mut app = create_test_app();
     app.status_items = vec![crate::config::StatusItem::Balance];
 
-    app.api_provider = ApiProvider::Ollama;
+    app.api_provider = ProviderKind::Ollama;
     assert!(!should_fetch_provider_balance(&app));
 
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     assert!(should_fetch_provider_balance(&app));
 
-    app.api_provider = ApiProvider::Siliconflow;
+    app.api_provider = ProviderKind::Siliconflow;
     assert!(should_fetch_provider_balance(&app));
 
-    app.api_provider = ApiProvider::DeepseekCN;
+    app.api_provider = ProviderKind::Deepseek;
     assert!(should_fetch_provider_balance(&app));
 }
 
@@ -28027,7 +28274,7 @@ fn duplicate_mailbox_token_usage_does_not_regress_displayed_cost() {
         agent_id: "agent-x".to_string(),
         source_id: "response-x".to_string(),
         route: Box::new(test_mailbox_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
         )),
         usage: codewhale_models::Usage {
@@ -30870,13 +31117,15 @@ async fn refused_route_change_does_not_pin_a_startup_default_and_says_so() {
     // A busy session refuses model/thinking changes outright.
     app.is_loading = true;
 
+    let selected_identity = config
+        .builtin_provider_identity(ProviderKind::Deepseek)
+        .unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-flash".to_string(),
-        Some(ApiProvider::Deepseek),
-        None,
+        Some(selected_identity),
         previous_effort,
         "grok-4.5".to_string(),
         previous_effort,
@@ -30886,7 +31135,7 @@ async fn refused_route_change_does_not_pin_a_startup_default_and_says_so() {
 
     assert_eq!(
         app.api_provider,
-        ApiProvider::Xai,
+        ProviderKind::Xai,
         "the refused switch must leave the live route alone"
     );
     let settings = crate::settings::Settings::load().expect("load settings");
@@ -32743,7 +32992,7 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     // at the root, so `/provider openai` came back on the catalog default.
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Openai;
+    app.api_provider = ProviderKind::Openai;
     app.model = "gpui-fixture".to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -32762,29 +33011,35 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     assert!(
-        switch_provider(
-            &mut app,
-            &mut engine.handle,
-            &mut config,
-            ApiProvider::Deepseek,
-            None,
-        )
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+            switch_provider(
+                &mut app,
+                &mut engine.handle,
+                &mut config,
+                captured_fixture_identity,
+                None,
+            )
+        }
         .await
     );
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_ne!(app.model, "gpui-fixture");
 
     assert!(
-        switch_provider(
-            &mut app,
-            &mut engine.handle,
-            &mut config,
-            ApiProvider::Openai,
-            None,
-        )
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openai);
+            switch_provider(
+                &mut app,
+                &mut engine.handle,
+                &mut config,
+                captured_fixture_identity,
+                None,
+            )
+        }
         .await
     );
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
     assert_eq!(app.model, "gpui-fixture");
 }
 
@@ -33196,4 +33451,61 @@ fn extension_prompt_origin_keeps_denials_and_other_policy_holds() {
         resolve_ui_approval_disposition(&app, "bash", "group", key, true),
         D::AutoDenyNeverPosture
     );
+}
+
+#[test]
+fn engine_retry_status_receipts_survive_footer_overwrite_in_the_existing_transcript() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = App::new(create_test_options(), &Config::default());
+    let first = "Retry attempt: transport 1/2; upstream 503; waiting 0.00s";
+    let last = "Retry recovery: transport request recovered after 1 retries";
+    let before = app.history.len();
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        first.into()
+    ));
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        last.into()
+    ));
+    assert!(!super::event_loop::apply_engine_status(
+        &mut app,
+        "Executing tools sequentially".into()
+    ));
+    assert_eq!(app.history.len(), before + 2);
+    assert!(matches!(&app.history[before], HistoryCell::System { content } if content == first));
+    assert!(matches!(&app.history[before + 1], HistoryCell::System { content } if content == last));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Executing tools sequentially")
+    );
+}
+
+#[test]
+fn engine_retry_receipt_projection_keeps_quiet_history_without_internal_status_rows() {
+    let _home = SettingsHomeGuard::new();
+    let config = Config {
+        notifications: Some(crate::config::NotificationsConfig {
+            quiet: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = App::new(create_test_options(), &config);
+    let before = app.history.len();
+    for status in [
+        "Continuing — next model step",
+        "Loaded deferred tool 'read'. Retry the call with its visible schema.",
+        "Goal set; starting goal work.",
+    ] {
+        assert!(!super::event_loop::apply_engine_status(
+            &mut app,
+            status.into()
+        ));
+    }
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        "Retry recovery: stream recovered after 1 retries".into()
+    ));
+    assert_eq!(app.history.len(), before + 1);
 }

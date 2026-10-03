@@ -1410,6 +1410,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Worker,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "not projected".to_string(),
                 role: None,
             },

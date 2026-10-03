@@ -21,7 +21,7 @@ impl HostAttachment {
             .lock()
             .expect("attachments lock")
             .get(&self.id)
-            .map(|state| state.desired.clone())
+            .map(|state| state.selection.clone())
             .unwrap_or_default();
         let hooks: Vec<_> = shared
             .registry
@@ -29,7 +29,13 @@ impl HostAttachment {
             .expect("registry lock")
             .live_hooks()
             .into_iter()
-            .filter(|hook| desired.get(&hook.owner.plugin_id) == Some(&hook.content_hash))
+            .filter(|hook| {
+                desired.includes(
+                    &hook.owner.plugin_id,
+                    &hook.content_hash,
+                    hook.scope.as_ref(),
+                )
+            })
             .collect();
         let mut results = Vec::with_capacity(hooks.len());
         let batch_started = Instant::now();
@@ -37,14 +43,14 @@ impl HostAttachment {
             let started = Instant::now();
             let answer = async {
                 let host = shared.live_host_for_hook(&hook).await?;
-                let still_desired = shared
-                    .attachments
-                    .lock()
-                    .expect("attachments lock")
-                    .get(&self.id)
-                    .is_some_and(|state| {
-                        state.desired.get(&hook.owner.plugin_id) == Some(&hook.content_hash)
-                    });
+                let still_desired = desired.revision.is_some_and(|revision| {
+                    shared.selection_current(
+                        revision,
+                        &hook.owner.plugin_id,
+                        &hook.content_hash,
+                        hook.scope.as_ref(),
+                    )
+                });
                 if !still_desired {
                     return Err("extension hook was withdrawn".to_string());
                 }
@@ -69,14 +75,14 @@ impl HostAttachment {
                 // A late response cannot restore an owner revoked while the
                 // callback waited. Revalidate its receipt and generation too.
                 shared.live_host_for_hook(&hook).await?;
-                let still_desired = shared
-                    .attachments
-                    .lock()
-                    .expect("attachments lock")
-                    .get(&self.id)
-                    .is_some_and(|state| {
-                        state.desired.get(&hook.owner.plugin_id) == Some(&hook.content_hash)
-                    });
+                let still_desired = desired.revision.is_some_and(|revision| {
+                    shared.selection_current(
+                        revision,
+                        &hook.owner.plugin_id,
+                        &hook.content_hash,
+                        hook.scope.as_ref(),
+                    )
+                });
                 if !still_desired {
                     return Err("extension hook was withdrawn".to_string());
                 }

@@ -5,13 +5,13 @@ use anyhow::{Context, Result};
 use super::http_client::McpHttpClient;
 use super::wire::{
     MAX_SSE_FRAME_BYTES, McpSessionRejected, find_sse_event_separator_bytes,
-    is_mcp_stale_session_body, sse_field_value,
+    is_mcp_stale_session_body, resolve_sse_endpoint_url, sse_field_value,
 };
 use super::{ERROR_BODY_PREVIEW_BYTES, McpTransport, bounded_body_excerpt, mask_url_secrets};
 
 const SSE_INBOUND_CHANNEL_CAPACITY: usize = 4;
 
-pub(super) struct SseTransport {
+pub(crate) struct SseTransport {
     pub(super) client: McpHttpClient,
     pub(super) base_url: String,
     pub(super) endpoint_url: Option<String>,
@@ -222,37 +222,8 @@ impl SseTransport {
     }
 
     fn store_endpoint(&mut self, endpoint: &str) -> Result<()> {
-        self.endpoint_url = Some(Self::resolve_endpoint_url(&self.base_url, endpoint)?);
+        self.endpoint_url = Some(resolve_sse_endpoint_url(&self.base_url, endpoint)?);
         Ok(())
-    }
-
-    fn resolve_endpoint_url(base_url: &str, endpoint_url: &str) -> Result<String> {
-        let base = reqwest::Url::parse(base_url)?;
-        let resolved =
-            if endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://") {
-                reqwest::Url::parse(endpoint_url)?
-            } else {
-                base.join(endpoint_url)?
-            };
-        // Security: the server-supplied `endpoint` event must stay same-origin
-        // as the connect URL. The connect host is vetted by network policy
-        // once, but the endpoint host is never re-checked — so an absolute
-        // cross-origin endpoint would let a malicious MCP server redirect the
-        // client's *authenticated* POSTs (Bearer/OAuth headers attached) to an
-        // internal host (169.254.169.254, localhost admin ports, …): an SSRF /
-        // policy bypass. Relative endpoints are same-origin by construction.
-        if resolved.scheme() != base.scheme()
-            || resolved.host_str() != base.host_str()
-            || resolved.port_or_known_default() != base.port_or_known_default()
-        {
-            anyhow::bail!(
-                "MCP SSE endpoint {} is not same-origin as {} — refusing to send \
-                 authenticated requests cross-origin",
-                mask_url_secrets(resolved.as_str()),
-                mask_url_secrets(base.as_str()),
-            );
-        }
-        Ok(resolved.to_string())
     }
 }
 
@@ -337,36 +308,6 @@ mod endpoint_tests {
     use std::time::Duration;
 
     use super::{McpHttpClient, SseInbound, SseTransport};
-
-    #[test]
-    fn resolve_endpoint_accepts_relative_and_same_origin() {
-        let base = "https://mcp.example.com/v1/sse";
-        // Relative path -> same origin.
-        assert_eq!(
-            SseTransport::resolve_endpoint_url(base, "/messages?sid=1").unwrap(),
-            "https://mcp.example.com/messages?sid=1"
-        );
-        // Absolute but same origin -> allowed.
-        assert_eq!(
-            SseTransport::resolve_endpoint_url(base, "https://mcp.example.com/messages").unwrap(),
-            "https://mcp.example.com/messages"
-        );
-    }
-
-    #[test]
-    fn resolve_endpoint_rejects_cross_origin_ssrf() {
-        let base = "https://mcp.example.com/v1/sse";
-        // Different host (metadata endpoint) -> rejected.
-        assert!(SseTransport::resolve_endpoint_url(base, "http://169.254.169.254/latest").is_err());
-        // Different scheme -> rejected.
-        assert!(
-            SseTransport::resolve_endpoint_url(base, "http://mcp.example.com/messages").is_err()
-        );
-        // Different port -> rejected.
-        assert!(
-            SseTransport::resolve_endpoint_url(base, "https://mcp.example.com:8443/x").is_err()
-        );
-    }
 
     #[tokio::test]
     async fn message_before_endpoint_is_rejected_instead_of_buffered() {

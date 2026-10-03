@@ -88,6 +88,7 @@ pub struct AgentProfile {
     /// Runtime authority for a profile loaded from an immutable plugin
     /// snapshot. Rechecked at Agent spawn so another process can revoke it.
     pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
+    pub native_preset: Option<crate::extension_host::composition_scope::NativePresetRef>,
 }
 
 /// The minimum profile information needed to prevent a save from clobbering
@@ -154,7 +155,7 @@ struct AgentProfileToml {
     #[serde(default, alias = "model_hint", alias = "model_id")]
     model: Option<String>,
     /// Explicit provider id for `model` (#4093), e.g. `"deepseek"` or
-    /// `"openrouter"`. Validated against the known `ApiProvider` vocabulary at
+    /// `"openrouter"`. Validated against the known `ProviderKind` vocabulary at
     /// load time — never inferred by sniffing `model` for a provider-shaped
     /// substring (EPIC #2608). `deny_unknown_fields` no longer needs to guard
     /// this name: it is now a first-class, validated field instead of a
@@ -498,6 +499,7 @@ fn load_claude_agent_file(root: Option<&Path>, path: &Path) -> Result<AgentProfi
         non_empty_trimmed(metadata.get("description").map(String::as_str)).map(str::to_string);
     let instructions = trimmed_non_empty(body).map(str::to_string);
     Ok(AgentProfile {
+        native_preset: None,
         id,
         display_name: None,
         description: description.clone(),
@@ -712,6 +714,7 @@ fn agent_profile_from_toml(path: &Path, parsed: AgentProfileToml) -> Result<Agen
     };
 
     Ok(AgentProfile {
+        native_preset: None,
         id,
         display_name: non_empty_trimmed(parsed.display_name.as_deref()).map(str::to_string),
         description,

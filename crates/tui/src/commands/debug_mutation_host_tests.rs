@@ -30,7 +30,7 @@ pub(in crate::commands) fn create_test_app() -> App {
     let mut app = App::new(options, &Config::default());
     app.ui_locale = codewhale_localization::Locale::En;
     app.cost_currency = crate::pricing::CostCurrency::Usd;
-    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.api_provider = crate::config::ProviderKind::Deepseek;
     app
 }
 

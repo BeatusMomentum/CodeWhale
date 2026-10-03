@@ -69,18 +69,50 @@ model-ready).
 
 Sources to keep in sync:
 
-- `crates/config/src/lib.rs` - shared provider IDs, defaults, env precedence.
-- `crates/config/assets/provider_descriptors.json` - bundled OpenAI-compatible
-  host descriptors (the known-good hosts table above).
-- `crates/tui/src/config.rs` - TUI provider IDs, provider capability metadata,
-  and provider-specific env handling.
-- `crates/agent/src/lib.rs` - static `ModelRegistry` used by
-  `codewhale model list` and `codewhale model resolve`.
+- `crates/config/assets/provider_descriptors.json` - built-in and compatible-host
+  labels, defaults, aliases, key-env lists, config/secret slots, and credential
+  guidance. `crates/config/build.rs` generates immutable typed views and the
+  existing constant projections from this one data owner.
+- `crates/config/src/provider_kind.rs` and `src/lib.rs` - legacy identity serde,
+  config schema, environment precedence and Rust route/auth behavior.
+- `crates/tui/src/config.rs` - captures and verifies exact configured provider
+  identities and keeps provider-specific credential and route policy in Rust.
+- `crates/config/assets/catalog_corrections.json` `reviewed` - intrinsic facts,
+  scoped selector aliases, completion references and pure transport metadata.
+  The existing seed renderer embeds this reviewed supplement in Models.dev.
+- `crates/agent/src/lib.rs` - compatibility projection of those shared selector
+  rows for `codewhale model list` and `codewhale model resolve`.
 - `config.example.toml` and `docs/CONFIGURATION.md` - user-facing config
   examples and environment variable reference.
 - `scripts/check-provider-registry.py` - drift check for canonical provider
   IDs, live TUI provider IDs, TOML table names, static registry rows, and
   documented defaults.
+
+## Captured Provider Identity
+
+Presentation names, labels, aliases, and historical wire tags come from
+`provider_descriptors.json`. `ProviderKind` remains the Rust-owned intrinsic
+credential, protocol, and region distinction. A configured route captures both
+its kind and exact table key; a custom table named `openai` stays custom and
+does not acquire OpenAI credentials or protocol rules from its name. Case is
+significant for custom keys.
+
+DeepSeek China has three preserved representations: `deepseek_c_n` in released
+TUI serde wrappers, `deepseek-cn` as its captured route ID, and `deepseek_cn` as
+its config leaf. Its intrinsic kind is DeepSeek, while its table and endpoint
+stay distinct.
+
+An old custom route without an additive provider ID can resume only with a
+verified root `base_url` migration into the active `providers.custom` table.
+That private receipt is bound to the parsed table generation. A table-only,
+profile-only, conflicting, or later replaced table cannot establish the
+missing identity; an explicit empty ID is refused. Writes reuse the existing
+locked config mutation and undo comparison, obtain the fresh migration receipt
+under that lock, and verify the captured table before changing a leaf.
+
+In-flight requests retain their captured identity, endpoint, and credential
+generation. Health lookup cannot treat an opaque credential reference as ready
+merely because an earlier request used the same authentication class.
 
 ## Provider Selection
 
@@ -1040,8 +1072,11 @@ price. Flash ships the published $0.15/$0.50 list. A live call can still
 
 ## Static Model Registry
 
-`codewhale model list` and `codewhale model resolve` use the static registry in
-`crates/agent/src/lib.rs`. This is not the same as live `/models` discovery.
+`codewhale model list` and `codewhale model resolve` project the reviewed
+`selections` in `crates/config/assets/catalog_corrections.json` through
+`crates/agent/src/lib.rs`. There is no independent Rust model roster. These
+ordered aliases and flags are compatibility metadata, not account availability
+or executable route permission. This differs from live `/models` discovery.
 Use `/models` or `codewhale models` to fetch model IDs from the active API
 endpoint when the endpoint supports model listing.
 
@@ -1305,8 +1340,8 @@ python3 scripts/check-provider-registry.py
 The check fails when:
 
 - `docs/PROVIDERS.md` omits a canonical `ProviderKind::as_str()` ID.
-- `crates/tui/src/config.rs` `ApiProvider::as_str()` diverges from
-  `ProviderKind::as_str()` except for the explicit `deepseek-cn` legacy alias.
+- Descriptor presentation IDs or released wire tags are duplicated or drift
+  from intrinsic kinds, or a second provider enum/ordinal bridge is introduced.
 - The shipped-provider table omits or adds a `[providers.*]` TOML table.
 - The static model registry table drifts from providers used by
   `crates/agent/src/lib.rs`.

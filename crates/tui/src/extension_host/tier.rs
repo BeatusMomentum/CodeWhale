@@ -5,8 +5,8 @@
 //!
 //! * **Plugin** (tier 1): reviewed third-party plugins. Owner ids are the
 //!   plugin ids discovery builds (`<scope>/<12 hex>/<name>`). This is the only
-//!   tier that spawns in production today, and everything about it is as it
-//!   was before the split.
+//!   tier serves reviewed third-party code independently of the selected
+//!   builtin MCP protocol backend.
 //! * **Builtin** (tier 0): Codewhale's own host code, so that it never shares
 //!   a process with third-party code. Owner ids are `host:<module>`. A module
 //!   is admitted by a row of [`BUILTIN_MODULES`], which pins the SHA-256 of its
@@ -21,24 +21,13 @@
 //! registry refuses a `host:` id on the plugin tier and any other id on the
 //! builtin tier (`OwnerRegistry::begin_owner`).
 //!
-//! Known limitations (this is the structural split, no more):
-//! * [`BUILTIN_MODULES`] is empty, so nothing asks for the builtin tier and it
-//!   never spawns. "Needed" means "has a row" until the first consumer brings
-//!   a reason to defer the spawn.
-//! * No method is reserved for the builtin tier yet (`protocol::MethodSpec::tiers`
-//!   is both tiers for every row), so the tier allow-list that keeps a
-//!   plugin-tier host from sending or being sent `proc/*`, `net/*` and `mcp/*`
-//!   has nothing to refuse today. `host/hello` does report the tier and the
-//!   built-in module digests, and the core refuses a mismatch with what it
-//!   launched (`supervisor::check_hello_identity`).
-//! * No capability tickets: a tier-0 module can ask for nothing the protocol
-//!   did not already let a plugin ask for. They land with their first redeemer.
-//! * The pinned digest is drift protection (a changed module no longer
-//!   matches its row), not a defence against a process already running as the
-//!   user, which can replace the file and the table's readers alike.
-//! * The source of a module is expected at
-//!   `<bundle dir>/builtin/<module>.mjs`; nothing embeds or materializes one
-//!   there yet, because there is no module.
+//! Production pins the MCP SDK module, activated only when a selected Host
+//! stdio connection asks for it. Plugin-tier frames cannot use proc/* or mcp/*.
+//! Rust owns launch, exact operation tickets, credentials and decision keys;
+//! the builtin is a protocol owner, not an execution or approval authority.
+//! The pinned digest detects changed bytes; it does not sandbox code already
+//! executing as the current OS user. Sources are embedded and materialized at
+//! `<bundle dir>/builtin/<module>.mjs` with the host's notices.
 
 use crate::tools::spec::ApprovalRequirement;
 
@@ -59,7 +48,7 @@ pub(crate) enum HostTier {
 }
 
 impl HostTier {
-    /// Plugin first: it is the tier that exists in production.
+    /// Plugin first for ordinary extension discovery; builtin stays separate.
     pub(crate) const ALL: [Self; 2] = [Self::Plugin, Self::Builtin];
 
     /// The value of `--tier=` and of the data directory's name.
@@ -152,12 +141,21 @@ impl BuiltinModule {
     }
 }
 
-/// The built-in modules the core knows. Empty: no Codewhale feature runs on
-/// the host yet, so the builtin tier never starts. A row is added together
-/// with the module, its digest in `dist/builtin-modules.json` (the host build
-/// writes it; `table_matches_the_host_build` fails until they agree), and the
-/// feature that needs it.
-pub(crate) const BUILTIN_MODULES: &[BuiltinModule] = &[];
+/// The built-in modules the core pins. MCP is started only by the explicit
+/// Host SDK backend. The host build records the same digest; the drift
+/// test refuses any row/file mismatch.
+pub(crate) const BUILTIN_MODULES: &[BuiltinModule] = &[
+    BuiltinModule {
+        id: "harness",
+        source_sha256: "8b40ab8734838da9513106ba576b7140656ff254f67c81c0b52365bc2b497aaa",
+        tools: &[],
+    },
+    BuiltinModule {
+        id: "mcp",
+        source_sha256: "d5eb38941113934f9768e90ab3f1db021b93980e41be5cdf8836489b7f233b55",
+        tools: &[],
+    },
+];
 
 /// The approval for `tool` of the module that owns `owner_id`, from `modules`
 /// and nowhere else: `Auto` only where a row says so, `Required` for a module

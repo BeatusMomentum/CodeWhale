@@ -98,6 +98,12 @@ export interface RatatuiCopy {
   paintDescription: string;
   actionsTitle: string;
   actionsDescription: string;
+  heroLabel: string;
+  heroAlt: string;
+  heroCaption: string;
+  heroOpenExplorer: string;
+  heroOpenComponent: string;
+  familyPosition: string;
 }
 
 export const RATATUI_COPY: Record<keyof RatatuiCopy, LocalizedText> = {
@@ -208,6 +214,12 @@ export const RATATUI_COPY: Record<keyof RatatuiCopy, LocalizedText> = {
   paintDescription: { en: "Components paint the facts you supply into your Ratatui frame.", zh: "组件将你提供的数据绘制到 Ratatui 帧中。" },
   actionsTitle: { en: "Handle the action", zh: "处理操作" },
   actionsDescription: { en: "Route input outcomes to your app. Supply elapsed time when motion needs a redraw.", zh: "将输入结果交给应用处理；动画需要重绘时，提供经过的时间。" },
+  heroLabel: { en: "Codewhale terminal, rendered by the library", zh: "由组件库渲染的 Codewhale 终端" },
+  heroAlt: { en: "A Codewhale terminal session: conversation, composer and Tasks workbar over the ocean background", zh: "Codewhale 终端会话：对话、输入框与任务工作栏，背景为海洋" },
+  heroCaption: { en: "Native conversation, composer and Tasks workbar · Underwater truecolor · {width}×{height}", zh: "原生对话、输入框与任务工作栏 · Underwater 真彩色 · {width}×{height}" },
+  heroOpenExplorer: { en: "Open in the explorer", zh: "在组件探索器中打开" },
+  heroOpenComponent: { en: "About this composition", zh: "关于此组合" },
+  familyPosition: { en: "{index} of {count} in this collection", zh: "本组件集中第 {index} 个，共 {count} 个" },
 };
 
 /** Use the site's deterministic locale selection rather than page-local copy forks. */

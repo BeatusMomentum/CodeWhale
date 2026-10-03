@@ -18,7 +18,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 
 const MAX_MODEL_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 const MODEL_CACHE_MAX_AGE: Duration = Duration::hours(24);
@@ -156,7 +156,10 @@ fn registration_key(issuer: &str, client_id: &str, subject: &str) -> String {
 }
 
 fn snapshot_path(config: &Config) -> Option<PathBuf> {
-    if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex) {
+    let identity = config
+        .builtin_provider_identity(ProviderKind::OpenaiCodex)
+        .ok()?;
+    if config.provider_uses_custom_endpoint(&identity) {
         return None;
     }
     let registration = crate::oauth::official_chatgpt_registration(config).ok()?;
@@ -331,12 +334,9 @@ fn read_cache_bytes(path: &Path) -> Result<Vec<u8>, CodexModelCacheFreshness> {
 
 #[cfg(test)]
 pub(crate) fn install_test_chatgpt_roster(config: &Config, ids: &[&str]) -> anyhow::Result<()> {
-    let path = snapshot_path(config)
-        .ok_or_else(|| anyhow::anyhow!("test needs an owned ChatGPT registration"))?;
-    let snapshot = CatalogSnapshot {
-        fetched_at: Utc::now(),
-        models: ids
-            .iter()
+    install_test_chatgpt_roster_with_metadata(
+        config,
+        ids.iter()
             .map(|id| CodexModelMetadata {
                 id: (*id).to_string(),
                 display_name: None,
@@ -345,6 +345,19 @@ pub(crate) fn install_test_chatgpt_roster(config: &Config, ids: &[&str]) -> anyh
                 efforts: Vec::new(),
             })
             .collect(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_roster_with_metadata(
+    config: &Config,
+    models: Vec<CodexModelMetadata>,
+) -> anyhow::Result<()> {
+    let path = snapshot_path(config)
+        .ok_or_else(|| anyhow::anyhow!("test needs an owned ChatGPT registration"))?;
+    let snapshot = CatalogSnapshot {
+        fetched_at: Utc::now(),
+        models,
     };
     codewhale_config::persistence::atomic_write(&path, &serde_json::to_vec(&snapshot)?)?;
     if let Ok(mut memo) = ROSTER_MEMO.lock() {
@@ -445,7 +458,7 @@ mod tests {
         .unwrap();
         assert!(model_roster_for(&workspace_b).models.is_empty());
         let generation = account_a
-            .provider_config_for(ApiProvider::OpenaiCodex)
+            .provider_config_for(&account_a.test_identity_for_kind(ProviderKind::OpenaiCodex))
             .unwrap()
             .oauth_credential_generation
             .as_ref()

@@ -44,6 +44,9 @@ pub(crate) enum TicketKind {
     /// One `tool/call` running under the turn loop's gate: redeemable by that
     /// call's `core/call` requests, up to the row's `uses`.
     Invocation,
+    McpLaunch,
+    McpOperation,
+    Execution,
 }
 
 impl TicketKind {
@@ -52,6 +55,7 @@ impl TicketKind {
     fn single_use(self) -> bool {
         match self {
             Self::Invocation => false,
+            Self::McpLaunch | Self::McpOperation | Self::Execution => true,
         }
     }
 }

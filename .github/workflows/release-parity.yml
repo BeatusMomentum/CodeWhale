@@ -98,6 +98,8 @@ jobs:
             echo "::warning::Could not add swap; continuing with the runner default"
           fi
           df -h / /mnt; free -m
+      - name: Build canonical executable for acceptance tests
+        run: cargo build -p codewhale-cli --bin codewhale --all-features --locked
       - name: Workspace tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one process
         # per test. This gate used libtest, where every test shares one process,

@@ -200,9 +200,12 @@ fn approval_mode(case: &Value) -> ApprovalMode {
 
 pub(super) fn send_message_op(case: &Value, config: &Config) -> Op {
     let model = case["model"].as_str().expect("case.model");
-    let route =
-        crate::route_runtime::resolve_runtime_route(config, config.api_provider(), Some(model))
-            .expect("resolve conformance route");
+    let route = crate::route_runtime::resolve_runtime_route(
+        config,
+        config.active_provider_identity().unwrap().provider,
+        Some(model),
+    )
+    .expect("resolve conformance route");
     Op::SendMessage(TurnSpec {
         max_output_tokens: None,
         submission_id: None,

@@ -157,6 +157,7 @@ impl ToolSpec for FakeExtensionTool {
 /// gate with the file tools (and a slow one) as the tool snapshot its core
 /// calls run against.
 struct Rig {
+    _manager: super::TestManagerGuard,
     tool: Arc<dyn ToolSpec>,
     context: ToolContext,
     server: Arc<Server>,
@@ -165,13 +166,14 @@ struct Rig {
 
 impl Rig {
     fn new(engine: &HostAttachment, workspace: &Path, tool: &str) -> Self {
+        let manager = super::TestManagerGuard::install(Arc::clone(&engine.manager));
         let slow = Arc::new(SlowFixture {
             running: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
         });
         let mut registry = crate::tools::registry::ToolRegistryBuilder::new()
             .with_file_tools()
-            .build(ToolContext::new(workspace));
+            .build(ToolContext::new(workspace).with_plugin_registry(engine.plugin_view()));
         registry.register(slow.clone());
         engine.install_tools(&mut registry);
         let tool = registry.get(tool).expect("the fixture tool is installed");
@@ -181,9 +183,10 @@ impl Rig {
         let (gate, requests) = NestedCallGate::new(None, tx_event, Duration::from_secs(60));
         let server = Arc::new(Server::default());
         serve(requests, Arc::clone(&server));
-        let mut context = ToolContext::new(workspace);
+        let mut context = ToolContext::new(workspace).with_plugin_registry(engine.plugin_view());
         context.execution.nested_call_gate = Some(gate.for_extension(caller, registry.all()));
         Self {
+            _manager: manager,
             tool,
             context,
             server,
@@ -362,7 +365,7 @@ async fn without_the_turn_loops_gate_for_this_tool_there_is_no_ticket_and_no_cor
     let input = json!({"name": "read_file", "input": {"path": "x"}});
 
     // No gate at all: a sub-agent, a test, a call nested in `execute_tools`.
-    let bare = ToolContext::new(fixture.workspace());
+    let bare = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let answer: Value = serde_json::from_str(
         &rig.tool
             .execute(input.clone(), &bare)
@@ -374,7 +377,8 @@ async fn without_the_turn_loops_gate_for_this_tool_there_is_no_ticket_and_no_cor
     assert_eq!(answer, json!({"noCore": true}));
 
     // A gate that is not an extension's (an `execute_tools` program's).
-    let mut program = ToolContext::new(fixture.workspace());
+    let mut program =
+        ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     program.execution.nested_call_gate = Some(NestedCallGate::admitting_for_test());
     let answer: Value = serde_json::from_str(
         &rig.tool
@@ -392,7 +396,8 @@ async fn without_the_turn_loops_gate_for_this_tool_there_is_no_ticket_and_no_cor
     let (gate, requests) = NestedCallGate::new(None, tx_event, Duration::from_secs(60));
     let server = Arc::new(Server::default());
     serve(requests, Arc::clone(&server));
-    let mut other = ToolContext::new(fixture.workspace());
+    let mut other =
+        ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     other.execution.nested_call_gate = Some(gate.for_extension(
         ExtensionCaller {
             origin: "extension:other".to_string(),
@@ -408,7 +413,7 @@ async fn without_the_turn_loops_gate_for_this_tool_there_is_no_ticket_and_no_cor
 
     // A command invocation never has `core`.
     let reference = manager
-        .commands_for_workspace(fixture.workspace())
+        .commands_for_plugins(&engine.plugin_view())
         .into_iter()
         .find(|entry| entry.registration.name == "cc-probe")
         .expect("the command is live")

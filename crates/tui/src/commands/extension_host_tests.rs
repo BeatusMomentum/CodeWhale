@@ -58,6 +58,7 @@ fn the_real_built_in_catalog_refuses_every_name_alias_and_mode_alias() {
         .unwrap();
     let register = |registry: &mut OwnerRegistry, name: &str| {
         registry.register(&RegisterParams {
+            scope: None,
             owner: owner.clone(),
             kind: RegisterKind::Command,
             spec: RegisterSpecWire {
@@ -131,8 +132,8 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
 
     // The user registry loads them for this workspace (and no other).
     let hint = |name: &str| {
-        crate::commands::user_registry::with_registry_for_workspace(
-            Some(fixture.workspace()),
+        crate::commands::user_registry::with_registry_for_plugins(
+            engine.plugin_view().as_ref(),
             |registry| {
                 registry
                     .get(name)
@@ -151,8 +152,8 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
         "another workspace never sees this workspace's extension commands"
     );
     // Discovery lists them.
-    let described = crate::commands::user_registry::with_registry_for_workspace(
-        Some(fixture.workspace()),
+    let described = crate::commands::user_registry::with_registry_for_plugins(
+        engine.plugin_view().as_ref(),
         |registry| {
             registry
                 .iter()
@@ -247,7 +248,10 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
     let error = crate::extension_host::run_command(&echo, "x", None)
         .await
         .unwrap_err();
-    assert!(error.contains("no longer registered"), "{error}");
+    assert!(
+        (error.contains("no longer registered") || error.contains("no longer selected")),
+        "{error}"
+    );
     manager.shutdown().await;
 }
 
@@ -280,23 +284,25 @@ async fn extension_commands_never_shadow_built_ins_or_other_plugins() {
         }
         other => panic!("{other:?}"),
     }
-    // Activation order between the other two is not fixed: exactly one holds
-    // `/ext-echo`, and the other failed on it.
-    let (winner, loser) = match (state("ext-commands"), state("commands-clash-plugin")) {
-        (OwnerState::Active, OwnerState::Failed(reason)) => ("ext-commands", reason),
-        (OwnerState::Failed(reason), OwnerState::Active) => ("commands-clash-plugin", reason),
-        other => panic!("{other:?}"),
-    };
-    assert!(loser.contains("already registered by extension"), "{loser}");
-    let live = manager.live_command_names();
-    assert_eq!(live.iter().filter(|name| *name == "ext-echo").count(), 1);
-    assert!(!live.contains(&"help".to_string()));
-    let holder = manager
-        .live_command_registrations()
-        .into_iter()
-        .find(|command| command.name == "ext-echo")
-        .unwrap();
-    assert_eq!(holder.plugin_name, winner);
+    // Distinct entry scopes may register the same spelling. The selected
+    // caller refuses ambiguity instead of choosing a global union winner.
+    assert_eq!(state("ext-commands"), OwnerState::Active);
+    assert_eq!(state("commands-clash-plugin"), OwnerState::Active);
+    assert_eq!(
+        manager
+            .live_command_names()
+            .iter()
+            .filter(|name| *name == "ext-echo")
+            .count(),
+        2
+    );
+    let selected = manager.commands_for_plugins(engine.plugin_view().as_ref());
+    assert!(
+        !selected
+            .iter()
+            .any(|entry| entry.registration.name == "ext-echo")
+    );
+    assert!(!manager.live_command_names().contains(&"help".to_string()));
     let diagnostics = manager.diagnostics().join("\n");
     assert!(
         diagnostics.contains("command `help` refused"),
@@ -312,7 +318,9 @@ async fn extension_commands_never_shadow_built_ins_or_other_plugins() {
         "markdown wins".to_string(),
     )]);
     let entry = |name: &str| crate::extension_host::command::ExtensionCommandEntry {
+        selection: None,
         registration: crate::extension_host::registry::CommandRegistration {
+            scope: None,
             handle: 1,
             owner: crate::extension_host::protocol::OwnerRef {
                 plugin_id: "p".into(),

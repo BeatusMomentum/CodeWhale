@@ -341,7 +341,7 @@ fn doctor_json_does_not_inherit_an_ambient_legacy_secret_from_an_explicit_home()
         .expect("seed ambient legacy secret");
     let legacy_before = fs::read(&legacy).expect("read legacy secret before doctor");
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     command
         .current_dir(&workspace)
         .args(["doctor", "--json"])
@@ -612,7 +612,7 @@ fn run_sealed_diagnostic<const N: usize>(args: [&str; N]) -> Output {
     let codewhale_home = fixture.path().join("sealed-codewhale-home");
     std::fs::create_dir_all(&workspace).expect("workspace");
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     command
         .current_dir(&workspace)
         .args(args)
@@ -653,7 +653,7 @@ fn run_sealed_diagnostic<const N: usize>(args: [&str; N]) -> Output {
 }
 
 fn diagnostic_command(workspace: &std::path::Path, home: &std::path::Path) -> Command {
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     command
         .current_dir(workspace)
         .env_clear()
@@ -802,21 +802,4 @@ fn preserve_host_platform_runtime(_command: &mut Command) {
             _command.env(name, value);
         }
     }
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }

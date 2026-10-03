@@ -320,6 +320,18 @@ The package is a small wrapper. Its `postinstall` step downloads the same
 manifest, and links `codewhale` and `codew` into npm's global `bin`. The whole
 thing took 6 s here.
 
+**Windows npm sessions:** Node remains the native program's launcher for the
+whole session. A process-name kill such as `taskkill /IM node.exe` or
+`Get-Process node | Stop-Process -Force` can interrupt this and other npm
+Codewhale sessions and prevent normal terminal cleanup. Stop only the server
+PID you started or the process owning its port, or use Codewhale's task
+cancellation. The Windows
+native archive/installer avoids this npm-parent dependency; this does not
+remove Node requirements for optional JavaScript tools. Codewhale's Windows
+shell safety floor holds recognized image-wide Node kills even in Full Access.
+An external hard kill or an arbitrary program that terminates the launcher
+cannot be made graceful by this shell-command check.
+
 ### If you get `EACCES: permission denied`
 
 That means Node is installed system-wide (apt, `/usr/local`, `/opt`), and your

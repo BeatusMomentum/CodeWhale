@@ -58,14 +58,40 @@ pub const TOOL_CALL_DEADLINE: Duration = Duration::from_secs(120);
 pub(crate) struct HostToolSpec {
     registration: ToolRegistration,
     manager: Arc<ManagerShared>,
+    selection: Option<super::composition_scope::SelectionRevision>,
 }
 
 impl HostToolSpec {
+    #[cfg(test)]
     pub(crate) fn new(registration: ToolRegistration, manager: Arc<ManagerShared>) -> Self {
         Self {
             registration,
             manager,
+            selection: None,
         }
+    }
+
+    pub(crate) fn for_selection(
+        registration: ToolRegistration,
+        manager: Arc<ManagerShared>,
+        selection: Option<super::composition_scope::SelectionRevision>,
+    ) -> Self {
+        Self {
+            registration,
+            manager,
+            selection,
+        }
+    }
+    fn check_caller(&self, context: &ToolContext) -> Result<(), ToolError> {
+        self.manager
+            .check_selection(
+                self.selection,
+                context.plugin_registry.as_deref(),
+                &self.registration.owner.plugin_id,
+                &self.registration.content_hash,
+                self.registration.scope.as_ref(),
+            )
+            .map_err(ToolError::not_available)
     }
 
     /// `extension:<plugin>` (or the module's owner id, `host:<module>`): the
@@ -114,8 +140,18 @@ impl HostToolSpec {
             origin: self.origin(),
             tool: self.registration.name.clone(),
             scope: format!(
-                "ext:{}@{}",
-                self.registration.owner.plugin_id, self.registration.content_hash
+                "ext:{}@{}:{}:{}:{}",
+                self.registration.owner.plugin_id,
+                self.registration.content_hash,
+                self.registration
+                    .scope
+                    .as_ref()
+                    .map(|entry| format!("{}@{}", entry.path, entry.sha256))
+                    .unwrap_or_default(),
+                self.selection
+                    .map(|selection| format!("{}:{}", selection.attachment_id, selection.revision))
+                    .unwrap_or_default(),
+                crate::session_manager::current_session_boot_id()
             ),
         }
     }
@@ -268,7 +304,8 @@ impl ToolSpec for HostToolSpec {
         Some(self.caller())
     }
 
-    fn prepare(&self, input: Value, _context: &ToolContext) -> Result<PreparedToolCall, ToolError> {
+    fn prepare(&self, input: Value, context: &ToolContext) -> Result<PreparedToolCall, ToolError> {
+        self.check_caller(context)?;
         // Before the user is asked to approve it: a call the schema refuses is
         // returned to the model to correct and never becomes an approval card.
         self.check_input(&input)?;
@@ -286,6 +323,7 @@ impl ToolSpec for HostToolSpec {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        self.check_caller(context)?;
         let registration = &self.registration;
         // Again here: `execute` is also reached without `prepare`, and nothing
         // that fails the schema may be sent to the host.
@@ -295,6 +333,7 @@ impl ToolSpec for HostToolSpec {
             .live_host_for(registration)
             .await
             .map_err(ToolError::not_available)?;
+        self.check_caller(context)?;
         let call_id = context
             .execution
             .owner_agent_id
@@ -313,7 +352,7 @@ impl ToolSpec for HostToolSpec {
             .nested_call_gate
             .as_ref()
             .and_then(|gate| {
-                self.manager.core_calls.begin(
+                self.manager.core_calls.begin_scoped(
                     registration.tier,
                     host.generation,
                     &registration.owner,
@@ -321,6 +360,8 @@ impl ToolSpec for HostToolSpec {
                     &self.caller(),
                     context,
                     gate,
+                    registration.scope.clone(),
+                    registration.content_hash.clone(),
                 )
             });
         let request = CoreRequest::ToolCall(ToolCallParams {
@@ -351,6 +392,12 @@ impl ToolSpec for HostToolSpec {
             )
             .await
             .map_err(|error| map_call_error(&registration.name, error))?;
+        self.check_caller(context)?;
+        self.manager
+            .live_host_for(registration)
+            .await
+            .map_err(ToolError::not_available)?;
+        self.check_caller(context)?;
         let wire: ToolResultWire = serde_json::from_value(value).map_err(|error| {
             ToolError::execution_failed(format!(
                 "extension tool `{}` returned a malformed result: {error}",

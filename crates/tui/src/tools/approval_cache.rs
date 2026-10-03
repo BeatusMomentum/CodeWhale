@@ -148,6 +148,8 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
 /// keyed `<scope>:<tool_name>:<hash of input>` for both, so its grants are
 /// bound to the reviewed plugin build and never widened to a family; every
 /// other tool keeps [`build_approval_key`] / [`build_approval_grouping_key`].
+/// The registry's captured owning agent prefixes both keys with `agent:<id>:`,
+/// so its grants and denials never cover a parent or sibling's call.
 ///
 /// [`approval_scope`]: crate::tools::spec::ToolSpec::approval_scope
 #[must_use]
@@ -159,7 +161,7 @@ pub fn approval_keys_for_call(
     let scope = registry
         .and_then(|registry| registry.get(tool_name))
         .and_then(|tool| tool.approval_scope());
-    match scope {
+    let keys = match scope {
         Some(scope) => {
             let key = ApprovalKey(format!("{scope}:{tool_name}:{}", hash_json_value(input)));
             (key.clone(), key)
@@ -168,6 +170,13 @@ pub fn approval_keys_for_call(
             build_approval_key(tool_name, input),
             build_approval_grouping_key(tool_name, input),
         ),
+    };
+    if let Some(owner) = registry.and_then(|registry| registry.context().owner_agent_id.as_deref())
+    {
+        let scoped = |key: ApprovalKey| ApprovalKey(format!("agent:{owner}:{}", key.0));
+        (scoped(keys.0), scoped(keys.1))
+    } else {
+        keys
     }
 }
 

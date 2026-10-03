@@ -59,7 +59,41 @@ runtime = "node"   # default: Node only
 # runtime = "auto" # Bun >= 1.4.0 if one is found and starts, otherwise Node
 # bun = "~/.bun/bin/bun"          # the only Bun tried when set
 # node = "/opt/homebrew/bin/node" # the only Node tried when set
+# mcp_backend = "host" # experimental SDK backend; default is "rust"
 ```
+
+`mcp_backend = "host"` selects the pinned MCP SDK independently of
+`[features] extension_host`. That feature controls optional Native extensions;
+selecting Host MCP does not activate them. The SDK for existing stdio, HTTP and legacy SSE server connections in a separate
+builtin host process. Rust retains process/network authority, credential
+resolution, catalog admission, tool approval and cancellation. HTTP/SSE uses
+Rust's guarded HTTP client; the SDK receives opaque session selectors and
+exact operation grants. Request IDs remain the Rust client's strings through
+an adapter bound to each grant. Explicit Host selection never falls back to
+Rust or replays an uncertain operation. The default remains `"rust"` while
+recorded transport parity is qualified. The Host path uses the same Rust
+GET session preflight and bounded reactive OAuth refresh as the default
+backend. An explicit incompatible HTTP response can negotiate the real SDK
+SSE transport only with a fresh exact Rust operation grant; a stale-session
+refusal remains a typed Rust recovery decision. Credentials, configured URLs,
+OAuth browser/login operations and Computer Use decision keys stay in Rust.
+Both backends run against the same recorded MCP goldens. Passing that suite
+and the actual broker acceptance tests is required before any default cutover.
+The default also requires the platform isolation and measured Phase 3 gates
+in Ops CURRENT_DECISIONS §26. The native Rust protocol adapters remain for one
+release after the accepted default flip, then retire. Rust retains the catalog,
+session, permission and credential authority. Missing or unsupported Node uses
+the existing doctor runtime diagnostic; selected Host failures never choose
+Rust automatically.
+
+The stock finance, data and speech adapters have independent experimental flags:
+`[features] finance_host = true`, `data_host = true` and `speech_host = true`.
+Each defaults to Rust. Speech preparation is shared by CLI `speech`/`tts` and
+the model tools; clone samples, provider requests and output writes stay in Rust.
+Selecting either uses the pinned Builtin harness and its existing operation
+broker, even when Native extensions are disabled. Rust retains network/file
+access, parsing diagnostics and permissions. A selected Host failure is reported;
+it never silently switches to the Rust adapter.
 
 Node must satisfy `^22.19 || >=24`; Bun must be 1.4.0 or newer. Leaving
 `runtime` unset means `node`, except that a table which sets only `bun` means
@@ -102,6 +136,15 @@ which is not part of what you reviewed. See
 Under Bun the host runs with `--no-install`: a missing package fails the import;
 it is never downloaded.
 
+Reviewed DSH compositions admit every local module against its recorded path
+and SHA-256 before importing it. Node checks runtime resolution; Bun prepares
+the reviewed JavaScript syntax and checks computed imports before they run.
+Unreviewed files and ambient package imports are refused. Bun currently cannot
+preserve query/fragment module identity, and computed CommonJS resolution also
+requires Node. These cases stop with a diagnostic: select
+`[extension_host] runtime = "node"` for that composition. Ordinary UTF-8 source
+and reviewed computed file/JSON imports work on both runtimes.
+
 Extensions cannot run native code inside the host. On both runtimes
 `process.dlopen`, `process.execve` and Worker threads are unavailable (a Worker
 is a new JavaScript realm that would start without these restrictions). Under
@@ -122,11 +165,11 @@ require another review. See [bundle rules](PLUGIN_BUNDLES.md).
 Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
 `inject = ['tools', 'commands']` asks for the tool and command registries. The
-supplied service names are `tools`, `commands`, `prompt`, `storage`, `skills`, `logger`,
+supplied service names are `tools`, `commands`, `prompt`, `storage`, `skills`, `shellHooks`, `mcp`, `logger`,
 `events`, `reflect` and `registry`. A tool can ask the core to run a core tool through
 `exec.core` (see [Asking the core to run a tool](#asking-the-core-to-run-a-tool));
-MCP is not a host service yet. Programmable pre-execute
-listeners use `ctx.on` as described below. A required
+Reviewed Native entries can propose MCP definitions through `ctx.mcp` as
+described below. Programmable pre-execute listeners use `ctx.on` as described below. A required
 service that is unavailable fails activation with a diagnostic.
 
 Package runtime dependencies and local imports within the reviewed bundle.
@@ -146,12 +189,50 @@ letter, and contain at most 64 characters. Duplicate owner-local IDs require
 disposing the earlier section first. The author cannot replace the core
 system prompt or select another session's sections.
 
+To interpolate Core's accepted turn facts, register
+`{id, text, interpolate: 'model-cwd'}`. Only `{{model}}` and `{{cwd}}` are
+supported; Rust expands them once when it captures the turn's prompt. Literal
+sections retain braces unchanged. Both source and expanded text must fit the
+section and snapshot limits. Scoped contributions keep their exact selected
+entry identity through capture and withdrawal. The fixed DSH persona bridge
+uses this path for additive prefix/suffix text; complete prompt replacement and
+runtime-context suppression are refused.
+
+Reviewed DSH compositions can register Claude Code and Codex command hooks
+through `shellHooks`. Codewhale's existing fifteen firepoints use the same
+pinned Builtin runner and Rust-owned process driver when the host feature is
+enabled. Rust retains hook approval, process environment and final verdicts;
+ShellEnv values remain in Rust. Forced continuation, observer steering,
+noncommand hooks and asynchronous dialect commands are unsupported and
+reported explicitly. A Native hook's `allow` cannot approve a tool.
+
 `ctx.storage.get(key)`, `set(key, json)` and `delete(key)` persist owner-local
 JSON under the `dataDir` Rust assigned. The API refuses access once owner
 disposal begins, symlinked storage, corrupt data and writes that exceed its
 bounded key/value/owner limits. It does not expose session history or secrets.
 Tool and command invocations also expose frozen `sessionId`, `agentId` and
 `originTurnId` strings when Rust supplies them for that particular call.
+
+## MCP definitions
+
+`ctx.mcp.registerServer({ serverName, server })` returns an idempotent disposer
+and proposes a literal MCP definition to the existing Rust catalog. Include
+`mcp` in the entry's `inject` list. Rust owns transport connections, tool
+admission, permissions and authentication; this service does not expose
+credentials or grant extensions direct process or network access.
+
+Definitions retain their exact reviewed, selected Native entry receipt.
+The limits are 64 servers per owner, 256 per host and 64 KiB per definition.
+Literal stdio, streamable HTTP and SSE definitions are supported by the bridge;
+credential values, endpoint query data and unsupported startup/reconnect
+controls are refused. Disposing an entry, changing its caller selection,
+disabling its plugin or changing reviewed bytes withdraws its definitions and
+cancels affected calls. An uncertain write is never replayed.
+
+The raw DSH skill-filesystem bridge uses the same reviewed skill-root service
+below. Its configuration must explicitly set `includeDefaultRoots: false` and
+`watch: false`, and list bundle-relative `customSkillDirs`. Ambient filesystem
+roots and independent watchers remain unsupported.
 
 ## Skill roots
 
@@ -472,13 +553,14 @@ starts, can write there. The cargo and npm entries are present only when
 The bubblewrap sandbox on Linux has no equivalent
 allowances.
 
-On Linux each start first checks that bwrap actually runs; where it is missing
-or cannot create its namespaces (for example Ubuntu 24.04's
-`kernel.apparmor_restrict_unprivileged_userns`), the host runs with the user's
-permissions and `/plugin`, `codewhale doctor` and the start diagnostic say
-`UNSANDBOXED` with bwrap's own error. Under bubblewrap a default credential
-store created after the host started stays readable until it restarts.
-Windows runs this host with the user's permissions. Review the
+Native extensions require a verified OS wrapper at each launch. On Linux,
+missing bwrap or a failed namespace probe refuses Native activation and reports
+the concrete error. Windows Native activation is likewise refused while its
+filesystem/network isolation is unavailable. The pinned Builtin tier retains
+an explicitly diagnosed unsandboxed exception; every effect still requires
+Rust operation tickets. That exception does not qualify Native extensions or
+the mandatory-host/default-runtime cutover. Planning creates the sibling
+Builtin data directory before masking it for Native launch. Review the
 [current design limits](design/TS_EXTENSION_HOST.md) before enabling
 third-party code.
 

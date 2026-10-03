@@ -8,6 +8,7 @@ use super::wire::{
 };
 use super::*;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -7381,6 +7382,7 @@ fn mcp_recovery_kind_names_real_login_and_reload_commands() {
 struct OAuthMcpMock {
     addr: std::net::SocketAddr,
     token_requests: Arc<AtomicUsize>,
+    frames: Arc<Mutex<Vec<Value>>>,
     /// When set, the provider has revoked every grant: `/mcp` 401s even with
     /// the previously accepted bearer and `/token` rejects every refresh
     /// with `invalid_grant` — a mid-session revocation.
@@ -7469,6 +7471,8 @@ impl OAuthMcpMock {
         let server_token_requests = Arc::clone(&token_requests);
         let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_revoked = Arc::clone(&revoked);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let server_frames = Arc::clone(&frames);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -7476,6 +7480,7 @@ impl OAuthMcpMock {
                 };
                 let token_requests = Arc::clone(&server_token_requests);
                 let revoked = Arc::clone(&server_revoked);
+                let frames = Arc::clone(&server_frames);
                 tokio::spawn(async move {
                     let request = read_request(&mut socket).await;
                     let first_line = request.lines().next().unwrap_or("").to_string();
@@ -7549,6 +7554,8 @@ impl OAuthMcpMock {
                             write_empty(&mut socket, "405 Method Not Allowed").await;
                             return;
                         }
+                        let frame: Value = serde_json::from_str(&body).unwrap();
+                        frames.lock().unwrap().push(frame);
                         if !authorized {
                             write_empty(&mut socket, "401 Unauthorized").await;
                             return;
@@ -7585,6 +7592,7 @@ impl OAuthMcpMock {
         OAuthMcpMock {
             addr,
             token_requests,
+            frames,
             revoked,
             task,
         }
@@ -8304,11 +8312,33 @@ async fn invalidation_never_deletes_a_credential_rotated_after_the_re_read() {
 
 #[tokio::test]
 async fn mid_session_revocation_lands_in_the_same_auth_required_state() {
+    mid_session_revocation_for_backend(McpBackend::Rust).await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn host_mid_session_revocation_lands_in_the_same_auth_required_state_without_replay() {
+    mid_session_revocation_for_backend(McpBackend::Host).await;
+}
+async fn mid_session_revocation_for_backend(backend: McpBackend) {
     let _env = crate::test_support::lock_test_env();
     let dir = tempfile::tempdir().unwrap();
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
     let _loopback = lock_mcp_loopback_tests().await;
+    let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+    let manager = (backend == McpBackend::Host).then(|| {
+        let node = crate::extension_host::tests::node_for_tests("Host revoked OAuth parity")
+            .expect("Host parity requires Node");
+        Arc::new(crate::extension_host::ExtensionHostManager::new(
+            crate::extension_host::ExtensionHostOptions {
+                root: Some(dir.path().to_path_buf()),
+                node_override: Some(node),
+                ..Default::default()
+            },
+        ))
+    });
+    let _manager = manager
+        .as_ref()
+        .map(|manager| crate::extension_host::TestManagerGuard::install(Arc::clone(manager)));
 
     let mock = OAuthMcpMock::spawn().await;
     let url = mock.url();
@@ -8324,7 +8354,7 @@ async fn mid_session_revocation_lands_in_the_same_auth_required_state() {
     );
     let mut mcp_config = McpConfig::default();
     mcp_config.servers.insert("wikiserver".to_string(), config);
-    let mut pool = McpPool::new(mcp_config);
+    let mut pool = McpPool::new(mcp_config).with_backend(backend);
     let errors = pool.connect_all().await;
     assert!(errors.is_empty(), "{errors:?}");
     assert!(!pool.server_needs_auth("wikiserver"));
@@ -8399,6 +8429,20 @@ async fn mid_session_revocation_lands_in_the_same_auth_required_state() {
     assert!(!wiki.connected);
     assert_eq!(wiki.recovery_kind(false), Some(McpRecoveryKind::Reauth));
 
+    assert_eq!(
+        mock.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame["method"] == "tools/call")
+            .count(),
+        1,
+        "rejected refresh must not replay a tool"
+    );
+    pool.shutdown_all().await;
+    if let Some(manager) = manager {
+        manager.shutdown().await;
+    }
     mock.task.abort();
 }
 
@@ -10589,4 +10633,212 @@ async fn discover_all_success_replaces_unavailable_old_families() {
     assert!(conn.tools.is_empty());
     assert!(conn.resources.is_empty());
     assert!(conn.prompts.is_empty());
+}
+
+/// The selected Host and Rust default share the same real Rust OAuth store,
+/// refresh endpoint and connection recovery. Only loopback fixture credentials
+/// exist; no provider/browser or token bytes cross the extension RPC wire.
+#[tokio::test(flavor = "current_thread")]
+async fn http_backend_parity_reactive_refresh_reuses_exact_facade_id_once() {
+    let _env = crate::test_support::lock_test_env();
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let _loopback = lock_mcp_loopback_tests().await;
+    let node = crate::extension_host::tests::node_for_tests("HTTP OAuth Host parity")
+        .expect("Host parity requires Node");
+    for backend in [McpBackend::Rust, McpBackend::Host] {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+        let manager = Arc::new(crate::extension_host::ExtensionHostManager::new(
+            crate::extension_host::ExtensionHostOptions {
+                root: Some(dir.path().to_path_buf()),
+                node_override: Some(node.clone()),
+                ..Default::default()
+            },
+        ));
+        let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+        let mock = OAuthMcpMock::spawn().await;
+        let url = mock.url();
+        // The local expiry trusts this token; only the explicit peer 401 may
+        // force refresh. A token-expiry fixture would not exercise this arm.
+        seed_oauth_tokens(
+            "wikiserver",
+            &url,
+            "cw-unaccepted-but-unexpired",
+            "rt-fresh",
+            Some(millis_from_now(3_600_000)),
+        );
+        let mut pool = McpPool::new(McpConfig {
+            servers: [("wikiserver".into(), mock_oauth_server_config(mock.addr))].into(),
+            ..Default::default()
+        })
+        .with_backend(backend);
+        assert!(pool.connect_all().await.is_empty(), "{backend:?}");
+        assert_eq!(mock.token_requests.load(AtomicOrdering::SeqCst), 1);
+        let frames = mock.frames.lock().unwrap().clone();
+        let initializes: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["method"] == "initialize")
+            .collect();
+        assert_eq!(initializes.len(), 2);
+        assert_eq!(
+            initializes[0], initializes[1],
+            "same admitted frame, exact original Rust ID and params"
+        );
+        assert_eq!(initializes[0]["id"], "1");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "notifications/initialized")
+                .count(),
+            1
+        );
+        pool.call_tool("mcp_wikiserver_wiki_lookup", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| frame["method"] == "tools/call")
+                .count(),
+            1
+        );
+        pool.shutdown_all().await;
+        manager.shutdown().await;
+        mock.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_http_refresh_revalidates_authority_before_any_second_write() {
+    let _env = crate::test_support::lock_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let _loopback = lock_mcp_loopback_tests().await;
+    let mock = OAuthMcpMock::spawn().await;
+    let config = mock_oauth_server_config(mock.addr);
+    let url = mock.url();
+    seed_oauth_tokens(
+        "wikiserver",
+        &url,
+        "cw-unaccepted-but-unexpired",
+        "rt-fresh",
+        Some(millis_from_now(3_600_000)),
+    );
+    let runtime = oauth::McpOAuthRuntime::from_server_config(
+        "wikiserver",
+        &config,
+        reqwest::header::HeaderMap::new(),
+    )
+    .await
+    .unwrap();
+    let client = super::http_client::McpHttpClient::new(
+        &url,
+        false,
+        false,
+        false,
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_mcp_auth(McpHttpAuth::from_config("wikiserver", &config, runtime));
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let error = client
+        .send_mcp_request(
+            client.post(&url).body(
+                json!({"jsonrpc":"2.0","id":"original-rust-id","method":"initialize","params":{}})
+                    .to_string(),
+            ),
+            true,
+            false,
+            true,
+            || {
+                // This is the actual post-refresh validation point, not a mock
+                // success result: the token endpoint really answered first.
+                if mock.token_requests.load(AtomicOrdering::SeqCst) != 0 {
+                    checks.fetch_add(1, AtomicOrdering::SeqCst);
+                    anyhow::bail!("fixture authority withdrawn during refresh");
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("authority withdrawn"));
+    assert_eq!(checks.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(mock.token_requests.load(AtomicOrdering::SeqCst), 1);
+    let frames = mock.frames.lock().unwrap();
+    assert_eq!(
+        frames.len(),
+        1,
+        "no second MCP network write after withdrawal"
+    );
+    assert_eq!(frames[0]["id"], "original-rust-id");
+    drop(frames);
+    mock.task.abort();
+}
+
+#[test]
+fn configured_mcp_search_matches_real_names_and_bounds_the_admitted_set() {
+    let mut config = McpConfig::default();
+    for index in 0..12 {
+        config.servers.insert(
+            format!("server{index:02}"),
+            serde_json::from_value(json!({"command":"unused"})).unwrap(),
+        );
+    }
+    let pool = McpPool::new(config);
+    assert!(
+        pool.configured_servers_for_search(".*", "regex", |_| true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pool.configured_servers_for_search("unrelated search", "bm25", |_| true)
+            .unwrap()
+            .is_empty()
+    );
+    let names = pool
+        .configured_servers_for_search("mcp_.*", "regex", |name| name >= "server04")
+        .unwrap();
+    assert_eq!(names.len(), 8);
+    assert_eq!(names[0], "server04");
+    assert_eq!(names[7], "server11");
+    assert_eq!(
+        pool.configured_servers_for_search("^mcp_server05_actual_method$", "regex", |_| true)
+            .unwrap(),
+        ["server05"]
+    );
+    assert!(
+        pool.configured_servers_for_search("mcp_[", "regex", |_| true)
+            .is_err()
+    );
+}
+
+#[test]
+fn configured_mcp_search_excludes_disabled_and_namespace_denied_servers() {
+    let mut config = McpConfig::default();
+    config.servers.insert(
+        "enabled".into(),
+        serde_json::from_value(json!({"command":"unused"})).unwrap(),
+    );
+    config.servers.insert(
+        "disabled".into(),
+        serde_json::from_value(json!({"command":"unused", "enabled":false})).unwrap(),
+    );
+    config.servers.insert(
+        "denied".into(),
+        serde_json::from_value(json!({"command":"unused"})).unwrap(),
+    );
+    let pool = McpPool::new(config).with_disallowed_tools(vec!["mcp_denied_*".into()]);
+    assert_eq!(
+        pool.configured_servers_for_search("mcp_.*", "regex", |_| true)
+            .unwrap(),
+        ["enabled"]
+    );
 }

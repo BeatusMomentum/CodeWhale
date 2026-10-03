@@ -319,7 +319,7 @@ fn exact_translation_client(
     .map_err(anyhow::Error::msg)?
     .validate()
     .map_err(anyhow::Error::msg)?;
-    if validated.identity.key != route.provider_identity
+    if validated.identity.key.as_str() != route.provider_identity
         || validated.model != route.model
         || validated.candidate.endpoint().base_url != route.base_url
     {
@@ -328,10 +328,7 @@ fn exact_translation_client(
         );
     }
     if let Some(receipt) = route.receipt.as_ref()
-        && &validated
-            .client
-            .turn_route_receipt(&route.provider_identity)
-            != receipt
+        && &validated.client.turn_route_receipt() != receipt
     {
         anyhow::bail!(
             "translation credential or endpoint changed after turn dispatch; refusing stale completion ownership"
@@ -1235,7 +1232,14 @@ pub async fn run_tui(
     // Fire session end hook
     {
         let context = app.base_hook_context();
-        let _ = app.execute_hooks(HookEvent::SessionEnd, &context);
+        let hooks = app.hooks.clone();
+        let hook_context = context.clone();
+        if tokio::task::spawn_blocking(move || hooks.execute(HookEvent::SessionEnd, &hook_context))
+            .await
+            .is_err()
+        {
+            tracing::warn!(target:"hooks","session_end hook executor task was lost");
+        }
         // Lifecycle outbox (`[lifecycle_outbox]`): fires alongside the
         // session_end hook, with the same session identity. No-op when
         // the feature is disabled.
@@ -1948,6 +1952,8 @@ pub(crate) async fn run_event_loop(
         // closure receives `&mut App` and applies success state or rollback.
         while let Ok(apply) = dispatch_completion_rx.try_recv() {
             let _ = apply(app, &engine_handle, &*config);
+            // Drain this completion immediately: a later completion cannot replace an edit.
+            super::feedback_host::dispatch_ready(app, config, &engine_handle).await?;
         }
 
         // Drain the version-check handle once; re-assign None so we
@@ -2632,6 +2638,8 @@ pub(crate) async fn run_event_loop(
                     }
                     // Liveness only. `record_turn_activity` above consumes the
                     // pulse; it must not alter transcript or status copy.
+                    EngineEvent::ToolExecutionStarted { .. }
+                    | EngineEvent::ToolResultContent { .. } => {}
                     EngineEvent::ToolCallHeartbeat => {}
                     // Typed owner activity is a pet-facing projection;
                     // `pet_watch::observe` above already consumed it, and the
@@ -3094,10 +3102,22 @@ pub(crate) async fn run_event_loop(
                         {
                             app.last_auto_route_receipt = None;
                         }
-                        if status == crate::core::events::TurnOutcomeStatus::Completed {
+                        if status == crate::core::events::TurnOutcomeStatus::Completed
+                            && let Some(receipt) = completed_turn
+                                .as_ref()
+                                .and_then(|turn| turn.route.as_ref())
+                                .and_then(|route| route.receipt.as_ref())
+                            && config
+                                .verify_provider_identity(receipt.admitted_identity())
+                                .is_ok()
+                            && receipt.endpoint_identity()
+                                == crate::route_receipt::endpoint_identity(
+                                    &config.base_url_for_route(receipt.admitted_identity()),
+                                )
+                        {
                             app.provider_health.record_success(
                                 config,
-                                effective_turn_provider,
+                                receipt,
                                 &effective_turn_model,
                             );
                         }
@@ -3445,33 +3465,43 @@ pub(crate) async fn run_event_loop(
                         recoverable: _,
                     } => {
                         let provider_before_error = app.api_provider;
-                        let identity_before_error = config
-                            .resolve_persisted_provider_identity(
-                                Some(provider_before_error.as_str()),
-                                app.provider_id_for_persistence(),
-                            )
-                            .unwrap_or_else(|_| ProviderIdentity {
-                                provider: provider_before_error,
-                                key: app.provider_identity_for_persistence().to_string(),
-                                exact_id: app.provider_id_for_persistence().map(str::to_string),
-                                migrated_legacy_ollama_cloud_route: false,
-                            });
+                        let identity_before_error = app.admitted_provider_identity().ok().cloned();
                         let fallback_chain_before_error = app.provider_chain.clone();
-                        let (health_provider, health_model) =
-                            error_health_route(app, provider_before_error);
-                        app.provider_health.record_failure(
-                            config,
-                            health_provider,
-                            &health_model,
-                            &envelope,
-                        );
+                        if let Some((identity, health_model)) = error_health_route(app)
+                            && config.verify_provider_identity(&identity).is_ok()
+                            && app
+                                .active_turn
+                                .as_ref()
+                                .and_then(|turn| turn.route.as_ref())
+                                .and_then(|route| route.receipt.as_ref())
+                                .is_some_and(|receipt| {
+                                    receipt.endpoint_identity()
+                                        == crate::route_receipt::endpoint_identity(
+                                            &config.base_url_for_route(&identity),
+                                        )
+                                })
+                        {
+                            app.provider_health.record_failure(
+                                config,
+                                app.active_turn
+                                    .as_ref()
+                                    .and_then(|turn| turn.route.as_ref())
+                                    .and_then(|route| route.receipt.as_ref())
+                                    .expect("health route has captured receipt"),
+                                &health_model,
+                                &envelope,
+                            );
+                        }
                         let rollback_after_auth_failure =
                             matches!(
                                 envelope.category,
                                 crate::error_taxonomy::ErrorCategory::Authentication
                             ) && app.pending_provider_switch.is_some();
                         apply_engine_error_to_app(app, envelope);
-                        if app.api_provider != provider_before_error && app.is_fallback_active() {
+                        if app.api_provider != provider_before_error
+                            && app.is_fallback_active()
+                            && let Some(identity_before_error) = identity_before_error
+                        {
                             // Several queued errors can be drained together.
                             // The first route remains the rollback authority;
                             // later chain advances must not overwrite it with
@@ -3489,7 +3519,7 @@ pub(crate) async fn run_event_loop(
                         }
                     }
                     EngineEvent::Status { message } => {
-                        app.status_message = Some(message);
+                        transcript_batch_updated |= apply_engine_status(app, message);
                     }
                     EngineEvent::ToolProjectionWarning {
                         provider,
@@ -5866,7 +5896,7 @@ pub(crate) async fn run_event_loop(
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
-                        app.plugin_registry.as_ref(),
+                        app.extension_plugin_view().as_ref(),
                     ),
                 ));
                 continue;
@@ -7200,7 +7230,7 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
             .await??;
     Ok(CacheWarmupOutcome {
         usage: response.usage,
-        provider_identity: route.identity.key,
+        provider_identity: route.identity.key.to_string(),
         model: route.model,
         base_url,
         inspection,
@@ -7239,14 +7269,14 @@ pub(super) async fn adopt_live_local_ollama_catalog(
         return;
     };
     // switch_provider resolves against the lake we just refreshed.
-    let switched = switch_provider(
-        app,
-        engine_handle,
-        config,
-        ApiProvider::Ollama,
-        Some(tag.clone()),
-    )
-    .await;
+    let identity = match config.builtin_provider_identity(ProviderKind::Ollama) {
+        Ok(identity) => identity,
+        Err(error) => {
+            app.push_status_toast(error, StatusToastLevel::Error, None);
+            return;
+        }
+    };
+    let switched = switch_provider(app, engine_handle, config, identity, Some(tag.clone())).await;
     if !switched {
         return;
     }
@@ -7536,12 +7566,12 @@ mod session_boot_event_tests {
 
     fn translation_test_route() -> crate::cost_status::EffectiveRouteEnvelope {
         crate::cost_status::EffectiveRouteEnvelope {
-            provider: crate::config::ApiProvider::Deepseek,
+            provider: crate::config::ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-chat".to_string(),
             openrouter_vendor: None,
             billing_surface: crate::pricing::billing_surface_for_route(
-                crate::config::ApiProvider::Deepseek,
+                crate::config::ProviderKind::Deepseek,
                 Some("https://api.deepseek.com/v1"),
             )
             .map(str::to_string),
@@ -8069,4 +8099,17 @@ pub(super) fn route_key_to_view_stack(
         return None;
     }
     Some(app.view_stack.handle_key(key))
+}
+
+/// Keep only the Engine's retry receipts in the existing transcript. Ordinary
+/// status/footer behavior and internal/model-only status projection stay intact.
+pub(super) fn apply_engine_status(app: &mut App, message: String) -> bool {
+    let retain = crate::core::events::is_retry_status_receipt(&message);
+    if retain {
+        app.add_message(HistoryCell::System {
+            content: message.clone(),
+        });
+    }
+    app.status_message = Some(message);
+    retain
 }

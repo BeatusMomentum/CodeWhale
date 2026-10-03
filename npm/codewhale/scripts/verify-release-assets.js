@@ -388,11 +388,21 @@ function assertChecksumManifestIncludes(checksums, expectedAssets, label) {
   }
 }
 
+const compiledHosts = require("./compiled-hosts");
+
 async function run() {
   const version = resolveBinaryVersion();
   const repo = resolveRepo();
   const cnbMirror = usesCnbMirror();
-  const assets = cnbMirror ? CNB_RELEASE_ASSET_NAMES : allReleaseAssetNames();
+  const checksums = parseChecksumManifest(await downloadText(checksumManifestUrl(version, repo)));
+  let catalog;
+  if (checksums.has(compiledHosts.HOST_CATALOG)) {
+    const text = await downloadText(releaseAssetUrl(compiledHosts.HOST_CATALOG, version, repo));
+    compiledHosts.verifyBytes(Buffer.from(text), checksums.get(compiledHosts.HOST_CATALOG), compiledHosts.HOST_CATALOG);
+    catalog = compiledHosts.parseCatalog(text, version);
+  }
+  if (compiledHosts.requested() && !catalog) throw new Error("compiled host requested but this source has no qualified catalog");
+  const assets = cnbMirror ? [...CNB_RELEASE_ASSET_NAMES, ...compiledHosts.assets(catalog)] : allReleaseAssetNames(catalog);
 
   assertPackageVersionMatchesBinaryVersion(version);
 
@@ -407,12 +417,9 @@ async function run() {
     await verifyAsset(url, asset);
     console.log(`  ok ${asset}`);
   }
-  const checksums = parseChecksumManifest(
-    await downloadText(checksumManifestUrl(version, repo)),
-  );
   assertChecksumManifestIncludes(
     checksums,
-    cnbMirror ? CNB_BINARY_ASSET_NAMES : checksummedReleaseAssetNames(),
+    cnbMirror ? [...CNB_BINARY_ASSET_NAMES, ...compiledHosts.assets(catalog)] : checksummedReleaseAssetNames(catalog),
     "Canonical checksum manifest",
   );
   if (!cnbMirror) {

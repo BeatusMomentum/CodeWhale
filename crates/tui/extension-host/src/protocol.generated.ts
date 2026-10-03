@@ -35,12 +35,26 @@ export const METHODS = [
   { name: 'tool/call', direction: 'core_to_host', request: true, params: 'ToolCallParams', tiers: ['plugin', 'builtin'] },
   { name: 'command/run', direction: 'core_to_host', request: true, params: 'CommandRunParams', tiers: ['plugin', 'builtin'] },
   { name: 'hook/evaluate', direction: 'core_to_host', request: true, params: 'HookEvaluateParams', tiers: ['plugin', 'builtin'] },
+  { name: 'mcp/open', direction: 'core_to_host', request: true, params: 'McpOpenParams', tiers: ['builtin'] },
+  { name: 'mcp/request', direction: 'core_to_host', request: true, params: 'McpRequestParams', tiers: ['builtin'] },
+  { name: 'mcp/close', direction: 'core_to_host', request: true, params: 'McpCloseParams', tiers: ['builtin'] },
+  { name: 'harness/run', direction: 'core_to_host', request: true, params: 'HarnessRunParams', tiers: ['builtin'] },
   { name: '$/cancel', direction: 'core_to_host', request: false, params: 'CancelParams', tiers: ['plugin', 'builtin'] },
   { name: 'host/hello', direction: 'host_to_core', request: false, params: 'HelloParams', tiers: ['plugin', 'builtin'] },
   { name: 'host/ready', direction: 'host_to_core', request: false, params: 'EmptyParams', tiers: ['plugin', 'builtin'] },
   { name: 'registry/register', direction: 'host_to_core', request: true, params: 'RegisterParams', tiers: ['plugin', 'builtin'] },
   { name: 'registry/unregister', direction: 'host_to_core', request: true, params: 'UnregisterParams', tiers: ['plugin', 'builtin'] },
   { name: 'core/call', direction: 'host_to_core', request: true, params: 'CoreCallParams', tiers: ['plugin', 'builtin'] },
+  { name: 'proc/launch', direction: 'host_to_core', request: true, params: 'ProcLaunchParams', tiers: ['builtin'] },
+  { name: 'proc/read', direction: 'host_to_core', request: true, params: 'ProcSessionParams', tiers: ['builtin'] },
+  { name: 'proc/write', direction: 'host_to_core', request: true, params: 'ProcWriteParams', tiers: ['builtin'] },
+  { name: 'proc/close', direction: 'host_to_core', request: true, params: 'ProcSessionParams', tiers: ['builtin'] },
+  { name: 'net/start', direction: 'host_to_core', request: true, params: 'ProcLaunchParams', tiers: ['builtin'] },
+  { name: 'net/fetch', direction: 'host_to_core', request: true, params: 'NetFetchParams', tiers: ['builtin'] },
+  { name: 'net/read', direction: 'host_to_core', request: true, params: 'NetReadParams', tiers: ['builtin'] },
+  { name: 'net/release', direction: 'host_to_core', request: true, params: 'NetReadParams', tiers: ['builtin'] },
+  { name: 'net/close', direction: 'host_to_core', request: true, params: 'ProcSessionParams', tiers: ['builtin'] },
+  { name: 'exec/redeem', direction: 'host_to_core', request: true, params: 'ExecutionRedeemParams', tiers: ['builtin'] },
   { name: 'ext/faulted', direction: 'host_to_core', request: false, params: 'FaultedParams', tiers: ['plugin', 'builtin'] },
   { name: 'log', direction: 'host_to_core', request: false, params: 'LogParams', tiers: ['plugin', 'builtin'] },
   { name: '$/cancel', direction: 'host_to_core', request: false, params: 'CancelParams', tiers: ['plugin', 'builtin'] },
@@ -70,7 +84,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: 'OwnerRef' }, plugin_name: 'string', entry: { ref: 'EntryRef' } },
-    optional: { config: 'json', data_dir: 'string' },
+    optional: { scope: { ref: 'EntryRef' }, config: 'json', data_dir: 'string' },
   },
   CancelParams: {
     strict: true,
@@ -90,7 +104,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   DeactivateParams: {
     strict: false,
     required: { owner: { ref: 'OwnerRef' } },
-    optional: {},
+    optional: { entry: { ref: 'EntryRef' } },
   },
   EmptyParams: {
     strict: true,
@@ -102,10 +116,20 @@ export const SHAPES: { readonly [name: string]: Shape } = {
     required: { path: 'string', sha256: 'string' },
     optional: {},
   },
+  ExecutionRedeemParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, execution_id: 'string', ticket: 'string' },
+    optional: {},
+  },
   FaultedParams: {
     strict: true,
     required: { owner: { ref: 'OwnerRef' }, error: 'string' },
     optional: {},
+  },
+  HarnessRunParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, execution_id: 'string', ticket: 'string', deadline_ms: 'uint' },
+    optional: { hook: { ref: 'HookDispatchWire' } },
   },
   HelloParams: {
     strict: true,
@@ -121,6 +145,11 @@ export const SHAPES: { readonly [name: string]: Shape } = {
     strict: true,
     required: { name: 'string', call_id: 'string', input: 'json', mode: 'string', workspace: 'string', model: 'string' },
     optional: {},
+  },
+  HookDispatchWire: {
+    strict: true,
+    required: { event: 'string', dialect: 'string', point: 'string', query: 'string' },
+    optional: { matcher: 'string' },
   },
   HookEvaluateParams: {
     strict: true,
@@ -142,15 +171,65 @@ export const SHAPES: { readonly [name: string]: Shape } = {
     required: { level: 'string', msg: 'string' },
     optional: { plugin_id: 'string' },
   },
+  McpCloseParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', deadline_ms: 'uint' },
+    optional: {},
+  },
+  McpHttpHeaders: {
+    strict: true,
+    required: {},
+    optional: { accept: 'string', content_type: 'string', mcp_session_id: 'string', mcp_protocol_version: 'string' },
+  },
+  McpOpenParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', launch_ticket: 'string', transport: 'string', initialize_grant: { ref: 'McpOperationGrant' }, initialized_grant: { ref: 'McpOperationGrant' }, client_version: 'string', deadline_ms: 'uint' },
+    optional: {},
+  },
+  McpOperationGrant: {
+    strict: true,
+    required: { ticket: 'string', operation_id: 'string', method: 'string', params: 'json' },
+    optional: { wire_id: 'string' },
+  },
+  McpRequestParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', grant: { ref: 'McpOperationGrant' }, deadline_ms: 'uint' },
+    optional: {},
+  },
   ModuleDigestWire: {
     strict: true,
     required: { id: 'string', sha256: 'string' },
+    optional: {},
+  },
+  NetFetchParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', url: 'string', method: 'string', headers: { ref: 'McpHttpHeaders' } },
+    optional: { frame: 'json', ticket: 'string', operation_id: 'string' },
+  },
+  NetReadParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', response_id: 'string' },
     optional: {},
   },
   OwnerRef: {
     strict: true,
     required: { plugin_id: 'string', generation: 'uint', owner_token: 'string' },
     optional: {},
+  },
+  ProcLaunchParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', ticket: 'string' },
+    optional: {},
+  },
+  ProcSessionParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string' },
+    optional: {},
+  },
+  ProcWriteParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, session_id: 'string', frame: 'json' },
+    optional: { ticket: 'string', operation_id: 'string' },
   },
   ProtocolRange: {
     strict: true,
@@ -159,8 +238,8 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook', 'prompt_section', 'skill_root'] }, spec: { ref: 'RegisterSpecWire' } },
-    optional: {},
+    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook', 'prompt_section', 'prompt_template', 'skill_root', 'shell_hook', 'mcp_server'] }, spec: { ref: 'RegisterSpecWire' } },
+    optional: { scope: { ref: 'EntryRef' } },
   },
   RegisterSpecWire: {
     strict: true,
@@ -188,6 +267,7 @@ export type Json = null | boolean | number | string | Json[] | { [key: string]: 
 
 export interface ActivateParams {
   owner: OwnerRef
+  scope?: EntryRef
   plugin_name: string
   entry: EntryRef
   config?: Json
@@ -224,6 +304,7 @@ export interface CoreCallParams {
 
 export interface DeactivateParams {
   owner: OwnerRef
+  entry?: EntryRef
 }
 
 export interface DeactivateResult {
@@ -238,9 +319,23 @@ export interface EntryRef {
   sha256: string
 }
 
+export interface ExecutionRedeemParams {
+  owner: OwnerRef
+  execution_id: string
+  ticket: string
+}
+
 export interface FaultedParams {
   owner: OwnerRef
   error: string
+}
+
+export interface HarnessRunParams {
+  owner: OwnerRef
+  execution_id: string
+  ticket: string
+  deadline_ms: number
+  hook?: HookDispatchWire
 }
 
 export interface HelloParams {
@@ -265,6 +360,14 @@ export interface HookCallPayload {
   mode: string
   workspace: string
   model: string
+}
+
+export interface HookDispatchWire {
+  event: string
+  dialect: string
+  point: string
+  matcher?: string
+  query: string
 }
 
 export interface HookEvaluateParams {
@@ -296,9 +399,65 @@ export interface LogParams {
   plugin_id?: string
 }
 
+export interface McpCloseParams {
+  owner: OwnerRef
+  session_id: string
+  deadline_ms: number
+}
+
+export interface McpHttpHeaders {
+  accept?: string
+  content_type?: string
+  mcp_session_id?: string
+  mcp_protocol_version?: string
+}
+
+export interface McpOpenParams {
+  owner: OwnerRef
+  session_id: string
+  launch_ticket: string
+  transport: string
+  initialize_grant: McpOperationGrant
+  initialized_grant: McpOperationGrant
+  client_version: string
+  deadline_ms: number
+}
+
+export interface McpOperationGrant {
+  ticket: string
+  operation_id: string
+  method: string
+  wire_id?: string
+  params: Json
+}
+
+export interface McpRequestParams {
+  owner: OwnerRef
+  session_id: string
+  grant: McpOperationGrant
+  deadline_ms: number
+}
+
 export interface ModuleDigestWire {
   id: string
   sha256: string
+}
+
+export interface NetFetchParams {
+  owner: OwnerRef
+  session_id: string
+  url: string
+  method: string
+  headers: McpHttpHeaders
+  frame?: Json
+  ticket?: string
+  operation_id?: string
+}
+
+export interface NetReadParams {
+  owner: OwnerRef
+  session_id: string
+  response_id: string
 }
 
 export interface OwnerRef {
@@ -307,15 +466,35 @@ export interface OwnerRef {
   owner_token: string
 }
 
+export interface ProcLaunchParams {
+  owner: OwnerRef
+  session_id: string
+  ticket: string
+}
+
+export interface ProcSessionParams {
+  owner: OwnerRef
+  session_id: string
+}
+
+export interface ProcWriteParams {
+  owner: OwnerRef
+  session_id: string
+  frame: Json
+  ticket?: string
+  operation_id?: string
+}
+
 export interface ProtocolRange {
   min: number
   max: number
 }
 
-export type RegisterKind = 'tool' | 'command' | 'hook' | 'prompt_section' | 'skill_root'
+export type RegisterKind = 'tool' | 'command' | 'hook' | 'prompt_section' | 'prompt_template' | 'skill_root' | 'shell_hook' | 'mcp_server'
 
 export interface RegisterParams {
   owner: OwnerRef
+  scope?: EntryRef
   kind: RegisterKind
   spec: RegisterSpecWire
 }

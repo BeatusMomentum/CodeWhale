@@ -26,6 +26,8 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod compiled_host;
+
 const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/Hmbown/CodeWhale/releases/latest";
 const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
     "https://github.com/Hmbown/CodeWhale/releases/download";
@@ -151,7 +153,12 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
 
     // Step 2: Prefer GitHub, then a supported mirror if its manifest is
     // unavailable. Keep the manifest and binary locked to the same source.
-    let download = resolve_download_plan(&fetched, &plan.asset_stem, proxy.as_ref())?;
+    let download = resolve_download_plan(
+        &fetched,
+        &plan.asset_stem,
+        proxy.as_ref(),
+        compiled_host::required_for(&current_exe)?,
+    )?;
     println!("Release source: {}", download.source.describe());
 
     // Step 3: Download and verify the sole implementation binary once. The
@@ -179,10 +186,38 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
     // Step 4: Replace command paths only after the download and the running
     // executable identity verify. The preflight happens before a colocated
     // compatibility path can change, then the identity is checked just in time.
-    replace_verified_downloads(&plan.target_paths, &bytes, |target| {
+    let mut host_update = compiled_host::prepare(
+        &download,
+        latest_tag,
+        plan.asset_stem.trim_start_matches("codewhale-"),
+        &current_exe,
+        proxy.as_ref(),
+    )?;
+    let replaced = (|| {
         validate_primary_update_identity(&executable_identity)?;
-        validate_update_target(target, &executable_identity)
-    })?;
+        if let Some(host) = &mut host_update {
+            host.publish()?;
+        }
+        replace_verified_downloads(&plan.target_paths, &bytes, |target| {
+            validate_primary_update_identity(&executable_identity)?;
+            validate_update_target(target, &executable_identity)
+        })
+    })();
+    if let Err(error) = replaced {
+        if let Some(host) = &mut host_update {
+            host.rollback()
+                .context("compiled-host rollback failed; retained backup path is reported below")?;
+        }
+        return Err(error);
+    }
+    if let Some(host) = &host_update {
+        println!(
+            "Updated the qualified compiled image, notices and relink source beside this CLI; Node remains default."
+        );
+        for path in host.recovery_paths() {
+            println!("Previous companion bytes retained at {}", path.display());
+        }
+    }
 
     println!(
         "\n✅ Successfully updated to {latest_tag}!\n\
@@ -207,21 +242,20 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
 /// never a reason to retry against the source that lost the probe: the two
 /// build their own artifacts, so their checksums are not interchangeable.
 fn verify_downloaded_asset(download: &DownloadPlan, bytes: &[u8]) -> Result<()> {
-    let expected = download
-        .checksums
-        .get(&download.binary_name)
-        .with_context(|| {
-            format!(
-                "{CHECKSUM_MANIFEST_ASSET} from {} is missing {}",
-                download.source.describe(),
-                download.binary_name
-            )
-        })?;
+    verify_manifest_asset(download, &download.binary_name, bytes)
+}
+
+fn verify_manifest_asset(download: &DownloadPlan, name: &str, bytes: &[u8]) -> Result<()> {
+    let expected = download.checksums.get(name).with_context(|| {
+        format!(
+            "{CHECKSUM_MANIFEST_ASSET} from {} is missing {name}",
+            download.source.describe()
+        )
+    })?;
     let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         bail!(
-            "SHA256 mismatch for {} from {}!\n  expected: {expected}\n  actual:   {actual}",
-            download.binary_name,
+            "SHA256 mismatch for {name} from {}!\n  expected: {expected}\n  actual:   {actual}",
             download.source.describe()
         );
     }
@@ -838,6 +872,7 @@ fn resolve_download_plan(
     fetched: &FetchedRelease,
     asset_stem: &str,
     proxy: Option<&Proxy>,
+    require_compiled_host: bool,
 ) -> Result<DownloadPlan> {
     match proactive_source_candidates(
         fetched,
@@ -851,10 +886,29 @@ fn resolve_download_plan(
                 fetched.release.tag_name,
                 candidate_labels(&candidates)
             );
-            select_release_source(candidates, manifest_probe_fetcher(proxy))
-                .with_context(update_network_fallback_hint)
+            let fetch = manifest_probe_fetcher(proxy);
+            let qualified: Arc<ManifestFetcher> = Arc::new(move |candidate| {
+                let bytes = fetch(candidate)?;
+                if require_compiled_host {
+                    compiled_host::require_catalog_manifest(&bytes)?;
+                }
+                Ok(bytes)
+            });
+            select_release_source(candidates, qualified).with_context(update_network_fallback_hint)
         }
-        None => single_source_download_plan(fetched, asset_stem, proxy),
+        None => {
+            let plan = single_source_download_plan(fetched, asset_stem, proxy)?;
+            if require_compiled_host
+                && !plan
+                    .checksums
+                    .contains_key("codewhale-extension-hosts.json")
+            {
+                bail!(
+                    "selected release source has no qualified compiled-host catalog; no files changed"
+                );
+            }
+            Ok(plan)
+        }
     }
 }
 

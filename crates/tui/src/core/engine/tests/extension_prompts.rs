@@ -25,6 +25,8 @@ async fn extension_prompt_changes_and_retirement_are_recorded_without_rewriting_
             content_hash: "fixture-reviewed-hash".to_string(),
             id: format!("repo-style-{i}"),
             text: format!("{}\nLast instruction {i}.", "x".repeat(4000)),
+            scope: None,
+            interpolate: false,
         })
         .collect();
     let block = crate::extension_host::prompt::render_prompt_sections(&sections)

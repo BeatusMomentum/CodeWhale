@@ -51,13 +51,38 @@ Node 是默认运行时，要求 `^22.19 || >=24`。Bun 要求至少 1.4.0，目
 选择 `node`、`bun` 或 `auto`；显式配置的运行时路径失败时，不会默默搜索替代路径。
 `auto` 的回退原因会显示在 `/plugin` 和 doctor 诊断中。
 
+可在 `[extension_host]` 中设置 `mcp_backend = "host"`，不必启用 Native 扩展。
+`[features] extension_host` 只控制可选 Native 扩展；选择 Host MCP 不会激活它们。
+这会让已有的 stdio、HTTP 和旧版 SSE MCP 服务器连接使用固定版本的 MCP SDK，运行于
+独立的内置宿主进程。进程与网络权限、凭据解析、目录接纳、工具批准和取消仍由 Rust
+掌握。HTTP/SSE 请求通过 Rust 的受保护 HTTP 客户端发出；SDK 只收到不含真实地址
+或凭据的会话标识，以及逐次授权的操作。适配器将 SDK 请求编号转换为 Rust 客户端
+原有的字符串编号，并将其绑定到相应操作票据。显式选择 Host 后，失败不会回退到
+Rust，也不会重放结果不明的操作。传输行为完成资格验证前，默认仍为
+`mcp_backend = "rust"`。Host 路径与默认后端共用 Rust 的 GET 会话预检和有界 OAuth
+响应式刷新。只有 HTTP 明确拒绝当前传输协议后，Rust 才会签发新的、精确绑定的单次操作授权，
+允许切换到 SDK 的 SSE 传输；失效会话仍由 Rust 以类型化错误决定恢复方式。凭据、配置中的 URL、
+OAuth 浏览器登录和 Computer Use 决策密钥都保留在 Rust。两个后端接受同一套已记录的 MCP
+基准验证；切换默认后端前，必须通过这些基准和真实代理的验收测试，并满足
+Ops CURRENT_DECISIONS §26 的平台隔离与 Phase 3 实测门槛。正式切换默认后，
+原生 Rust 协议适配器再保留一个版本，然后删除；目录、会话、权限和凭据的权威
+仍留在 Rust。缺少受支持的 Node 时，沿用 doctor 的运行时诊断；Host 失败不会
+自动选择 Rust。
+
 `.mts` 只支持 Node 能直接擦除的类型语法。enum、decorator、JSX 等需要转换的语法，
 应由作者先构建为 JavaScript。不要依赖 Bun 特有的 tsconfig 路径解析：Node 不读取
 此配置。Bun 使用 `--no-install`，缺少依赖时会失败，不会下载。把运行时依赖和本地
 导入打包在已审查包内；激活时不应安装包或获取代码。
 
+已审查的 DSH 组合在导入前会核对本地模块的路径和 SHA-256。Node 检查运行时解析；
+Bun 解析已审查的 JavaScript 语法，并在执行计算式导入前核对对应凭据。未审查的文件
+和环境中的包会被拒绝。Bun 目前无法保留查询参数或片段所区分的模块身份，动态
+CommonJS 解析也需要 Node；这些情况会明确提示使用
+`[extension_host] runtime = "node"`。普通 UTF-8 源码和已审查的计算式文件/JSON
+导入可在两种运行时中使用。
+
 宿主提供同一个 Cordis、schemastery、cosmokit 及有限的 DSH 兼容导出。支持的服务名为
-`tools`、`commands`、`prompt`、`storage`、`skills`、`logger`、`events`、`reflect`、`registry`。
+`tools`、`commands`、`prompt`、`storage`、`skills`、`shellHooks`、`mcp`、`logger`、`events`、`reflect`、`registry`。
 需要未提供服务的插件会激活失败，并显示原因。目前没有已发布的插件编写 SDK；
 普通 ESM 示例使用这些文档规定的适配服务。
 
@@ -65,6 +90,18 @@ Node 是默认运行时，要求 `^22.19 || >=24`。Bun 要求至少 1.4.0，目
 宿主禁止进程内原生代码入口，包括 native addon、Worker 和相关 FFI/SQLite 入口。
 macOS Seatbelt 与 Linux bubblewrap 限制宿主进程，但不等于对每次插件文件访问执行
 工具审批。不要在描述、日志、配置或结果中保存凭据。
+
+Native 扩展启动必须通过操作系统隔离验证。Linux 缺少 bubblewrap 或命名空间探测失败
+时会拒绝激活并显示具体原因；Windows 文件与网络隔离尚不可用时也会拒绝 Native。
+固定摘要的 Builtin 宿主可使用明确标示的未隔离例外，但其所有效果仍须兑换 Rust
+签发的操作凭据。这不能证明 Native 隔离或默认运行时切换已完成。
+
+金融、数据与语音工具的实验性适配器分别使用 `[features] finance_host = true`、
+`data_host = true` 和 `speech_host = true`；三者默认使用 Rust。CLI `speech`/`tts`
+与模型工具共享语音准备逻辑，克隆样本、提供商请求和输出文件写入仍归 Rust。
+选中 Host 后通过现有固定 Builtin harness 与
+操作 broker 执行，即使 Native 扩展关闭也可独立运行。网络、文件、解析诊断、权限及凭据仍归
+Rust；选中的 Host 失败会明确报告，不会自动切回 Rust 适配器。
 
 ## 工具和结构化结果
 
@@ -147,6 +184,12 @@ Rust 只选择当前 Engine 所需、仍有效并具有已审查 Native 权限�
 只含 `a-z`、`0-9`、`_`、`-`，最多 64 字符。同一所有者重复使用 id 前，必须先撤销
 旧注册。停用、撤销、注销或宿主退出都会移除相应片段。
 
+需要当前回合的模型及工作区时，可登记 `{id, text, interpolate: 'model-cwd'}`。
+仅支持 `{{model}}` 和 `{{cwd}}`；Rust 在捕获回合提示词时展开一次，普通文本的
+花括号保持不变。原始及展开文本均受片段与快照上限约束，捕获和撤回保留精确选定
+入口。DSH persona 桥接只贡献 prefix/suffix；替换完整提示词及屏蔽运行时上下文
+会被明确拒绝。
+
 ## 插件本地状态
 
 `ctx.storage.get(key)`、`set(key, json)`、`delete(key)` 操作 Rust 已指定的 `dataDir`
@@ -159,6 +202,17 @@ key 最多 128 UTF-8 字节，单个值最多 128 KiB；所有者当前可见记
 读/改/写队列。损坏状态不会被自动覆盖，应明确选择恢复或删除。
 
 ## 注册技能目录
+
+`ctx.mcp.registerServer({serverName, server})` 提议字面量 MCP 定义并返回可重复调用的释放函数。
+入口须声明 `inject = ['mcp']`。Rust 的现有目录仍拥有连接、工具准入、权限和认证；
+服务不向扩展暴露凭据，也不授予直接进程或网络访问。定义绑定精确的已审查、已选择 Native 入口。
+每个 owner 最多 64 个服务器，宿主最多 256 个，每条定义最多 64 KiB。
+桥接支持字面量 stdio、streamable HTTP 和 SSE；凭据值、URL 查询数据及不支持的启动/重连控制会被拒绝。
+释放入口、变更调用方选择、停用插件或变更已审查字节会撤回定义并取消受影响的调用；不确定的写操作不会重放。
+
+原始 DSH skill-filesystem 桥接复用下述已审查技能根服务。配置必须明确设置
+`includeDefaultRoots: false`、`watch: false`，并列出包内相对路径 `customSkillDirs`；
+环境中的默认目录及独立 watcher 不受支持。
 
 `ctx.skills.registerRoot({path: 'profiles/review-skills'})` 把已审查包内的技能
 交给 Rust 现有的 skill catalog，并返回可重复调用的 disposer。入口的 `inject`
@@ -223,10 +277,11 @@ Full Access 都会逐次询问用户，明确的会话拒绝仍然生效。Auto-
 原生 mod 入口、静态导入器及其他客户端的插件格式是不同入口。
 兼容的 Claude 插件包仍通过[原生组件适配器](./PLUGINS.md)读取声明组件；这不加载
 Claude 的执行循环。Pi 扩展 API 并未被自动适配，需按当前契约手工移植。
-DSH 静态导入器只转换其 MCP/skill 可移植子集，报告不支持的条目，不执行插件代码。
-已明确编写并审查的 Native 入口可使用受支持的 Cordis/DSH 适配导出；这不等于加载
-原生 `dsh.bundle.patch`、`!!js`、DSH agent runtime 或浏览器 UI。
+DSH 导入器在不执行插件的审查阶段读取 `dsh.bundle.patch`，封存入口、模块及资源的
+路径与哈希。已审查的 Native 入口通过同一 Loader 加载选定的组合；`!!js` 表达式
+仅在已审查 Native 激活时求值。Bun 不保留带 query/fragment 的模块身份，这类组合
+会明确提示选择 Node。缺少 default 的预设目录保持未选中，不会自动选择第一个条目。
+损坏或不支持的预设仍显示原因；这不加载 DSH 的 agent 执行循环或浏览器 UI。
 
-目前还没有作者可用的自定义 Ratatui/GPUI 控件、UI slots 及 MCP
-宿主服务。插件不能替换核心的 tools、commands、systemPrompt、审批、会话或凭据服务。
+目前还没有作者可用的自定义 Ratatui/GPUI 控件及 UI slots。插件不能替换核心的 tools、commands、systemPrompt、审批、会话或凭据服务。
 当前功能边界和安装流程见[插件编写指南](./PLUGIN_AUTHORING.md)及[插件包契约](./PLUGIN_BUNDLES.md)。

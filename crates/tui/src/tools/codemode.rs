@@ -797,7 +797,11 @@ impl CodemodeInvoker {
             };
             enforce_tool_authority(name, &input, spec.as_ref(), &self.context)?;
             let context = self.context.clone();
-            Box::pin(async move { spec.execute_rich(input, &context).await })
+            Box::pin(async move {
+                crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+                    .map_err(ToolError::not_available)?;
+                spec.execute_rich(input, &context).await
+            })
         };
         match self.runtime.as_ref() {
             Some(runtime) => {
