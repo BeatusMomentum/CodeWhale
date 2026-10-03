@@ -464,7 +464,8 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 15s"
             sleep 15
           done
-          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap
+          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          sh scripts/prepare-linux-test-sandbox.sh
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -882,7 +883,8 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 15s"
             sleep 15
           done
-          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap
+          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
         # The combined wave/0.10.1-next workspace build was terminated
         # mid-compile on every PR run ("runner has received a shutdown

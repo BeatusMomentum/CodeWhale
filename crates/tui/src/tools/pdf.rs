@@ -107,7 +107,7 @@ impl<'a> PdfTextCommand<'a> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_context(mut self, context: &'a super::spec::ToolContext) -> Self {
         self.context = Some(context);
         if self.cancel.is_none() {

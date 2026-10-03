@@ -1071,7 +1071,13 @@ model = "deepseek-v4-pro"
         wait_for_queued_child(&mut mailbox_rx, &id).await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(bodies.lock().unwrap().is_empty());
-        manager.write().await.cancel_agent(&id).unwrap();
+        let requested = manager.write().await.cancel_agent(&id).unwrap();
+        let settled = settle_requested_child(&manager, requested).await;
+        assert_eq!(settled.status, SubAgentStatus::Cancelled);
+        assert_eq!(
+            manager.read().await.agents[&id].status,
+            SubAgentStatus::Cancelled
+        );
     }
     drop(held_permit);
 }

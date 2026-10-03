@@ -7698,7 +7698,11 @@ async fn revert_thread_file(
     // The worker owns the reservation: a client disconnect cannot release it
     // while Git is still changing files. Snapshot listing, diffing and
     // checkout all shell out to git; keep that off the async workers.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     let response = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
         let _reservation = reservation;
         revert_file_from_snapshot(&workspace, &owned, &req)
     })

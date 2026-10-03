@@ -661,6 +661,7 @@ fn write_error(error: ToolError, uncertain: &'static str) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]

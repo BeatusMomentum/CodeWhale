@@ -1874,7 +1874,7 @@ async fn record_stdio_thread_hint(state: &AppState, response: &ThreadResponse) {
 }
 
 /// Historical cold-child cache comparator. It has no production producer.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn acquire_historical_runtime_bridge<F, Fut>(
     state: &AppState,
     start: F,
@@ -1926,7 +1926,7 @@ async fn acquire_live_runtime_bridge(
 }
 
 /// Historical respawn comparison; all actual frontends use the held owner.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn acquire_live_runtime_bridge_with<F, Fut>(
     state: &AppState,
     start: F,
@@ -2490,6 +2490,7 @@ impl RuntimeBridge {
     /// error counts as exited: with `WNOHANG` it only fails when the pid is no
     /// longer this process's child (already reaped elsewhere), and such a
     /// child can neither be tracked nor killed on drop.
+    #[cfg(unix)]
     fn child_exited(&mut self) -> bool {
         self.child
             .as_mut()
