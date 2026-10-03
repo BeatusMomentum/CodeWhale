@@ -1532,7 +1532,8 @@ pub fn unix_process_start(pid: u32) -> Result<String> {
         }
         // SAFETY: successful fstatfs initialized the output buffer.
         anyhow::ensure!(
-            unsafe { filesystem.assume_init() }.f_type == libc::PROC_SUPER_MAGIC,
+            i128::from(unsafe { filesystem.assume_init() }.f_type)
+                == i128::from(libc::PROC_SUPER_MAGIC),
             "local process identity is not on procfs"
         );
         let open = |name: &std::ffi::CStr| -> Result<File> {

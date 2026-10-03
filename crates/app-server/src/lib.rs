@@ -3420,7 +3420,7 @@ mod tests {
         });
         let captured = Arc::new(Mutex::new(RuntimeBridge {
             base_url: "http://127.0.0.1:1".into(),
-            client: reqwest::Client::new(),
+            client: codewhale_release::tls::reqwest_client(),
             auth_token: None,
             child: None,
             last_seq_by_thread: HashMap::new(),

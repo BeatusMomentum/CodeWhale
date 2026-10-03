@@ -219,13 +219,16 @@ test('same-key writers publish complete last-writer-wins records during concurre
   assert.ok(['first', 'second'].includes((await store.get('shared')).writer))
 })
 
-// Faults are injected in an owned subprocess. These prove retry/guard behavior,
-// not Windows kernel semantics; the unchanged concurrent-writer case runs there.
+// Faults are injected before the first storage import in an owned subprocess.
+// Bun's syncBuiltinESMExports is a no-op, so installing hooks after import would
+// leave named filesystem bindings untouched. Seed records through the parent
+// store first; every child operation then observes the actual injected failure.
+// These prove retry/guard behavior, not Windows kernel semantics; the unchanged
+// concurrent-writer case runs there.
 async function sharingWorker(t, directory, body) {
   const run = worker(t, directory, `
     (async () => {
       const fs = require('node:fs'), { syncBuiltinESMExports } = require('node:module');
-      const { createStorage } = await import(${JSON.stringify(moduleUrl)});
       ${body}
       process.disconnect();
     })().catch(e => { console.error(e); process.exit(1); });
@@ -237,11 +240,9 @@ async function sharingWorker(t, directory, body) {
 }
 
 test('Windows sharing retries keep complete records and retain atomic replacement', async (t) => {
-  const { a } = await fixture(t)
+  const { a, store } = await fixture(t)
+  await store.set('shared', 'original')
   const report = await sharingWorker(t, a, `
-    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
-    await store.set('shared', 'original');
-    Object.defineProperty(process, 'platform', { value: 'win32' });
     const realOpen = fs.promises.open, realRename = fs.promises.rename;
     let reads = 0, publications = 0;
     fs.promises.open = async (...args) => {
@@ -253,6 +254,9 @@ test('Windows sharing retries keep complete records and retain atomic replacemen
       return realRename(...args);
     };
     syncBuiltinESMExports();
+    const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    Object.defineProperty(process, 'platform', { value: 'win32' });
     await store.set('shared', 'complete replacement');
     const value = await store.get('shared');
     process.send({ value, publications, reads, names: await fs.promises.readdir(require('node:path').join(process.argv[1], 'storage-v1')) });
@@ -269,13 +273,11 @@ test('Windows sharing retries refuse revocation, corrupt replacements and perman
   for (const mode of ['revoked', 'corrupt', 'denied']) {
     const directory = join(a, mode)
     await mkdir(directory, { mode: 0o700 })
+    await createStorage({ dataDir: directory, isActive: () => true }).set('shared', 'original')
     const report = await sharingWorker(t, directory, `
       let live = true;
-      const store = createStorage({ dataDir: process.argv[1], isActive: () => live });
-      await store.set('shared', 'original');
       const path = require('node:path').join(process.argv[1], 'storage-v1', require('node:crypto').createHash('sha256').update('shared').digest('hex') + '.json');
       const original = await fs.promises.readFile(path, 'utf8');
-      Object.defineProperty(process, 'platform', { value: 'win32' });
       let publications = 0;
       fs.promises.rename = async () => {
         publications++;
@@ -284,6 +286,9 @@ test('Windows sharing retries refuse revocation, corrupt replacements and perman
         throw Object.assign(new Error('sharing'), { code: 'EPERM' });
       };
       syncBuiltinESMExports();
+      const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+      const store = createStorage({ dataDir: process.argv[1], isActive: () => live });
+      Object.defineProperty(process, 'platform', { value: 'win32' });
       let code;
       try { await store.set('shared', 'must not publish'); throw new Error('unexpected publication'); } catch (error) { code = error.code; }
       process.send({ code, publications, bytes: await fs.promises.readFile(path, 'utf8'), original, names: await fs.promises.readdir(require('node:path').dirname(path)) });
@@ -296,14 +301,15 @@ test('Windows sharing retries refuse revocation, corrupt replacements and perman
 })
 
 test('sharing failures on other platforms remain visible without replaying publication', async (t) => {
-  const { a } = await fixture(t)
+  const { a, store } = await fixture(t)
+  await store.set('shared', 'original')
   const report = await sharingWorker(t, a, `
-    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
-    await store.set('shared', 'original');
-    Object.defineProperty(process, 'platform', { value: 'linux' });
     let publications = 0;
     fs.promises.rename = async () => { publications++; throw Object.assign(new Error('denied'), { code: 'EPERM' }); };
     syncBuiltinESMExports();
+    const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    Object.defineProperty(process, 'platform', { value: 'linux' });
     let code;
     try { await store.set('shared', 'must not publish'); throw new Error('unexpected publication'); } catch (error) { code = error.code; }
     process.send({ code, publications, value: await store.get('shared') });
@@ -314,12 +320,10 @@ test('sharing failures on other platforms remain visible without replaying publi
 })
 
 test('Windows sharing read retries refuse revocation before reopening private state', async (t) => {
-  const { a } = await fixture(t)
+  const { a, store } = await fixture(t)
+  await store.set('shared', 'private value')
   const report = await sharingWorker(t, a, `
     let live = true;
-    const store = createStorage({ dataDir: process.argv[1], isActive: () => live });
-    await store.set('shared', 'private value');
-    Object.defineProperty(process, 'platform', { value: 'win32' });
     const realOpen = fs.promises.open;
     let opens = 0;
     fs.promises.open = async (...args) => {
@@ -331,6 +335,9 @@ test('Windows sharing read retries refuse revocation before reopening private st
       return realOpen(...args);
     };
     syncBuiltinESMExports();
+    const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => live });
+    Object.defineProperty(process, 'platform', { value: 'win32' });
     let code, value;
     try { value = await store.get('shared'); } catch (error) { code = error.code; }
     process.send({ code, opens, value });
