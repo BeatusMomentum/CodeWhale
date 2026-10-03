@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh sửa tệp, chạy lệnh và kiểm tra công việc của mình bằng mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ mà bạn chọn. Hãy bắt đầu với một tác vụ trong terminal. Với công việc lớn hơn, bạn có thể giao từng phần cho các tác nhân dùng mô hình và đảm nhiệm vai trò khác nhau.
@@ -51,7 +51,7 @@ Codewhale có thể đọc kho mã nguồn, chỉnh sửa tệp, chạy lệnh, 
 
 ## Terminal, ứng dụng và Computer Use
 
-Terminal và các ứng dụng khách đồ họa kết nối với Codewhale Runtime, nơi chạy tác nhân và các công cụ của nó:
+Terminal và các ứng dụng khách đồ họa kết nối với [Codewhale Engine](docs/ARCHITECTURE.md), nơi chạy tác nhân và các công cụ của nó:
 
 - **Terminal:** `codewhale` mở giao diện tương tác; `codewhale exec` chạy tác vụ từ tập lệnh hoặc công việc CI.
 - **Trình duyệt cục bộ:** `codewhale web` mở [ứng dụng web cục bộ](docs/WEB.md) đi kèm, dùng cùng Runtime.

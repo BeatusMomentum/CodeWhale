@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale은 사용자가 선택한 호스팅 모델이나 로컬 모델로 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하며, 작업 결과를 확인하는 오픈 소스 에이전트입니다. 터미널에서 하나의 작업으로 시작하세요. 더 큰 작업은 서로 다른 모델과 역할을 가진 에이전트에게 나누어 맡길 수 있습니다.
@@ -51,7 +51,7 @@ Codewhale은 저장소를 읽고, 파일을 편집하고, 명령을 실행하고
 
 ## 터미널, 앱, Computer Use
 
-터미널과 그래픽 클라이언트는 Codewhale Runtime에 연결하며, Runtime이 에이전트와 도구를 실행합니다:
+터미널과 그래픽 클라이언트는 에이전트와 도구를 실행하는 [Codewhale Engine](docs/ARCHITECTURE.md)에 연결합니다:
 
 - **터미널:** `codewhale`은 대화형 인터페이스를 열고, `codewhale exec`는 스크립트나 CI 작업에서 태스크를 실행합니다.
 - **로컬 브라우저:** `codewhale web`은 같은 Runtime을 사용하는 내장 [로컬 웹 클라이언트](docs/WEB.md)를 엽니다.

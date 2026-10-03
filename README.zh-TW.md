@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
@@ -51,7 +51,7 @@ Codewhale 可以讀取你的程式碼儲存庫、編輯檔案、執行指令、�
 
 ## 終端機、應用程式與 Computer Use
 
-終端機和圖形用戶端連線至 Codewhale Runtime，由它執行代理及其工具：
+終端機和圖形用戶端連線至 [Codewhale Engine](docs/ARCHITECTURE.md)，由它執行代理及其工具：
 
 - **終端機：** `codewhale` 開啟互動介面；`codewhale exec` 可從指令碼或 CI 工作中執行任務。
 - **本機瀏覽器：** `codewhale web` 開啟隨附的[本機網頁用戶端](docs/WEB.md)，使用同一個 Runtime。

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
@@ -51,7 +51,7 @@ Codewhale dapat membaca repositori Anda, mengedit berkas, menjalankan perintah, 
 
 ## Terminal, aplikasi, dan Computer Use
 
-Terminal dan klien grafis terhubung ke Codewhale Runtime, yang menjalankan agen beserta alatnya:
+Terminal dan klien grafis terhubung ke [Codewhale Engine](docs/ARCHITECTURE.md), yang menjalankan agen beserta alatnya:
 
 - **Terminal:** `codewhale` membuka antarmuka interaktif; `codewhale exec` menjalankan tugas dari skrip atau job CI.
 - **Browser lokal:** `codewhale web` membuka [klien web lokal](docs/WEB.md) bawaan untuk Runtime yang sama.

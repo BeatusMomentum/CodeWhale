@@ -37,7 +37,7 @@ PATTERNS = {
         r"\bstd::fs::(?:read|read_to_string|write|create_dir|create_dir_all|"
         r"remove_file|remove_dir|remove_dir_all|copy|rename|metadata|"
         r"symlink_metadata|read_dir|canonicalize|exists|set_permissions|"
-        r"hard_link|soft_link|symlink|File|OpenOptions|DirBuilder)\b"
+        r"hard_link|soft_link|symlink|(?:File|OpenOptions|DirBuilder)(?=\s*::))\b"
     ),
     # Method form (`path.canonicalize()`) resolves the path on the calling
     # thread exactly like `std::fs::canonicalize` (#6522 review).

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale és un agent de codi obert que llegeix el teu projecte, edita fitxers, executa ordres i comprova la seva feina amb un model allotjat o local que tu tries. Comença amb una tasca al terminal. Per a una feina més gran, assigna parts de la feina a agents amb models i rols diferents.
@@ -51,7 +51,7 @@ Codewhale pot llegir el teu repositori, editar fitxers, executar ordres, inspecc
 
 ## Terminal, aplicacions i Computer Use
 
-El terminal i els clients gràfics es connecten al Runtime de Codewhale, que executa l’agent i les seves eines:
+El terminal i els clients gràfics es connecten a [Codewhale Engine](docs/ARCHITECTURE.md), que executa l’agent i les seves eines:
 
 - **Terminal:** `codewhale` obre la interfície interactiva; `codewhale exec` executa una tasca des d’un script o d’una feina de CI.
 - **Navegador local:** `codewhale web` obre el [client web local](docs/WEB.md) inclòs, que fa servir el mateix runtime.

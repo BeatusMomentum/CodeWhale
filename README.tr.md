@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
@@ -51,7 +51,7 @@ Codewhale deponuzu okuyabilir, dosyaları düzenleyebilir, komutları çalışt�
 
 ## Terminal, uygulamalar ve Computer Use
 
-Terminal ve grafik istemciler, ajanı ve araçlarını çalıştıran Codewhale Runtime’a bağlanır:
+Terminal ve grafik istemciler, ajanı ve araçlarını çalıştıran [Codewhale Engine](docs/ARCHITECTURE.md)’e bağlanır:
 
 - **Terminal:** `codewhale` etkileşimli arayüzü açar; `codewhale exec` bir betikten veya CI işinden görev çalıştırır.
 - **Yerel tarayıcı:** `codewhale web`, aynı çalışma zamanı için paketle birlikte gelen [yerel web istemcisini](docs/WEB.md) açar.

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale ist ein Open-Source-Agent, der dein Projekt liest, Dateien bearbeitet, Befehle ausführt und seine Arbeit mit einem gehosteten oder lokalen Modell deiner Wahl prüft. Starte mit einer Aufgabe im Terminal. Teile eine größere Aufgabe auf Agenten mit verschiedenen Modellen und Rollen auf.
@@ -51,7 +51,7 @@ Codewhale kann dein Repository lesen, Dateien bearbeiten, Befehle ausführen, Er
 
 ## Terminal, Apps und Computer Use
 
-Das Terminal und die grafischen Clients verbinden sich mit der Codewhale Runtime, die den Agenten und seine Werkzeuge ausführt:
+Das Terminal und die grafischen Clients verbinden sich mit [Codewhale Engine](docs/ARCHITECTURE.md), die den Agenten und seine Werkzeuge ausführt:
 
 - **Terminal:** `codewhale` öffnet die interaktive Oberfläche; `codewhale exec` führt eine Aufgabe aus einem Skript oder CI-Job aus.
 - **Lokaler Browser:** `codewhale web` öffnet den mitgelieferten [lokalen Webclient](docs/WEB.md) für dieselbe Runtime.

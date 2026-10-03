@@ -89,6 +89,46 @@ class BlockingCallScopeTests(unittest.TestCase):
             {"std_fs": 1},
         )
 
+    def test_std_fs_imports_and_signature_types_do_not_count(self) -> None:
+        self.assertEqual(
+            counts(
+                "use std::fs::File;\n"
+                "use std::fs::OpenOptions;\n"
+                "use std::fs::DirBuilder;\n"
+                "type Handle = std::fs::File;\n"
+                "fn types(_: &std::fs::File, _: std::fs::OpenOptions, "
+                "_: std::fs::DirBuilder) -> Option<std::fs::File> { None }\n"
+            ),
+            {},
+        )
+
+    def test_std_fs_qualified_member_operations_count(self) -> None:
+        for operation in (
+            "std::fs::File::open(path)",
+            "std::fs::File::create(path)",
+            "std::fs::File::options()",
+            "std::fs::OpenOptions::new()",
+            "std::fs::DirBuilder::new()",
+            "std::fs::File :: open(path)",
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    counts(f"async fn run() {{ let _ = {operation}; }}\n"),
+                    {"std_fs": 1},
+                )
+
+    def test_std_fs_qualified_member_in_spawn_blocking_is_exempt(self) -> None:
+        self.assertEqual(
+            counts(
+                "async fn run() {\n"
+                "    tokio::task::spawn_blocking(move || {\n"
+                "        let _ = std::fs::File::open(path);\n"
+                "    });\n"
+                "}\n"
+            ),
+            {},
+        )
+
     def test_comment_and_string_literals_do_not_count(self) -> None:
         self.assertEqual(
             counts(
