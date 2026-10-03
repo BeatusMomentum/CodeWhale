@@ -365,44 +365,14 @@ fn fleet_drift_summary(
     config: &crate::config::Config,
     locale: Locale,
 ) -> Option<String> {
-    let selected = crate::fleet::store::selected_fleet(&app.workspace)?;
-    let (fleet, _scope) = crate::fleet::store::load_fleet_at(&selected.path).ok()?;
-    let active = config
-        .provider
-        .as_deref()
-        .and_then(crate::config::ApiProvider::parse)
-        .unwrap_or(crate::config::ApiProvider::Deepseek);
-    let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
-    let routes =
-        crate::tui::views::fleet_setup::cross_provider_model_routes(config, active, &health);
-    let offered = |provider: &str, model: &str| {
-        routes
-            .iter()
-            .any(|(p, m, _)| p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model))
-    };
-    let mut drifted: Vec<String> = Vec::new();
-    if let Some(operator) = &fleet.operator
-        && !offered(&operator.provider, &operator.model)
-    {
-        drifted.push("operator".to_string());
-    }
-    for member in &fleet.members {
-        if let (Some(provider), Some(model)) = (&member.provider, &member.model)
-            && !offered(provider, model)
-        {
-            drifted.push(member.id.clone());
-        }
-    }
-    if drifted.is_empty() {
-        return None;
-    }
+    let drift = crate::commands::contract::config_policy::fleet_drift(app, config)?;
     Some(localized(
         locale,
         MessageId::StatusFleetDrifted,
         &[
-            ("{fleet}", &fleet.name),
-            ("{count}", &drifted.len().to_string()),
-            ("{ids}", &drifted.join(", ")),
+            ("{fleet}", &drift.name),
+            ("{count}", &drift.ids.len().to_string()),
+            ("{ids}", &drift.ids.join(", ")),
         ],
     ))
 }
@@ -416,16 +386,14 @@ fn session_model_drift_notice(
     config: &crate::config::Config,
     locale: Locale,
 ) -> Option<String> {
-    if app.auto_model || app.model.trim().is_empty() {
-        return None;
-    }
-    let provider = app.provider_identity_for_persistence();
-    crate::provider_catalog_live::pin_missing_from_fresh_roster(config, provider, &app.model)
-        .filter(|missing| *missing)?;
+    let model = crate::commands::contract::config_policy::model_pin_drift(app, config)?;
     Some(localized(
         locale,
         MessageId::StatusModelNotInRoster,
-        &[("{model}", &app.model), ("{provider}", provider)],
+        &[
+            ("{model}", &model),
+            ("{provider}", app.provider_identity_for_persistence()),
+        ],
     ))
 }
 

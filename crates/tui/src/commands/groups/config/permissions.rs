@@ -179,20 +179,7 @@ fn format_matcher(app: &App, rule: &ToolAskRule) -> String {
     }
 }
 
-fn rule_applies_in_workspace(rule: &ToolAskRule, workspace: &std::path::Path) -> bool {
-    let Some(rule_workspace) = rule.workspace.as_deref() else {
-        return true;
-    };
-    let workspace = workspace.to_string_lossy();
-    let Some(rule_workspace) = codewhale_execpolicy::normalize_workspace_scope(rule_workspace)
-    else {
-        return false;
-    };
-    let Some(workspace) = codewhale_execpolicy::normalize_workspace_scope(&workspace) else {
-        return false;
-    };
-    rule_workspace == workspace
-}
+use crate::commands::contract::config_policy::rule_applies_in_workspace;
 
 fn action_name(action: PermissionAction) -> &'static str {
     match action {
