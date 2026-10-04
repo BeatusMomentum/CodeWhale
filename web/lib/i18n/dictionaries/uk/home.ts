@@ -65,12 +65,18 @@ export const home: HomeDict = {
   chapterAvailability: "Де працює",
   availabilityHeading: "Де можна користуватися Codewhale",
   availabilityLede:
-    "Ви вже можете користуватися Codewhale в терміналі, поки ми розробляємо вебзастосунок, настільний застосунок і хмарні комп’ютери.",
+    "Ви вже можете користуватися Codewhale у терміналі, в локальному браузері та в графічному інтерфейсі CodeWhale GUI, який підтримує спільнота, поки ми розробляємо вебзастосунок, настільний застосунок і хмарні комп’ютери.",
   availability: [
     [
       "Термінал",
       "Випущено",
       "Готові збірки з релізів GitHub для Linux, macOS і Windows; npm і Cargo — альтернативи. Android у Termux — попередня версія."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Доступно",
+      "Графічний інтерфейс, який підтримує спільнота, в окремому проєкті: чат, треди та зміни файлів на бічній панелі VS Code поверх того самого Runtime. Встановлюється з VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "Вебзастосунок",
@@ -89,7 +95,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Терміналом можна користуватися без облікового запису Codewhale, а плату за використання хмарних моделей стягує ваш провайдер.",
+    "Терміналом і графічним інтерфейсом можна користуватися без облікового запису Codewhale, а плату за використання хмарних моделей стягує ваш провайдер.",
   accountLink: "Створити обліковий запис",
   surfacesHeading: "Способи роботи з Codewhale",
   surfaces: [

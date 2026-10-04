@@ -66,12 +66,18 @@ export const home: HomeDict = {
   chapterAvailability: "Gdzie działa",
   availabilityHeading: "Gdzie możesz korzystać z Codewhale",
   availabilityLede:
-    "Możesz już dziś korzystać z Codewhale w terminalu, a my pracujemy nad aplikacją webową, aplikacją desktopową i komputerami w chmurze.",
+    "Możesz już dziś korzystać z Codewhale w terminalu, w lokalnej przeglądarce i z utrzymywanym przez społeczność interfejsem CodeWhale GUI, a my pracujemy nad aplikacją webową, aplikacją desktopową i komputerami w chmurze.",
   availability: [
     [
       "Terminal",
       "Wydany",
       "Gotowe pliki binarne z wydań GitHub dla systemów Linux, macOS i Windows; npm i Cargo to alternatywy. Android w Termux to wersja podglądowa."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Dostępny",
+      "Interfejs graficzny utrzymywany przez społeczność, w osobnym projekcie: czat, wątki i zmiany plików w panelu bocznym VS Code na tym samym Runtime. Zainstaluj z VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "Aplikacja webowa",
@@ -90,7 +96,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Możesz korzystać z terminala bez konta Codewhale, a opłaty za użycie modeli hostowanych nalicza Twój dostawca.",
+    "Możesz korzystać z terminala i interfejsu graficznego bez konta Codewhale, a opłaty za użycie modeli hostowanych nalicza Twój dostawca.",
   accountLink: "Załóż konto",
   surfacesHeading: "Sposoby pracy z Codewhale",
   surfaces: [

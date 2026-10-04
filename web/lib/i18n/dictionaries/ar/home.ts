@@ -66,12 +66,18 @@ export const home: HomeDict = {
   chapterAvailability: "أين يعمل",
   availabilityHeading: "أين يمكنك استخدام Codewhale",
   availabilityLede:
-    "يمكنك استخدام Codewhale في طرفيتك اليوم، بينما نعمل على تطوير تطبيق الويب وتطبيق سطح المكتب وأجهزة الكمبيوتر السحابية.",
+    "يمكنك استخدام الطرفية والمتصفح المحلي وواجهة CodeWhale GUI التي يصونها المجتمع اليوم، بينما نعمل على تطوير تطبيق الويب وتطبيق سطح المكتب وأجهزة الكمبيوتر السحابية.",
   availability: [
     [
       "الطرفية",
       "تم الإصدار",
       "ملفات إصدار GitHub الثنائية لأنظمة Linux وmacOS وWindows؛ ويمكن استخدام npm وCargo كبديلين. دعم Android عبر Termux ما زال في مرحلة المعاينة."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "متاح",
+      "واجهة رسومية يصونها المجتمع، في مشروع مستقل: محادثة وخيوط وتغييرات الملفات في شريط جانبي داخل VS Code متصلة بـ Runtime نفسه. ثبّتها من VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "تطبيق الويب",
@@ -90,7 +96,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "يمكنك استخدام الطرفية دون حساب Codewhale، ويتولى مزوّدك فوترة أي استخدام للنماذج المستضافة.",
+    "يمكنك استخدام الطرفية وواجهة GUI دون حساب Codewhale، ويتولى مزوّدك فوترة أي استخدام للنماذج المستضافة.",
   accountLink: "أنشئ حسابًا",
   surfacesHeading: "طرق العمل باستخدام Codewhale",
   surfaces: [

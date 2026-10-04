@@ -1649,6 +1649,8 @@ pub(super) async fn execute_code_execution_tool(
     let budget = Duration::from_secs(120);
     let mut cmd =
         crate::tools::shell::sandboxed_runner_command(context, &program, args, workspace, budget)?;
+    // Match the UTF-8 decoder below, including Windows Python's piped output.
+    cmd.env("PYTHONIOENCODING", "utf-8");
     let output = tokio::time::timeout(
         budget,
         crate::process_tree::contained_output_with_input(&mut cmd, code.as_bytes().to_vec()),

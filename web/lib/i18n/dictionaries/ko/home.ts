@@ -62,12 +62,18 @@ export const home: HomeDict = {
   startVocabularyLink: "제품 용어 보기",
   chapterAvailability: "실행 환경",
   availabilityHeading: "Codewhale을 사용할 수 있는 곳",
-  availabilityLede: "Codewhale은 지금 터미널에서 사용할 수 있으며, 웹 앱과 데스크톱 앱, 클라우드 컴퓨터는 개발 중입니다.",
+  availabilityLede: "Codewhale은 지금 터미널과 로컬 브라우저에서 사용할 수 있고, 커뮤니티가 관리하는 CodeWhale GUI도 이용할 수 있습니다. 웹 앱과 데스크톱 앱, 클라우드 컴퓨터는 개발 중입니다.",
   availability: [
     [
       "터미널",
       "출시됨",
       "Linux, macOS, Windows용 릴리스 바이너리를 GitHub에서 제공합니다. npm과 Cargo로도 설치할 수 있습니다. Android에서 Termux로 실행하는 버전은 미리보기입니다."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "사용 가능",
+      "커뮤니티가 관리하는 그래픽 프런트엔드로, 별도 프로젝트입니다. 같은 Runtime 위에서 VS Code 사이드바로 대화, 스레드, 파일 변경을 다룹니다. VS Code Marketplace에서 설치하세요.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "웹 앱",
@@ -85,7 +91,7 @@ export const home: HomeDict = {
       "작업을 실행할 수 있는 호스팅 컴퓨터."
     ]
   ],
-  availabilityNote: "Codewhale 계정 없이도 터미널을 사용할 수 있으며, 호스팅형 모델 사용 요금은 이용하는 제공업체에서 청구합니다.",
+  availabilityNote: "Codewhale 계정 없이도 터미널과 GUI를 사용할 수 있으며, 호스팅형 모델 사용 요금은 이용하는 제공업체에서 청구합니다.",
   accountLink: "계정 만들기",
   surfacesHeading: "Codewhale로 작업하는 방법",
   surfaces: [

@@ -67,12 +67,18 @@ export const home: HomeDict = {
   availabilityHeading:
     "Tempat Anda dapat menggunakan Codewhale",
   availabilityLede:
-    "Anda dapat menggunakan Codewhale di terminal sekarang, sementara kami mengembangkan aplikasi web, aplikasi desktop, dan komputer cloud.",
+    "Anda dapat menggunakan Codewhale di terminal, di peramban lokal, dan dengan antarmuka CodeWhale GUI yang dipelihara oleh komunitas sekarang, sementara kami mengembangkan aplikasi web, aplikasi desktop, dan komputer cloud.",
   availability: [
     [
       "Terminal",
       "Dirilis",
       "Biner rilis GitHub untuk Linux, macOS, dan Windows; npm dan Cargo tersedia sebagai alternatif. Android di Termux masih dalam tahap pratinjau."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Tersedia",
+      "Antarmuka grafis yang dipelihara oleh komunitas, dalam proyek terpisah: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Runtime yang sama. Pasang dari VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "Aplikasi web",
@@ -91,7 +97,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Anda dapat menggunakan terminal tanpa akun Codewhale, dan penggunaan model yang dihosting ditagih oleh penyedia Anda.",
+    "Anda dapat menggunakan terminal dan GUI tanpa akun Codewhale, dan penggunaan model yang dihosting ditagih oleh penyedia Anda.",
   accountLink: "Buat akun",
   surfacesHeading: "Cara bekerja dengan Codewhale",
   surfaces: [
