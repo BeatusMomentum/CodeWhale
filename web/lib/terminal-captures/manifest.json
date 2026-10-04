@@ -1,9 +1,9 @@
 {
-  "source": "Native Codewhale PTY via qa_harness; website_current_terminal_capture sequence and native workbar keys",
-  "command": "Capture an isolated offline session from the installed Codewhale binary with crates/tui/tests/support/qa_harness; follow website_current_terminal_capture and work_bar_keys_pty input sequences",
-  "binaryVersion": "0.10.1 (e9401490969d)",
-  "baseCommit": "e9401490969d58935b4544388d75dc7f276b81a4",
-  "capturedAt": "2026-10-02",
+  "source": "Native Codewhale PTY via qa_harness; website_current_terminal_capture sequence",
+  "command": "Run the opt-in crates/tui/tests/cucumber/launch_card_pty.rs::website_current_terminal_capture test (cargo test -p codewhale-tui --features long-running-tests --test cucumber -- --ignored --exact launch_card_pty::website_current_terminal_capture) with QA_TUI_BIN set to the commit-stamped Codewhale binary and QA_LAUNCH_CAPTURE_DIR set; it records all six frames",
+  "binaryVersion": "0.10.1 (8ba2bbf805e1)",
+  "baseCommit": "8ba2bbf805e1393ba27493bb5970db88b14ff7b3",
+  "capturedAt": "2026-10-04",
   "conditions": {
     "colorterm": "truecolor",
     "fixtureHistory": false,
@@ -19,45 +19,45 @@
       "file": "website-provider-picker-100x24.json",
       "rows": 24,
       "state": "first-run provider picker",
-      "sha256": "2a81b1f8188622cfe68ee92973b12e7df6633a1f8bf29a841e21acbb884a2e10"
+      "sha256": "775baabf84d59cece15e007a3496f16cea2fe6de0bc2604b2ce00831d646acb7"
     },
     {
       "cols": 100,
       "file": "website-home-100x24.json",
       "rows": 24,
       "state": "home after offline first run, with the onboarding starter prompt",
-      "sha256": "7347431504bbe99a904d68ae0a3e2246fe89039063fe7ecd3ee761dc01604659"
+      "sha256": "59c80f2f0ae9b6b6a81dae58e577ea0b088fdd012824a402311e93a1f181e4b0"
     },
     {
       "cols": 100,
       "file": "website-composer-100x24.json",
       "rows": 24,
       "state": "typed unsent prompt; no provider request",
-      "sha256": "b7d85ec111e831b961d48838fe733dd6e21056d5fdf4093855b0e3b02a494208"
+      "sha256": "c7ef75a89133a2d3142d8b3c4ce9e5a3958bf75f77aaab8fa4f0fcf409385a5a"
     },
     {
       "cols": 100,
       "file": "website-help-100x24.json",
       "rows": 24,
       "state": "actual /help overlay",
-      "sha256": "ac341c21bedcb44a5b89f4e60030c3525b49ff2e7c9313af5989020baffbd6fb"
+      "sha256": "397eab474c39ce229f56c7a467f9e221a3782692cb31d58913fd44bfbd2260ac"
     },
     {
       "cols": 100,
       "file": "website-workbar-fleet-100x32.json",
       "rows": 32,
-      "state": "actual Fleet workbar in an empty offline session",
-      "sha256": "7dafe6351a48e316cd7cb840fd799eb2a028c648845ee87481a9dc046b97b0dc"
+      "state": "actual Fleet workbar in an empty offline session, opened from the launch screen",
+      "sha256": "2f9db9d9e5b477496d466c458bf8f2cfdfa8e34124753a0d18afbb4dd3f68248"
     },
     {
       "cols": 100,
       "file": "website-workbar-100x32.json",
       "rows": 32,
-      "state": "actual Tasks workbar in an empty offline session",
-      "sha256": "0f40f3ad63c9ec105f813a41df46f3ff2d7f1ae6f12fcad35591f06a1a249f61"
+      "state": "actual Tasks workbar in an empty offline session, opened from the launch screen",
+      "sha256": "d967c6bf3c580cc598428bf9ccf504e581b132f95617f2f87b836bdab1b0ec6b"
     }
   ],
   "schema": "{rows, cols, cells: [row][col] -> {x, text, fg, bg, flags}}; fg/bg are null (terminal default), a 0-255 palette index, or [r,g,b]; flags are rio-vt style bits (see crates/tui/tests/support/qa_harness/frame.rs capture_cells)",
-  "binarySha256": "e4efba787a4f07867ddf6268ef74c45637496d6ffea658e31bcc8edeb49828de",
-  "captureToolSha256": "1269ebcacb6b1dedb17746d4dedab55a410ef401aa6bd9a9bca42f9e232732dd"
+  "binarySha256": "d0923befbab85dbadcf381a9dc0019be0e83626f73b1a269e006700aa806d8db",
+  "captureToolSha256": "4b6b64268b36599221747256b03cb1484d26a80e67909b633b24384ca559d3a7"
 }

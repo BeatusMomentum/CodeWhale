@@ -3,7 +3,7 @@
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
 
-![Terminalde çalışan Codewhale](web/public/codewhale-tui-e940149.png)
+![Terminalde çalışan Codewhale](web/public/codewhale-tui-8ba2bbf.png)
 
 *v0.10.1 geliştirme derlemesinden terminal önizlemesi.*
 

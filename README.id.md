@@ -3,7 +3,7 @@
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
 
-![Codewhale berjalan di terminal](web/public/codewhale-tui-e940149.png)
+![Codewhale berjalan di terminal](web/public/codewhale-tui-8ba2bbf.png)
 
 *Pratinjau terminal dari build pengembangan v0.10.1.*
 

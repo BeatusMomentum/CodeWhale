@@ -3,7 +3,7 @@
 
 Codewhale é um agente de código aberto que lê seu projeto, edita arquivos, executa comandos e verifica o próprio trabalho usando um modelo hospedado ou local à sua escolha. Comece com uma tarefa no terminal. Para um trabalho maior, distribua partes do trabalho entre agentes com diferentes modelos e funções.
 
-![Codewhale em execução em um terminal](web/public/codewhale-tui-e940149.png)
+![Codewhale em execução em um terminal](web/public/codewhale-tui-8ba2bbf.png)
 
 *Prévia do terminal em uma build de desenvolvimento da v0.10.1.*
 
