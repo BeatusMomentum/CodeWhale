@@ -76,7 +76,8 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI (VS Code)",
       "Có sẵn",
-      "Giao diện đồ họa do cộng đồng duy trì, trong một dự án riêng: trò chuyện, chủ đề và thay đổi tệp trong thanh bên VS Code trên cùng Runtime. Cài đặt từ VS Code Marketplace."
+      "Giao diện đồ họa do cộng đồng duy trì, trong một dự án riêng: trò chuyện, chủ đề và thay đổi tệp trong thanh bên VS Code trên cùng Runtime. Cài đặt từ VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "Ứng dụng web",

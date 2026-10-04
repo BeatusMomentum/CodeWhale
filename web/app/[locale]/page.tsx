@@ -275,9 +275,9 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             }
           >
             <dl className="ruled-list">
-              {d.availability.map(([surface, status, detail], index) => (
+              {d.availability.map(([surface, status, detail, href], index) => (
                 <div key={surface}>
-                  <dt>{surface}</dt>
+                  <dt>{href ? <a href={href} className="body-link">{surface}</a> : surface}</dt>
                   <dd>
                     <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{status}</Status>
                     {detail}

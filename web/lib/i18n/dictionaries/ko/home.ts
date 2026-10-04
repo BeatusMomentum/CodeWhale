@@ -72,7 +72,8 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI (VS Code)",
       "사용 가능",
-      "커뮤니티가 관리하는 그래픽 프런트엔드로, 별도 프로젝트입니다. 같은 Runtime 위에서 VS Code 사이드바로 대화, 스레드, 파일 변경을 다룹니다. VS Code Marketplace에서 설치하세요."
+      "커뮤니티가 관리하는 그래픽 프런트엔드로, 별도 프로젝트입니다. 같은 Runtime 위에서 VS Code 사이드바로 대화, 스레드, 파일 변경을 다룹니다. VS Code Marketplace에서 설치하세요.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "웹 앱",

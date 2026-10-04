@@ -72,7 +72,8 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI（VS Code）",
       "利用可能",
-      "コミュニティが保守するグラフィカルフロントエンド（独立したプロジェクト）。同じ Runtime 上で、VS Code のサイドバーからチャット、スレッド、ファイル変更を扱えます。VS Code Marketplace からインストールできます。"
+      "コミュニティが保守するグラフィカルフロントエンド（独立したプロジェクト）。同じ Runtime 上で、VS Code のサイドバーからチャット、スレッド、ファイル変更を扱えます。VS Code Marketplace からインストールできます。",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "ウェブアプリ",

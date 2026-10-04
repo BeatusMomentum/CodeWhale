@@ -77,7 +77,8 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI (VS Code)",
       "Tersedia",
-      "Antarmuka grafis yang dipelihara oleh komunitas, dalam proyek terpisah: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Runtime yang sama. Pasang dari VS Code Marketplace."
+      "Antarmuka grafis yang dipelihara oleh komunitas, dalam proyek terpisah: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Runtime yang sama. Pasang dari VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "Aplikasi web",

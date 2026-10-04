@@ -72,7 +72,8 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI（VS Code）",
       "可用",
-      "社区维护的图形前端，独立项目：在 VS Code 侧边栏中连接同一个 Codewhale Runtime，进行对话、管理线程并查看文件变更。可从 VS Code Marketplace 安装。"
+      "社区维护的图形前端，独立项目：在 VS Code 侧边栏中连接同一个 Codewhale Runtime，进行对话、管理线程并查看文件变更。可从 VS Code Marketplace 安装。",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "托管网页应用",

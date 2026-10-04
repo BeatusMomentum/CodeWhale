@@ -85,6 +85,7 @@ export const home: HomeDict = {
       "CodeWhale GUI (VS Code)",
       "Available",
       "The community-maintained graphical frontend, a separate project: chat, threads, and file changes in a VS Code sidebar over the same Codewhale Runtime. Install it from the VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode",
     ],
     [
       "Hosted web app",

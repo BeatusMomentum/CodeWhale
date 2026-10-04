@@ -402,9 +402,18 @@ describe("website dictionaries", () => {
       expect(home.surfaces, `${locale} surfaces`).toHaveLength(5);
       for (const row of [...home.gain, ...home.modelsFacts, ...home.availability, ...home.surfaces]) {
         for (const cell of row) {
+          if (cell === undefined) continue;
           expect(cell.length, `${locale} empty cell`).toBeGreaterThan(0);
         }
       }
+    }
+  });
+
+  it("links the community VS Code GUI to its Marketplace listing in every locale", () => {
+    const marketplace = "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode";
+    for (const locale of ["en", ...DICTIONARY_LOCALES]) {
+      const row = getHome(locale).availability.find(([surface]) => surface.startsWith("CodeWhale GUI"));
+      expect(row?.[3], `${locale} GUI Marketplace link`).toBe(marketplace);
     }
   });
 
