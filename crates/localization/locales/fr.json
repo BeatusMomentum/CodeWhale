@@ -786,6 +786,7 @@
   "ClearConversation": "Conversation effacée",
   "ClearConversationBusy": "Rien n'a été effacé (état Work ou exécution occupée ; patientez, puis réessayez /clear)",
   "ModelChanged": "Le modèle est maintenant {new} (avant : {old}).",
+  "ModelChangedSessionNote": " (pour cette session uniquement — /fleet save met à jour cette équipe, /fleet save-as enregistre une nouvelle équipe, /model save-default l'enregistre comme défaut de démarrage)",
   "LinksProjectTitle": "Codewhale et communauté :",
   "LinksDocumentation": "Documentation :",
   "LinksCommunity": "Communauté et contribution :",

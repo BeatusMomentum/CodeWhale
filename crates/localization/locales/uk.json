@@ -786,6 +786,7 @@
   "ClearConversation": "Розмову очищено",
   "ClearConversationBusy": "Нічого не очищено (стан роботи або виконання зайняті; зачекайте й повторіть /clear)",
   "ModelChanged": "Модель тепер {new} (була {old}).",
+  "ModelChangedSessionNote": " (лише для цього сеансу — /fleet save оновлює цю команду, /fleet save-as зберігає нову команду, /model save-default зберігає її як типову для запуску)",
   "LinksProjectTitle": "Codewhale і спільнота:",
   "LinksDocumentation": "Документація:",
   "LinksCommunity": "Спільнота та внесок:",

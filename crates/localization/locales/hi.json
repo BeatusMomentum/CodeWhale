@@ -786,6 +786,7 @@
   "ClearConversation": "वार्तालाप साफ़ किया गया",
   "ClearConversationBusy": "कुछ साफ़ नहीं हुआ (कार्य स्थिति या रनटाइम कार्य व्यस्त है; प्रतीक्षा करें, फिर /clear दोबारा आज़माएँ)",
   "ModelChanged": "मॉडल अब {new} है (पहले {old} था)।",
+  "ModelChangedSessionNote": " (सिर्फ़ इस सत्र के लिए — /fleet save इस टीम को अपडेट करता है, /fleet save-as नई टीम सहेजता है, /model save-default इसे स्टार्टअप डिफ़ॉल्ट के रूप में सहेजता है)",
   "LinksProjectTitle": "Codewhale और समुदाय:",
   "LinksDocumentation": "दस्तावेज़:",
   "LinksCommunity": "समुदाय और योगदान:",

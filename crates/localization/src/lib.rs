@@ -1024,6 +1024,7 @@ pub enum MessageId {
     ClearConversation,
     ClearConversationBusy,
     ModelChanged,
+    ModelChangedSessionNote,
     LinksProjectTitle,
     LinksDocumentation,
     LinksCommunity,
@@ -3580,6 +3581,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ClearConversation,
     MessageId::ClearConversationBusy,
     MessageId::ModelChanged,
+    MessageId::ModelChangedSessionNote,
     MessageId::LinksProjectTitle,
     MessageId::LinksDocumentation,
     MessageId::LinksCommunity,
@@ -5583,6 +5585,7 @@ mod tests {
             MessageId::KbReasoningDetail,
             MessageId::CmdTurnInspectDescription,
             MessageId::CmdAdvisorDescription,
+            MessageId::ModelChangedSessionNote,
         ];
         for locale in Locale::shipped_complete() {
             if *locale == Locale::En {
