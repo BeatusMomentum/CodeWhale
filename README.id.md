@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:a59c459aea4d -->
+<!-- source: README.md sha256:efa9c4d27420 -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
