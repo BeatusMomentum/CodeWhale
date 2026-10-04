@@ -148,7 +148,7 @@ describe("checkout and durable payment receipts", () => {
     const quote = await checkout();
     expect(quote.expiresAt-Date.now()).toBeGreaterThan(14*60*1000);
     expect(quote.expiresAt-Date.now()).toBeLessThanOrEqual(15*60*1000);
-    const creation = sent.find(r => r.url.includes("stripe.com") && r.method === "POST")!;
+    const creation = sent.find(r => new URL(r.url).hostname === "api.stripe.com" && r.method === "POST")!;
     expect(creation.idempotency).toBe("codewhale-merch:" + quote.quoteId);
     const params = new URLSearchParams(creation.body);
     expect(params.get("payment_method_configuration")).toBe("pmc_fixture");
@@ -159,7 +159,7 @@ describe("checkout and durable payment receipts", () => {
     expect(params.has("shipping_address_collection[allowed_countries][0]")).toBe(false);
     expect(Number(params.get("expires_at"))*1000-quote.expiresAt).toBeGreaterThan(29*60*1000);
     expect((await handleMerch(request("checkout", { quoteId: quote.quoteId }), "checkout", env)).status).toBe(200);
-    expect(sent.filter(r => r.url.includes("stripe.com") && r.method === "POST")).toHaveLength(1);
+    expect(sent.filter(r => new URL(r.url).hostname === "api.stripe.com" && r.method === "POST")).toHaveLength(1);
   });
   it("rejects an expired quote and changed saved artwork", async () => {
     const quote = await quoted();
@@ -183,7 +183,7 @@ describe("checkout and durable payment receipts", () => {
       expect(result.status).toBe(409);
       expect((await result.json()).code).toBe("quote_expired");
     }
-    expect(sent.filter(r => r.url.includes("stripe.com"))).toHaveLength(0);
+    expect(sent.filter(r => new URL(r.url).hostname === "api.stripe.com")).toHaveLength(0);
   });
   it("rejects bad signatures, test/live mismatch and unreconciled amounts", async () => {
     const quote = await checkout();
