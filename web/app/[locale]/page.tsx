@@ -132,7 +132,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 <div className="figure-frame">
                   <NativeTerminalGallery
                     locale={locale}
-                    defaultFrame="home"
+                    defaultFrame="composer"
                     regionLabel={d.shotPreview}
                     label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
                   />

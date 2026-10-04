@@ -21,7 +21,7 @@ const views = Object.keys(NATIVE_TERMINAL_VIEWS).flatMap((id) =>
 /** Website controls select real PTY captures; the terminal itself is unchanged. */
 export function NativeTerminalGallery({
   locale,
-  defaultFrame = "home",
+  defaultFrame = "composer",
   label,
   regionLabel,
 }: {

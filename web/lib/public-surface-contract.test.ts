@@ -566,9 +566,9 @@ done
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // Website and README share the same exact-build terminal-cell capture:
-    // the site renders its cells as live text, the README shows the same
-    // frame rasterized from them.
+    // The site and README use captures from the same exact build. The site
+    // opens on the real unsent composer; the README image preserves the home
+    // frame rasterized from its corresponding capture.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
@@ -586,7 +586,7 @@ done
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(homepage).toContain('<NativeTerminalGallery\n                    locale={locale}\n                    defaultFrame="home"');
+    expect(homepage).toContain('<NativeTerminalGallery\n                    locale={locale}\n                    defaultFrame="composer"');
     expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
     expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
     // Every locale describes the actual capture; build identity comes from
