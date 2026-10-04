@@ -23,9 +23,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Security::Authorization::{
-    GRANT_ACCESS, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT,
-};
+use windows_sys::Win32::Security::Authorization::{GRANT_ACCESS, REVOKE_ACCESS};
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
 };
@@ -63,7 +61,7 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 0x1;
 const MAX_GRANT_ENTRIES: usize = 65_536;
 const MAX_GRANT_SCOPES: usize = 1024;
-/// Empty Bun config in the granted runtime-copy directory (see spawn_inner).
+/// Empty Bun config in the granted runtime-copy directory (see sandbox_args).
 const EMPTY_BUN_CONFIG: &str = "empty-bunfig.toml";
 // Serialize Core's read/merge/write ACL operations across old-profile cleanup
 // and a new host admission. Never overwrite a concurrently admitted profile.
@@ -585,6 +583,8 @@ impl NativeSandbox {
                 format!("{PROBE_SOURCE}\nconsole.log(JSON.stringify(await windowsSandboxProbe()))"),
             ]);
         }
+        // Serialize the same sandbox-safe argv used to launch the parent.
+        let args = sandbox_args(&args, self._assets.path());
         let child_args = (
             "CODEWHALE_WINDOWS_PROBE_CHILD_ARGS".to_string(),
             serde_json::to_string(&args)?,
@@ -640,7 +640,8 @@ impl NativeSandbox {
         env: &[(OsString, OsString)],
         memory_cap: u64,
     ) -> io::Result<Spawned> {
-        self.spawn_inner(args, env, memory_cap, true)
+        let args = sandbox_args(args, self._assets.path());
+        self.spawn_inner(&args, env, memory_cap, true)
     }
 
     fn spawn_inner(
@@ -655,8 +656,9 @@ impl NativeSandbox {
         let (stderr, child_stderr) = pipe(true, overlapped)?;
         let mut attrs = Attributes::new(4)?;
         let registry_read = CapabilitySid::registry_read()?;
+        let capability_sid = registry_read.sid();
         let mut capability = SID_AND_ATTRIBUTES {
-            Sid: registry_read.sid(),
+            Sid: capability_sid,
             Attributes: windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED as u32,
         };
         let capabilities = SECURITY_CAPABILITIES {
@@ -691,23 +693,7 @@ impl NativeSandbox {
         startup.StartupInfo.hStdError = child_stderr.as_raw_handle();
         startup.lpAttributeList = attrs.ptr();
         let application = wide(self.program.as_os_str())?;
-        // An LPAC cannot open the NUL device, so a Bun host reads its empty
-        // config from the granted runtime-copy directory instead.
-        let empty_config = format!(
-            "--config={}",
-            self._assets.path().join(EMPTY_BUN_CONFIG).display()
-        );
-        let args: Vec<String> = args
-            .iter()
-            .map(|arg| {
-                if arg == "--config=NUL" {
-                    empty_config.clone()
-                } else {
-                    arg.clone()
-                }
-            })
-            .collect();
-        let mut command = command_line(self.program.as_os_str(), &args)?;
+        let mut command = command_line(self.program.as_os_str(), args)?;
         let directory = wide(self.data.as_os_str())?;
         let mut env = env.to_vec();
         let temp = self.data.join("tmp").into_os_string();
@@ -747,7 +733,7 @@ impl NativeSandbox {
                 &process,
             )?);
             tree.limit_process_memory(memory_cap)?;
-            verify_token(&process, self.profile.sid, registry_read.sid())?;
+            verify_token(&process, self.profile.sid, capability_sid)?;
             // No Native byte executes until Job, memory and actual LPAC token
             // identity/capabilities have all been checked by Rust.
             if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
@@ -1162,14 +1148,11 @@ impl Drop for CapabilitySid {
 fn set_acl(file: &File, sid: PSID, access: u32, inheritance: u32) -> io::Result<()> {
     edit_acl(file, sid, access, inheritance, GRANT_ACCESS)
 }
-/// Edit exactly one SID's explicit allow entry and write the resulting DACL
-/// through the kernel on this pinned handle. `SetSecurityInfo` re-derives
-/// inheritance: it turned a file's inherited ACEs into explicit copies after a
-/// grant/retire cycle, and it would propagate to children. Writing the exact
-/// DACL with `SetKernelObjectSecurity` keeps every other ACE byte-for-byte,
-/// including inherited ones, and never touches a child or reparse target.
-/// Microsoft advises against this API for files precisely because it does not
-/// propagate; here that is the required property.
+/// Edit exactly one SID's allow entries on this pinned handle. Read the stored
+/// descriptor with GetKernelObjectSecurity: GetSecurityInfo can normalize a
+/// child's inherited ACEs/control while its parent has a grant. Writing that
+/// view back freezes the normalized state. The exact kernel reader/writer pair
+/// preserves every other ACE and never propagates changes to child objects.
 fn edit_acl(
     file: &File,
     sid: PSID,
@@ -1179,9 +1162,9 @@ fn edit_acl(
 ) -> io::Result<()> {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, AddAccessAllowedAceEx, AddAce, GetAce, GetLengthSid,
-        GetSecurityDescriptorControl, INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor,
-        SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-        SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor, SE_DACL_AUTO_INHERIT_REQ,
+        SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
@@ -1192,43 +1175,13 @@ fn edit_acl(
     if !grant && mode != REVOKE_ACCESS {
         return Err(io::Error::other("unsupported ACL edit mode"));
     }
-    let mut old_acl: *mut ACL = null_mut();
-    let mut descriptor = null_mut();
-    let result = unsafe {
-        GetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &mut old_acl,
-            null_mut(),
-            &mut descriptor,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::from_raw_os_error(result as i32));
-    }
-    let descriptor = LocalAllocation(descriptor);
-    if old_acl.is_null() {
-        return Err(io::Error::other("refusing to replace an unrestricted DACL"));
-    }
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let preserved = control & (SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED);
-    // An unprotected file has no children, so SetSecurityInfo cannot
-    // propagate from it; with UNPROTECTED it re-derives the inherited entries
-    // from the parent. Writing a file's inherited entries back (either API)
-    // turned them into explicit ones on hosted Windows. Directories and
-    // protected DACLs keep the exact kernel write, which never propagates.
-    let derive_inherited = preserved & SE_DACL_PROTECTED == 0 && !file.metadata()?.is_dir();
+    let descriptor = RawDacl::read(file)?;
+    let old_acl = descriptor.acl();
+    let preserved = descriptor.control & (SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED);
     let old = std::ptr::NonNull::new(old_acl)
         .ok_or_else(|| io::Error::other("refusing to replace an unrestricted DACL"))?;
     let (acl_revision, acl_size, ace_count) = {
-        // SAFETY: GetSecurityInfo returned this DACL inside `descriptor`.
+        // SAFETY: RawDacl validated this DACL inside its owned descriptor.
         let acl = unsafe { old.as_ref() };
         (
             u32::from(acl.AclRevision),
@@ -1286,10 +1239,6 @@ fn edit_acl(
             merged |= unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().as_ref().Mask };
             continue;
         }
-        if derive_inherited && inherited {
-            // Windows re-derives these from the parent on write.
-            continue;
-        }
         if ours && !grant {
             // Retirement removes explicit entries and the stale inherited
             // copies left after the parent's grant was revoked first.
@@ -1322,66 +1271,42 @@ fn edit_acl(
     {
         return Err(io::Error::last_os_error());
     }
-    if derive_inherited {
-        use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
-        use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
-        // SAFETY: the pinned handle and the explicit-only ACL outlive the call.
-        let result = unsafe {
-            SetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                new_acl,
-                null(),
-            )
+    let mut security: SECURITY_DESCRIPTOR = unsafe { zeroed() };
+    let security_ptr = (&mut security as *mut SECURITY_DESCRIPTOR).cast();
+    // NTFS stores this descriptor as given, with no inheritance merge. The
+    // kernel keeps SE_DACL_AUTO_INHERITED only when SE_DACL_AUTO_INHERIT_REQ
+    // accompanies it, so request it exactly when the object already had it;
+    // otherwise the object would silently become a legacy DACL.
+    let requested = preserved
+        | if preserved & SE_DACL_AUTO_INHERITED != 0 {
+            SE_DACL_AUTO_INHERIT_REQ
+        } else {
+            0
         };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error(result as i32));
-        }
-    } else {
-        let mut security: SECURITY_DESCRIPTOR = unsafe { zeroed() };
-        let security_ptr = (&mut security as *mut SECURITY_DESCRIPTOR).cast();
-        // NTFS stores this descriptor as given, with no inheritance merge. The
-        // kernel keeps SE_DACL_AUTO_INHERITED only when SE_DACL_AUTO_INHERIT_REQ
-        // accompanies it, so request it exactly when the object already had it;
-        // otherwise the object would silently become a legacy DACL.
-        let requested = preserved
-            | if preserved & SE_DACL_AUTO_INHERITED != 0 {
-                SE_DACL_AUTO_INHERIT_REQ
-            } else {
-                0
-            };
-        if unsafe { InitializeSecurityDescriptor(security_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
-            || unsafe { SetSecurityDescriptorDacl(security_ptr, 1, new_acl, 0) } == 0
-            || unsafe {
-                SetSecurityDescriptorControl(
-                    security_ptr,
-                    SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED,
-                    requested,
-                )
-            } == 0
-            || unsafe {
-                SetKernelObjectSecurity(
-                    file.as_raw_handle(),
-                    DACL_SECURITY_INFORMATION,
-                    security_ptr,
-                )
-            } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+    if unsafe { InitializeSecurityDescriptor(security_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
+        || unsafe { SetSecurityDescriptorDacl(security_ptr, 1, new_acl, 0) } == 0
+        || unsafe {
+            SetSecurityDescriptorControl(
+                security_ptr,
+                SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED,
+                requested,
+            )
+        } == 0
+        || unsafe {
+            SetKernelObjectSecurity(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                security_ptr,
+            )
+        } == 0
+    {
+        return Err(io::Error::last_os_error());
     }
     drop(descriptor);
     let (still_granted, control) = read_back_dacl(file, sid)?;
-    // A re-derived file DACL is auto-inherited by construction; it must stay
-    // unprotected. A kernel-written DACL keeps both bits exactly.
-    let checked = if derive_inherited {
-        SE_DACL_PROTECTED
-    } else {
-        SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED
-    };
+    // The raw descriptor and exact kernel write preserve both bits on files
+    // and directories, without re-deriving or propagating inherited entries.
+    let checked = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
     if control & checked != preserved & checked {
         return Err(io::Error::other(
             "edited DACL changed its inheritance control bits",
@@ -1398,37 +1323,14 @@ fn edit_acl(
 /// Read back the object's DACL: whether any allow entry names `sid`, and the
 /// descriptor's control bits.
 fn read_back_dacl(file: &File, sid: PSID) -> io::Result<(bool, u16)> {
-    use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, GetSecurityDescriptorControl,
-    };
+    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce};
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
-    let mut acl: *mut ACL = null_mut();
-    let mut descriptor = null_mut();
-    let result = unsafe {
-        GetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &mut acl,
-            null_mut(),
-            &mut descriptor,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::from_raw_os_error(result as i32));
-    }
-    let descriptor = LocalAllocation(descriptor);
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let Some(dacl) = std::ptr::NonNull::new(acl) else {
-        return Ok((false, control));
-    };
-    // SAFETY: GetSecurityInfo returned this DACL inside `descriptor`.
+    let descriptor = RawDacl::read(file)?;
+    let acl = descriptor.acl();
+    let control = descriptor.control;
+    let dacl = std::ptr::NonNull::new(acl)
+        .ok_or_else(|| io::Error::other("refusing to inspect an unrestricted DACL"))?;
+    // SAFETY: RawDacl validated this DACL inside its owned descriptor.
     for index in 0..u32::from(unsafe { dacl.as_ref().AceCount }) {
         let mut ace = null_mut();
         if unsafe { GetAce(acl, index, &mut ace) } == 0 {
@@ -1454,7 +1356,205 @@ fn read_back_dacl(file: &File, sid: PSID) -> io::Result<(bool, u16)> {
     Ok((false, control))
 }
 
+/// Owned DWORD-aligned storage for a bounded self-relative kernel descriptor.
+/// The ACL offset is validated once and never outlives this allocation.
+struct RawDacl {
+    storage: Vec<u32>,
+    acl_offset: usize,
+    control: u16,
+}
+impl RawDacl {
+    fn read(file: &File) -> io::Result<Self> {
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+        use windows_sys::Win32::Security::{GetKernelObjectSecurity, SECURITY_DESCRIPTOR_RELATIVE};
+        let mut required = 0_u32;
+        // SAFETY: a zero-length size query writes only `required`.
+        if unsafe {
+            GetKernelObjectSecurity(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                0,
+                &mut required,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                return Err(error);
+            }
+        }
+        // An external ACL writer can change the required size between calls.
+        // Bound both the allocation and the number of attempts; fail closed.
+        for _ in 0..3 {
+            if !(size_of::<SECURITY_DESCRIPTOR_RELATIVE>()..=1024 * 1024)
+                .contains(&(required as usize))
+            {
+                return Err(io::Error::other(
+                    "kernel security descriptor exceeds size bounds",
+                ));
+            }
+            let capacity = required;
+            let mut storage = vec![0_u32; (capacity as usize).div_ceil(size_of::<u32>())];
+            // SAFETY: storage is aligned, owned, and at least capacity bytes.
+            if unsafe {
+                GetKernelObjectSecurity(
+                    file.as_raw_handle(),
+                    DACL_SECURITY_INFORMATION,
+                    storage.as_mut_ptr().cast(),
+                    capacity,
+                    &mut required,
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32)
+                    && required > capacity
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+            if required > capacity {
+                return Err(io::Error::other(
+                    "kernel security descriptor exceeds its buffer",
+                ));
+            }
+            return Self::from_storage(storage, required as usize);
+        }
+        Err(io::Error::other(
+            "kernel security descriptor repeatedly changed size",
+        ))
+    }
+
+    fn from_storage(mut storage: Vec<u32>, length: usize) -> io::Result<Self> {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, IsValidAcl, IsValidSid, SE_SELF_RELATIVE,
+            SECURITY_DESCRIPTOR_RELATIVE, SID,
+        };
+        use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+        if length < size_of::<SECURITY_DESCRIPTOR_RELATIVE>()
+            || length > storage.len() * size_of::<u32>()
+        {
+            return Err(io::Error::other("kernel security descriptor is truncated"));
+        }
+        let descriptor = storage.as_mut_ptr().cast();
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: the aligned allocation contains the complete descriptor header.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if control & SE_SELF_RELATIVE == 0 {
+            return Err(io::Error::other(
+                "kernel security descriptor is not self-relative",
+            ));
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl: *mut ACL = null_mut();
+        // SAFETY: only the validated self-relative header is read here. Bound
+        // the returned DACL pointer before dereferencing any of its bytes.
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 0 || acl.is_null() {
+            return Err(io::Error::other("refusing an absent or unrestricted DACL"));
+        }
+        let acl_offset = (acl as usize)
+            .checked_sub(descriptor as usize)
+            .filter(|offset| {
+                *offset >= size_of::<SECURITY_DESCRIPTOR_RELATIVE>()
+                    && *offset % size_of::<u32>() == 0
+                    && offset
+                        .checked_add(size_of::<ACL>())
+                        .is_some_and(|end| end <= length)
+            })
+            .ok_or_else(|| io::Error::other("DACL header is outside its descriptor"))?;
+        // SAFETY: the aligned DACL header lies completely inside storage.
+        let acl_size = usize::from(unsafe { (*acl).AclSize });
+        if acl_size < size_of::<ACL>()
+            || acl_offset
+                .checked_add(acl_size)
+                .is_none_or(|end| end > length)
+        {
+            return Err(io::Error::other("DACL is outside its descriptor"));
+        }
+        // SAFETY: the entire claimed ACL extent is bounded by owned storage.
+        // IsValidAcl checks revision and whether its ACEs fit that extent.
+        if unsafe { IsValidAcl(acl) } == 0 {
+            return Err(io::Error::other(
+                "kernel descriptor contains an invalid ACL",
+            ));
+        }
+        for index in 0..u32::from(unsafe { (*acl).AceCount }) {
+            let mut entry = null_mut();
+            if unsafe { GetAce(acl, index, &mut entry) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let entry_offset = (entry as usize)
+                .checked_sub(acl as usize)
+                .filter(|offset| {
+                    *offset >= size_of::<ACL>()
+                        && *offset % size_of::<u32>() == 0
+                        && offset
+                            .checked_add(size_of::<ACE_HEADER>())
+                            .is_some_and(|end| end <= acl_size)
+                })
+                .ok_or_else(|| io::Error::other("ACE header is outside its DACL"))?;
+            // SAFETY: the complete, aligned ACE header is inside the DACL.
+            let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+            let entry_size = usize::from(header.AceSize);
+            if entry_size < size_of::<ACE_HEADER>() || entry_offset + entry_size > acl_size {
+                return Err(io::Error::other("ACE is outside its DACL"));
+            }
+            if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE {
+                // IsValidAcl does not validate SIDs. Bound the whole SID before
+                // IsValidSid or either caller's EqualSid can inspect it.
+                let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+                let sid_header = std::mem::offset_of!(SID, SubAuthority);
+                if entry_size < sid_offset + sid_header {
+                    return Err(io::Error::other("allow ACE has a truncated SID header"));
+                }
+                // SAFETY: the complete SID header is inside this ACE.
+                let sid = unsafe { entry.cast::<u8>().add(sid_offset) };
+                let count = usize::from(unsafe { *sid.add(1) });
+                if sid_header + count * size_of::<u32>() > entry_size - sid_offset
+                    || unsafe { IsValidSid(sid.cast()) } == 0
+                {
+                    return Err(io::Error::other(
+                        "allow ACE has an invalid or truncated SID",
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            storage,
+            acl_offset,
+            control,
+        })
+    }
+
+    fn acl(&self) -> *mut ACL {
+        // SAFETY: from_storage validated the offset, alignment, and ACL extent;
+        // storage stays owned and unchanged while the returned pointer is used.
+        unsafe {
+            self.storage
+                .as_ptr()
+                .cast::<u8>()
+                .add(self.acl_offset)
+                .cast_mut()
+                .cast()
+        }
+    }
+}
+
+#[cfg(test)]
 struct LocalAllocation(*mut core::ffi::c_void);
+#[cfg(test)]
 impl Drop for LocalAllocation {
     fn drop(&mut self) {
         unsafe {
@@ -1602,6 +1702,21 @@ fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
     }
     value.push(0);
     Ok(value)
+}
+
+fn sandbox_args(args: &[String], runtime_dir: &Path) -> Vec<String> {
+    // An LPAC cannot open the NUL device. Both the host and its probe
+    // descendant read the empty config in the already-granted runtime copy.
+    let empty_config = format!("--config={}", runtime_dir.join(EMPTY_BUN_CONFIG).display());
+    args.iter()
+        .map(|arg| {
+            if arg == "--config=NUL" {
+                empty_config.clone()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect()
 }
 
 fn command_line(program: &OsStr, args: &[String]) -> io::Result<Vec<u16>> {

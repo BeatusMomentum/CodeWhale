@@ -1196,9 +1196,26 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
         &scopes.admit(selected_workspace.clone()).await?,
         &selected_scope
     ));
+    let retired_workspace = root.join("retired-workspace");
+    #[cfg(windows)]
+    {
+        // This fixture still owns a Fleet ledger whose ancestor pins deny
+        // deletion. Check that protection before releasing the test owner.
+        let error = fs::rename(&selected_workspace, &retired_workspace)
+            .expect_err("a live Fleet ledger must prevent workspace replacement");
+        assert_eq!(error.raw_os_error(), Some(32), "{error}");
+        assert!(!retired_workspace.exists());
+        assert!(Arc::ptr_eq(
+            &scopes.admit(selected_workspace.clone()).await?,
+            &selected_scope
+        ));
+    }
+    drop(selected_fleet);
     // File identity, not a stable pathname, binds the cache. Replacing the
-    // selected directory cannot borrow its admitted LSP/MCP authority.
-    fs::rename(&selected_workspace, root.join("retired-workspace"))?;
+    // selected directory after the Fleet pins close cannot borrow its admitted
+    // LSP/MCP authority. Keep this check on Windows as well as Unix.
+    fs::rename(&selected_workspace, &retired_workspace)
+        .context("replace selected workspace after releasing the test Fleet manager")?;
     fs::create_dir(&selected_workspace)?;
     assert!(scopes.admit(selected_workspace.clone()).await.is_err());
     assert_eq!(

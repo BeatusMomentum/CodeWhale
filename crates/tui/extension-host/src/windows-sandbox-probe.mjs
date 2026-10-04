@@ -41,31 +41,68 @@ export async function windowsSandboxProbe(env = process.env) {
   if (env.CODEWHALE_WINDOWS_PROBE_DESCENDANT !== '1') {
     const args = JSON.parse(env.CODEWHALE_WINDOWS_PROBE_CHILD_ARGS ?? 'null')
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new Error('missing Core child probe argv')
-    await new Promise((resolve, reject) => {
-      const child = childProcess.spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: {
-        ...env, CODEWHALE_WINDOWS_PROBE_DESCENDANT: '1', CODEWHALE_WINDOWS_PROBE_INSIDE: `${inside}.child`,
-      } })
-      let output = '', bytes = 0
-      const finish = (error) => { clearTimeout(timer); if (error) { child.kill(); reject(error) } else resolve() }
-      const timer = setTimeout(() => finish(new Error('sandbox descendant probe timed out')), 6000)
-      child.stdout.on('data', (chunk) => {
-        bytes += chunk.length
-        if (bytes > 4096) finish(new Error('sandbox descendant output exceeds 4096 bytes'))
-        else output += chunk.toString()
-      })
-      // Drain stderr without retaining arbitrary output.
-      child.stderr.on('data', (chunk) => {
-        bytes += chunk.length
-        if (bytes > 4096) finish(new Error('sandbox descendant output exceeds 4096 bytes'))
-      })
-      child.once('error', (error) => finish(error))
-      child.once('close', (code, signal) => {
+    // LPAC cannot open NUL or libuv's global named pipes. Core already gave
+    // us an EOF stdin handle; capture the fixed child receipt in own-data and
+    // inherit all three handles instead of asking the runtime to create any.
+    const outputPath = `${inside}.receipt`
+    const fd = fs.openSync(outputPath, 'wx+')
+    try {
+      await new Promise((resolve, reject) => {
+        let child, timer, poll, closeTimer, failure, settled = false
+        const finish = (error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer); clearInterval(poll); clearTimeout(closeTimer)
+          if (error) reject(error)
+          else resolve()
+        }
+        const fail = (error) => {
+          if (settled || failure) return
+          failure = error
+          clearTimeout(timer); clearInterval(poll)
+          // Wait for inherited handles to close before cleanup. Core's outer
+          // job deadline still kills the whole tree if termination stalls.
+          closeTimer = setTimeout(() => finish(failure), 1000)
+          try { child.kill() } catch {}
+        }
         try {
-          if (code !== 0 || signal || JSON.stringify(JSON.parse(output)) !== JSON.stringify(receipt)) throw new Error('sandbox descendant has no exact denial receipt')
-          finish()
-        } catch (error) { finish(error) }
+          child = childProcess.spawn(process.execPath, args, { stdio: [0, fd, fd], windowsHide: true, env: {
+            ...env, CODEWHALE_WINDOWS_PROBE_DESCENDANT: '1', CODEWHALE_WINDOWS_PROBE_INSIDE: `${inside}.child`,
+          } })
+        } catch (error) { finish(error); return }
+        timer = setTimeout(() => fail(new Error('sandbox descendant probe timed out')), 6000)
+        // This stops excess output promptly; it bounds neither a single write
+        // nor disk growth between polls. The fixed diagnostic has no plugin code.
+        poll = setInterval(() => {
+          try {
+            if (fs.fstatSync(fd).size > 4096) fail(new Error('sandbox descendant output exceeds 4096 bytes'))
+          } catch (error) { fail(error) }
+        }, 25)
+        child.once('error', fail)
+        child.once('close', (code, signal) => {
+          if (settled) return
+          if (failure) { finish(failure); return }
+          try {
+            if (code !== 0 || signal) throw new Error('sandbox descendant has no exact denial receipt')
+            if (fs.fstatSync(fd).size > 4096) throw new Error('sandbox descendant output exceeds 4096 bytes')
+            const output = Buffer.alloc(4097)
+            let bytes = 0
+            while (bytes < output.length) {
+              // Inherited file handles share their offset; always read from
+              // the beginning explicitly, including after a short read.
+              const read = fs.readSync(fd, output, bytes, output.length - bytes, bytes)
+              if (read === 0) break
+              bytes += read
+            }
+            if (bytes > 4096) throw new Error('sandbox descendant output exceeds 4096 bytes')
+            if (JSON.stringify(JSON.parse(output.subarray(0, bytes).toString())) !== JSON.stringify(receipt)) throw new Error('sandbox descendant has no exact denial receipt')
+            finish()
+          } catch (error) { finish(error) }
+        })
       })
-    })
+    } finally {
+      try { fs.closeSync(fd) } finally { fs.unlinkSync(outputPath) }
+    }
   }
   return receipt
 }

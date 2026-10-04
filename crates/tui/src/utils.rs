@@ -485,6 +485,28 @@ fn windows_atomic_target_name(path: &Path) -> std::io::Result<std::ffi::OsString
         )
     };
     let name = path.file_name().ok_or_else(invalid)?;
+    // Path normalization alone can leave a reserved DOS basename unchanged.
+    // Reject them explicitly, including extensions and the documented
+    // superscript port digits, before the native rename can create one.
+    let stem = name
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let reserved_port = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|port| {
+            matches!(
+                port,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        });
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || reserved_port {
+        return Err(invalid());
+    }
     let absolute = std::path::absolute(path)?;
     if absolute.file_name() != Some(name)
         || absolute.as_os_str().to_string_lossy().starts_with(r"\\.\")
@@ -1290,11 +1312,34 @@ mod atomic_write_tests {
         assert_eq!(fs::read(&created).expect("read created"), b"new");
         write_atomic(&created, b"replaced").expect("replace beside pins");
         assert_eq!(fs::read(&created).expect("read replaced"), b"replaced");
-        for name in ["trailing.", "trailing ", "CON"] {
+        for name in [
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con.txt",
+            "PRN",
+            "AUX.log",
+            "nul.tar.gz",
+            "COM1",
+            "com9.cfg",
+            "LPT1",
+            "lpt9.log",
+            "COM¹",
+            "COM².log",
+            "COM³",
+            "LPT¹",
+            "LPT².log",
+            "LPT³",
+        ] {
             assert!(
                 write_atomic(&workspace.path().join(name), b"x").is_err(),
                 "{name}"
             );
+        }
+        for name in ["console.json", "CON-file", "COM10.txt", "LPT10.txt"] {
+            let path = workspace.path().join(name);
+            write_atomic(&path, b"ordinary").expect("write ordinary name");
+            assert_eq!(fs::read(&path).expect("read ordinary name"), b"ordinary");
         }
         let strays: Vec<_> = fs::read_dir(workspace.path())
             .expect("read_dir")

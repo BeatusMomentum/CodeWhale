@@ -210,6 +210,36 @@ fn windows_native_profiles_are_distinct_and_acl_grant_refuses_junctions() {
 }
 
 #[test]
+fn windows_sandbox_args_use_granted_bun_config_without_changing_other_values() {
+    let runtime_dir = Path::new("runtime copy 鲸鱼");
+    let args = vec![
+        "--no-addons".into(),
+        "--config=NUL".into(),
+        "--input-type=module".into(),
+        "-e".into(),
+        "console.log('--config=NUL')".into(),
+        String::new(),
+    ];
+    let mapped = sandbox_args(&args, runtime_dir);
+    let mut expected = args.clone();
+    expected[1] = format!("--config={}", runtime_dir.join(EMPTY_BUN_CONFIG).display());
+    assert_eq!(mapped, expected);
+    assert_eq!(sandbox_args(&mapped, runtime_dir), mapped);
+}
+
+#[test]
+fn windows_sandbox_args_preserve_node_and_compiled_arguments() {
+    for args in [
+        vec!["--no-addons".into(), "--input-type=module".into()],
+        vec!["--tier=plugin".into(), "--windows-sandbox-probe".into()],
+        vec!["--config=NUL.toml".into(), "--config=custom.toml".into()],
+        Vec::new(),
+    ] {
+        assert_eq!(sandbox_args(&args, Path::new("runtime copy")), args);
+    }
+}
+
+#[test]
 fn windows_argv_and_environment_keep_exact_values_and_reject_nul() {
     let args = vec![
         String::new(),
@@ -248,13 +278,19 @@ fn assert_no_profile_grant(path: &Path, profile: PSID) {
     );
 }
 fn acl_snapshot(path: &Path, exclude: Option<PSID>) -> Vec<Vec<u8>> {
-    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce};
+    acl_snapshot_view(path, exclude, false).1
+}
+fn acl_snapshot_view(path: &Path, exclude: Option<PSID>, raw: bool) -> (u16, Vec<Vec<u8>>) {
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, GetSecurityDescriptorControl,
+    };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     let directory;
     let file;
-    let handle = if path.is_dir() {
+    let opened = if path.is_dir() {
         directory = WindowsDirectory::open(path).unwrap();
-        directory.acl_handle().unwrap().as_raw_handle()
+        directory.acl_handle().unwrap()
     } else {
         file = fs::OpenOptions::new()
             .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
@@ -262,24 +298,37 @@ fn acl_snapshot(path: &Path, exclude: Option<PSID>) -> Vec<Vec<u8>> {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .unwrap();
-        file.as_raw_handle()
+        &file
     };
+    let raw_descriptor = raw.then(|| RawDacl::read(opened).unwrap());
+    let mut _descriptor = None;
+    let mut control = 0_u16;
     let mut dacl = null_mut();
-    let mut descriptor = null_mut();
-    let error = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &mut dacl,
-            null_mut(),
-            &mut descriptor,
-        )
-    };
-    assert_eq!(error, 0, "cannot inspect control ACL");
-    let _descriptor = LocalAllocation(descriptor);
+    if let Some(raw) = &raw_descriptor {
+        dacl = raw.acl();
+        control = raw.control;
+    } else {
+        let mut descriptor = null_mut();
+        let error = unsafe {
+            GetSecurityInfo(
+                opened.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(error, 0, "cannot inspect control ACL");
+        _descriptor = Some(LocalAllocation(descriptor));
+        let mut revision = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+    }
     let dacl = std::ptr::NonNull::new(dacl).expect("control must have an actual DACL");
     let mut result = Vec::new();
     for index in 0..unsafe { dacl.as_ref().AceCount as u32 } {
@@ -304,7 +353,118 @@ fn acl_snapshot(path: &Path, exclude: Option<PSID>) -> Vec<Vec<u8>> {
             .to_vec(),
         );
     }
-    result
+    (control, result)
+}
+
+#[test]
+fn windows_raw_dacl_rejects_truncated_unrestricted_and_malformed_descriptors() {
+    use windows_sys::Win32::Security::{
+        ACL_REVISION, InitializeAcl, SE_DACL_PRESENT, SE_SELF_RELATIVE,
+        SECURITY_DESCRIPTOR_RELATIVE,
+    };
+    fn fixture() -> Vec<u32> {
+        let length = size_of::<SECURITY_DESCRIPTOR_RELATIVE>() + size_of::<ACL>();
+        let mut storage = vec![0_u32; length.div_ceil(size_of::<u32>())];
+        let descriptor = storage.as_mut_ptr().cast::<SECURITY_DESCRIPTOR_RELATIVE>();
+        // SAFETY: the aligned allocation contains both complete structures.
+        unsafe {
+            (*descriptor).Revision = 1;
+            (*descriptor).Control = SE_SELF_RELATIVE | SE_DACL_PRESENT;
+            (*descriptor).Dacl = size_of::<SECURITY_DESCRIPTOR_RELATIVE>() as u32;
+            let acl = storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<SECURITY_DESCRIPTOR_RELATIVE>())
+                .cast::<ACL>();
+            assert_ne!(InitializeAcl(acl, size_of::<ACL>() as u32, ACL_REVISION), 0);
+        }
+        storage
+    }
+    let valid = fixture();
+    let length = valid.len() * size_of::<u32>();
+    let descriptor = RawDacl::from_storage(valid.clone(), length).unwrap();
+    assert_eq!(descriptor.control, SE_SELF_RELATIVE | SE_DACL_PRESENT);
+    assert_eq!(
+        unsafe { (*descriptor.acl()).AceCount },
+        0,
+        "an empty restrictive ACL is valid"
+    );
+    assert!(RawDacl::from_storage(Vec::new(), 0).is_err());
+    assert!(RawDacl::from_storage(valid.clone(), length + 1).is_err());
+    assert!(
+        RawDacl::from_storage(valid.clone(), size_of::<SECURITY_DESCRIPTOR_RELATIVE>() - 1)
+            .is_err()
+    );
+    for (control, offset) in [
+        (
+            SE_DACL_PRESENT,
+            size_of::<SECURITY_DESCRIPTOR_RELATIVE>() as u32,
+        ),
+        (SE_SELF_RELATIVE, 0),
+        (SE_SELF_RELATIVE | SE_DACL_PRESENT, 0),
+        (SE_SELF_RELATIVE | SE_DACL_PRESENT, 4),
+        (SE_SELF_RELATIVE | SE_DACL_PRESENT, 21),
+        (SE_SELF_RELATIVE | SE_DACL_PRESENT, length as u32),
+    ] {
+        let mut storage = valid.clone();
+        let header = storage.as_mut_ptr().cast::<SECURITY_DESCRIPTOR_RELATIVE>();
+        unsafe {
+            (*header).Control = control;
+            (*header).Dacl = offset;
+        }
+        assert!(
+            RawDacl::from_storage(storage, length).is_err(),
+            "control={control:#x}, offset={offset}"
+        );
+    }
+    for (size, count) in [(0, 0), (u16::MAX, 0), (size_of::<ACL>() as u16, 1)] {
+        let mut storage = valid.clone();
+        let acl = unsafe {
+            storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<SECURITY_DESCRIPTOR_RELATIVE>())
+                .cast::<ACL>()
+        };
+        unsafe {
+            (*acl).AclSize = size;
+            (*acl).AceCount = count;
+        }
+        assert!(
+            RawDacl::from_storage(storage, length).is_err(),
+            "size={size}, count={count}"
+        );
+    }
+    // A complete allow ACE with S-1-5-32 provides the positive control. A
+    // bounded ACL alone must not authorize EqualSid to read past that ACE.
+    let mut allowed = fixture();
+    let entry_offset = length;
+    allowed.resize(allowed.len() + 5, 0);
+    let allowed_length = allowed.len() * size_of::<u32>();
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts_mut(allowed.as_mut_ptr().cast::<u8>(), allowed_length);
+        bytes[size_of::<SECURITY_DESCRIPTOR_RELATIVE>() + 2..][..2]
+            .copy_from_slice(&((size_of::<ACL>() + 20) as u16).to_le_bytes());
+        bytes[size_of::<SECURITY_DESCRIPTOR_RELATIVE>() + 4] = 1; // AceCount
+        bytes[entry_offset + 2..][..2].copy_from_slice(&20_u16.to_le_bytes());
+        bytes[entry_offset + 4] = 1; // Mask
+        bytes[entry_offset + 8..][..12].copy_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0]);
+    }
+    assert!(RawDacl::from_storage(allowed.clone(), allowed_length).is_ok());
+    for (offset, value) in [(2, 12), (8, 2), (9, 2)] {
+        let mut malformed = allowed.clone();
+        unsafe {
+            *malformed
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(entry_offset + offset) = value;
+        }
+        assert!(
+            RawDacl::from_storage(malformed, allowed_length).is_err(),
+            "malformed allow ACE at byte {offset}"
+        );
+    }
 }
 
 #[test]
@@ -315,6 +475,8 @@ fn windows_profile_retirement_removes_only_its_grants_and_inherited_data_on_rest
     fs::write(&original_file, b"retained user state").unwrap();
     let original_root_acl = acl_snapshot(data.path(), None);
     let original_file_acl = acl_snapshot(&original_file, None);
+    let original_raw_root_acl = acl_snapshot_view(data.path(), None, true);
+    let original_raw_file_acl = acl_snapshot_view(&original_file, None, true);
     let make = || NativeSandbox {
         profile: Arc::new(Profile::create().unwrap()),
         _assets: Arc::new(tempfile::tempdir().unwrap()),
@@ -324,6 +486,19 @@ fn windows_profile_retirement_removes_only_its_grants_and_inherited_data_on_rest
     // A concurrent/new profile's exact grants must survive old-profile cleanup.
     let other = make();
     other.grant_tree(data.path(), true).unwrap();
+    // Check stored ACE bytes and all control bits before taking a later
+    // baseline. GetSecurityInfo can temporarily normalize the child's view
+    // while its parent carries a grant; no flag masking is allowed here.
+    assert_eq!(
+        acl_snapshot_view(data.path(), Some(other.profile.sid), true),
+        original_raw_root_acl,
+        "first profile grant changed pre-existing directory ACEs"
+    );
+    assert_eq!(
+        acl_snapshot_view(&original_file, Some(other.profile.sid), true),
+        original_raw_file_acl,
+        "first profile grant changed pre-existing file ACEs"
+    );
     for turn in 0..8 {
         let current = make();
         current.grant_tree(data.path(), true).unwrap();
@@ -366,8 +541,16 @@ fn windows_profile_retirement_removes_only_its_grants_and_inherited_data_on_rest
         assert_eq!(fs::read(&original_file).unwrap(), b"retained user state");
     }
     drop(other);
-    assert_eq!(acl_snapshot(data.path(), None), original_root_acl);
-    assert_eq!(acl_snapshot(&original_file, None), original_file_acl);
+    assert_eq!(
+        acl_snapshot(data.path(), None),
+        original_root_acl,
+        "final profile retirement changed pre-existing directory ACEs"
+    );
+    assert_eq!(
+        acl_snapshot(&original_file, None),
+        original_file_acl,
+        "final profile retirement changed pre-existing file ACEs"
+    );
 }
 
 #[test]
