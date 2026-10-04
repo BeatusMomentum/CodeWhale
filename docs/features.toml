@@ -650,3 +650,14 @@ surfaces = { tui = "preview", api = "partial", web = "none" }
 since = "unreleased"
 docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
 owner = "crates/tui/src/oauth.rs"
+
+# Community marketing website, separate from the Runtime's local web client.
+[[feature]]
+id = "merch-interest"
+name = "Merch interest list"
+summary = "The community website collects private merch opt-ins, material preferences and optional item-price feedback."
+status = "experimental"
+surfaces = { tui = "none", web = "none", api = "none" }
+since = "unreleased"
+docs = "web/lib/merch/README.md"
+owner = "web/components/merch-interest.tsx"

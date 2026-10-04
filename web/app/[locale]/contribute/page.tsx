@@ -3,6 +3,7 @@ import { Icon } from "@/components/icon";
 import { PageHeader, Section } from "@/components/page-header";
 import { getContribute, pickTextLocale } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
+import { getMerchCopy } from "@/lib/content/contributor-merch";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -141,6 +142,7 @@ export default async function ContributePage({ params }: { params: Promise<{ loc
   const { locale } = await params;
   const t = getContribute(locale);
   const textLocale = pickTextLocale(locale);
+  const merch = getMerchCopy(locale);
   const steps = { en: stepsEn, zh: stepsZh }[textLocale];
   const paths = { en: pathsEn, zh: pathsZh }[textLocale];
   const reviewNotes = { en: reviewNotesEn, zh: reviewNotesZh }[textLocale];
@@ -231,6 +233,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked`}
           </pre>
+        </Section>
+        <Section id="contributor-merch" title={merch.title} scope={merch.lede}>
+          <Link href={`/${locale}/merch`} className="btn btn-secondary">{merch.cta}</Link>
         </Section>
       </div>
     </>

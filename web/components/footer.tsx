@@ -11,6 +11,7 @@ import {
 import { SITE_CONTACT_EMAIL, SITE_SECURITY_EMAIL } from "@/lib/page-meta";
 import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
 import { pickText } from "@/lib/i18n/dictionaries";
+import { getStorefrontCopy } from "@/lib/content/merch-storefront";
 import { Strata } from "./strata";
 import { WhalePose } from "./whale-pose";
 
@@ -55,6 +56,7 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
               <span className="site-footer-label">{chrome.footerProject}</span>
               <div className="site-footer-list">
                 {project.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
+                <Link href={`/${locale}/merch`}>{getStorefrontCopy(locale).merch}</Link>
               </div>
             </div>
           </div>
