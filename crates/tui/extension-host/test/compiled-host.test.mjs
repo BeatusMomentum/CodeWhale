@@ -75,7 +75,11 @@ export function apply(ctx) { ctx.tools.register({ name: 'env', description: '', 
   assert.equal(result.status, 'ok', result.diagnostic)
   const handle = host.registry.find((entry) => entry.op === 'register').handle
   const value = await host.call('tool/call', { handle, call_id: 'env', input: {}, deadline_ms: 5000 })
-  assert.deepEqual(JSON.parse(value.content[0].text), { cli: '0', options: '', execArgv: ['--no-install', '--no-env-file', `--config=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, '--no-addons'] })
+  const expectedExecArgv = process.platform === 'win32'
+    // The Windows LPAC cannot open NUL; compile-host intentionally omits this flag there.
+    ? ['--no-install', '--no-env-file', '--no-addons']
+    : ['--no-install', '--no-env-file', '--config=/dev/null', '--no-addons']
+  assert.deepEqual(JSON.parse(value.content[0].text), { cli: '0', options: '', execArgv: expectedExecArgv })
 })
 
 compiledTest('compiled Native imports cannot reach FFI or fresh worker realms', async (t) => {
