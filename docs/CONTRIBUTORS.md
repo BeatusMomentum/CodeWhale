@@ -39,6 +39,7 @@ notes, and relevant issue/PR comments.
 
 **Merged or adapted contributions**
 
+- **[LIghtJUNction](https://github.com/LIghtJUNction)** — added reviewed plugin-provided AI routes with host-owned OAuth PKCE credentials and request-time authority checks ([#6805](https://github.com/Hmbown/Codewhale/pull/6805)).
 - **[harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host descriptor, with its billing basis recorded as unreviewed rather than guessed ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
 - **[asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving the original contributor commits ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
 - **[qiuYliangM](https://github.com/qiuYliangM)** — made provider-bound project instruction and constitution labels stable across directory moves and kept their absolute paths in operator reports ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
