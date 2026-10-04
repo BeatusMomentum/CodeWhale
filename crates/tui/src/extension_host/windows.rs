@@ -1474,6 +1474,12 @@ impl RawDacl {
                         .is_some_and(|end| end <= length)
             })
             .ok_or_else(|| io::Error::other("DACL header is outside its descriptor"))?;
+        // Read through owned storage at the checked offset, not through the
+        // out-pointer Windows returned: same address, owned provenance.
+        // SAFETY: acl_offset + size_of::<ACL>() <= length <= storage bytes.
+        let acl = unsafe { storage.as_ptr().cast::<u8>().add(acl_offset) }
+            .cast_mut()
+            .cast::<ACL>();
         // SAFETY: the aligned DACL header lies completely inside storage.
         let acl_size = usize::from(unsafe { (*acl).AclSize });
         if acl_size < size_of::<ACL>()
@@ -1505,6 +1511,9 @@ impl RawDacl {
                             .is_some_and(|end| end <= acl_size)
                 })
                 .ok_or_else(|| io::Error::other("ACE header is outside its DACL"))?;
+            // Same rule: address the ACE from the storage-derived ACL.
+            // SAFETY: entry_offset + size_of::<ACE_HEADER>() <= acl_size.
+            let entry = unsafe { acl.cast::<u8>().add(entry_offset) };
             // SAFETY: the complete, aligned ACE header is inside the DACL.
             let header = unsafe { &*entry.cast::<ACE_HEADER>() };
             let entry_size = usize::from(header.AceSize);
