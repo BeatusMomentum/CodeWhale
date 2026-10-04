@@ -965,6 +965,19 @@ test('cancelling the tool call cancels its pending core/call with $/cancel, and 
   assert.deepEqual(await host.call('host/ping', {}), {})
 })
 
+test('shutdown drops a late core reply after the fake core closes stdin', async () => {
+  let release
+  const held = new Promise((resolve) => (release = resolve))
+  const host = await startHost({ coreCall: () => held })
+  const { call } = await coreCallTool(host, 'cc_call')
+  call({ name: 'read' })
+  await host.waitFor((m) => m.method === 'core/call')
+
+  const stopped = host.stop()
+  release(coreResult('late'))
+  await stopped
+})
+
 test('several core calls can be in flight at once, each answered to its own request', async (t) => {
   const host = await startHost({ coreCall: async (params) => { await new Promise((r) => setTimeout(r, params.input.ms)); return coreResult(String(params.input.ms)) } })
   t.after(() => host.stop())

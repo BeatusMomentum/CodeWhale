@@ -63,6 +63,7 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin',
   const decoder = new FrameDecoder()
   const pending = new Map()
   const waiters = []
+  let stopping = false
   const host = {
     child,
     stderr: '',
@@ -99,6 +100,10 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin',
     },
     async stop() {
       if (child.exitCode === null && child.signalCode === null) {
+        // The child can still have a core/call response queued on the fake
+        // core while it handles stdin EOF. Those replies are intentionally
+        // abandoned once shutdown starts.
+        stopping = true
         child.stdin.end()
         await host.exit
       }
@@ -138,7 +143,7 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin',
             const answer = coreCall ? coreCall(message.params, message.id) : { error: { code: -32002, message: 'no core/call handler' } }
             const id = message.id
             Promise.resolve(answer).then((value) => {
-              if (host.cancels.includes(id) || child.exitCode !== null) return
+              if (host.cancels.includes(id) || child.exitCode !== null || stopping) return
               if (value && typeof value === 'object' && 'error' in value) host.send({ jsonrpc: '2.0', id, error: value.error })
               else host.send({ jsonrpc: '2.0', id, result: value })
             })
