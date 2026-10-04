@@ -23,8 +23,7 @@ use windows_sys::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GRANT_ACCESS, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -248,8 +247,8 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
         ));
     }
     // Remove the parent's inheritable grant before walking, so newly created
-    // children cannot inherit this retired SID. MAXIMUM_ALLOWED prevents SDK
-    // propagation; every child is independently fenced and updated.
+    // children cannot inherit this retired SID. The kernel write never
+    // propagates; every child is independently fenced and updated.
     edit_acl(file, sid, 0, 0, REVOKE_ACCESS)?;
     if !scope.tree {
         return Ok(());
@@ -288,8 +287,9 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
                     return Err(io::Error::other("grant left its pinned parent"));
                 }
                 // Retiring this exact SID may overlap a new host's data
-                // writes. The physical handle stays pinned, but allow those
-                // legitimate writers/renames; never restore an old whole ACL.
+                // writes. The handle edits this exact object while the pinned
+                // parent chain fences its path, so allow those legitimate
+                // writers/renames; never restore an old whole ACL.
                 let file = acl_file_with_share(&path, 1 | 2 | 4)?;
                 edit_acl(&file, sid, 0, 0, REVOKE_ACCESS)?;
                 Ok(())
@@ -504,7 +504,7 @@ impl NativeSandbox {
     }
 
     // The owning grant entrypoint holds ACL_EDITS. Tree files reuse the parent
-    // chain rather than reopen MAXIMUM_ALLOWED directory objects. The
+    // chain rather than reopen pinned directory objects. The
     // child_path comparison is only a lexical invariant; the protection is the
     // held no-write/no-delete parent chain plus acl_file's no-follow,
     // regular, single-link checks.
@@ -826,20 +826,16 @@ fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    // Both flags must be exactly 1. Report each observation, so a refusal
-    // says which property the kernel did not confirm.
-    let mut observed = Vec::new();
-    let mut confirmed = true;
-    for (name, class) in [
-        ("TokenIsAppContainer", TokenIsAppContainer),
-        (
-            "TokenIsLessPrivilegedAppContainer",
-            TokenIsLessPrivilegedAppContainer,
-        ),
-    ] {
+    // AppContainer must be confirmed, and LPAC through the token flag or, when
+    // that query fails (hosted Windows Server returned ERROR_INVALID_PARAMETER;
+    // the cause is unknown), through the `WIN://NOALLAPPPKG` security
+    // attribute the LPAC opt-out adds (ntdoc; NtObjectManager's
+    // LowPrivilegeAppContainer). Report each observation, so a refusal says
+    // which property the kernel did not confirm.
+    let query = |class| -> io::Result<u32> {
         let mut value = 0_u32;
         let mut read = 0;
-        let queried = unsafe {
+        if unsafe {
             GetTokenInformation(
                 token.as_raw_handle(),
                 class,
@@ -847,18 +843,49 @@ fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
                 size_of::<u32>() as u32,
                 &mut read,
             )
-        } != 0;
-        if queried {
-            observed.push(format!("{name}={value}"));
-        } else {
-            observed.push(format!(
-                "{name} query failed: {}",
-                io::Error::last_os_error()
-            ));
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
         }
-        confirmed &= queried && value == 1;
-    }
-    if !confirmed {
+        Ok(value)
+    };
+    let mut observed = Vec::new();
+    let app_container = match query(TokenIsAppContainer) {
+        Ok(value) => {
+            observed.push(format!("TokenIsAppContainer={value}"));
+            value == 1
+        }
+        Err(error) => {
+            observed.push(format!("TokenIsAppContainer query failed: {error}"));
+            false
+        }
+    };
+    let less_privileged = match query(TokenIsLessPrivilegedAppContainer) {
+        Ok(value) => {
+            observed.push(format!("TokenIsLessPrivilegedAppContainer={value}"));
+            value == 1
+        }
+        Err(error) => {
+            observed.push(format!(
+                "TokenIsLessPrivilegedAppContainer query failed: {error}"
+            ));
+            match token_has_lpac_attribute(&token) {
+                Ok(true) => {
+                    observed.push("WIN://NOALLAPPPKG=1".to_string());
+                    true
+                }
+                Ok(false) => {
+                    observed.push("WIN://NOALLAPPPKG absent".to_string());
+                    false
+                }
+                Err(error) => {
+                    observed.push(format!("WIN://NOALLAPPPKG unreadable: {error}"));
+                    false
+                }
+            }
+        }
+    };
+    if !(app_container && less_privileged) {
         return Err(io::Error::other(format!(
             "Windows refused the required LPAC token ({})",
             observed.join(", ")
@@ -903,9 +930,136 @@ fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether the token carries the LPAC opt-out attribute `WIN://NOALLAPPPKG`
+/// with a nonzero integer value. `TokenSecurityAttributes` (Windows 8+)
+/// returns TOKEN_SECURITY_ATTRIBUTES_INFORMATION whose pointers are absolute
+/// addresses into the returned buffer; each is checked to be aligned and to
+/// stay inside it before it is read.
+fn token_has_lpac_attribute(token: &OwnedHandle) -> io::Result<bool> {
+    use windows_sys::Win32::Security::TokenSecurityAttributes;
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+    #[repr(C)]
+    struct AttributeV1 {
+        name: UnicodeString,
+        value_type: u16,
+        reserved: u16,
+        flags: u32,
+        value_count: u32,
+        values: *const u64,
+    }
+    #[repr(C)]
+    struct AttributesInformation {
+        version: u16,
+        reserved: u16,
+        attribute_count: u32,
+        attributes: *const AttributeV1,
+    }
+    const VERSION_V1: u16 = 1;
+    const TYPE_INT64: u16 = 1;
+    const TYPE_UINT64: u16 = 2;
+    let mut size = 0;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenSecurityAttributes,
+            null_mut(),
+            0,
+            &mut size,
+        );
+    }
+    if (size as usize) < size_of::<AttributesInformation>() || size > 64 * 1024 {
+        return Err(io::Error::other("invalid token security attribute size"));
+    }
+    let mut buffer = vec![0_usize; (size as usize).div_ceil(size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenSecurityAttributes,
+            buffer.as_mut_ptr().cast(),
+            size,
+            &mut size,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let start = buffer.as_ptr() as usize;
+    let end = start + buffer.len() * size_of::<usize>();
+    let inside = |pointer: usize, bytes: usize, align: usize| {
+        pointer % align == 0
+            && pointer >= start
+            && pointer.checked_add(bytes).is_some_and(|last| last <= end)
+    };
+    let information = unsafe { &*buffer.as_ptr().cast::<AttributesInformation>() };
+    if information.version != VERSION_V1 {
+        return Err(io::Error::other("unknown token security attribute version"));
+    }
+    let count = information.attribute_count as usize;
+    if count == 0 {
+        return Ok(false);
+    }
+    if !count
+        .checked_mul(size_of::<AttributeV1>())
+        .is_some_and(|bytes| {
+            inside(
+                information.attributes as usize,
+                bytes,
+                align_of::<AttributeV1>(),
+            )
+        })
+    {
+        return Err(io::Error::other(
+            "token security attributes exceed their buffer",
+        ));
+    }
+    for index in 0..count {
+        let attribute = unsafe { &*information.attributes.add(index) };
+        let name_bytes = usize::from(attribute.name.length);
+        if name_bytes % 2 != 0
+            || !inside(
+                attribute.name.buffer as usize,
+                name_bytes,
+                align_of::<u16>(),
+            )
+        {
+            return Err(io::Error::other(
+                "token security attribute name exceeds its buffer",
+            ));
+        }
+        let name = unsafe { std::slice::from_raw_parts(attribute.name.buffer, name_bytes / 2) };
+        if !String::from_utf16_lossy(name).eq_ignore_ascii_case("WIN://NOALLAPPPKG") {
+            continue;
+        }
+        let values = attribute.value_count as usize;
+        if !matches!(attribute.value_type, TYPE_INT64 | TYPE_UINT64)
+            || values == 0
+            || !values
+                .checked_mul(size_of::<u64>())
+                .is_some_and(|bytes| inside(attribute.values as usize, bytes, align_of::<u64>()))
+        {
+            return Ok(false);
+        }
+        return Ok(unsafe { *attribute.values } != 0);
+    }
+    Ok(false)
+}
+
 fn set_acl(file: &File, sid: PSID, access: u32, inheritance: u32) -> io::Result<()> {
     edit_acl(file, sid, access, inheritance, GRANT_ACCESS)
 }
+/// Edit exactly one SID's explicit allow entry and write the resulting DACL
+/// through the kernel on this pinned handle. `SetSecurityInfo` re-derives
+/// inheritance: it turned a file's inherited ACEs into explicit copies after a
+/// grant/retire cycle, and it would propagate to children. Writing the exact
+/// DACL with `SetKernelObjectSecurity` keeps every other ACE byte-for-byte,
+/// including inherited ones, and never touches a child or reparse target.
+/// Microsoft advises against this API for files precisely because it does not
+/// propagate; here that is the required property.
 fn edit_acl(
     file: &File,
     sid: PSID,
@@ -913,8 +1067,21 @@ fn edit_acl(
     inheritance: u32,
     mode: windows_sys::Win32::Security::Authorization::ACCESS_MODE,
 ) -> io::Result<()> {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, AddAccessAllowedAceEx, AddAce, GetAce, GetLengthSid,
+        GetSecurityDescriptorControl, INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor,
+        SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+        SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
+    };
     // The owning grant/retirement entrypoint holds ACL_EDITS while opening
     // and editing its exact objects, including all shared pinned ancestors.
+    let grant = mode == GRANT_ACCESS;
+    if !grant && mode != REVOKE_ACCESS {
+        return Err(io::Error::other("unsupported ACL edit mode"));
+    }
     let mut old_acl: *mut ACL = null_mut();
     let mut descriptor = null_mut();
     let result = unsafe {
@@ -936,40 +1103,196 @@ fn edit_acl(
     if old_acl.is_null() {
         return Err(io::Error::other("refusing to replace an unrestricted DACL"));
     }
-    let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: access,
-        grfAccessMode: mode,
-        grfInheritance: inheritance,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.cast(),
-        },
-    };
-    let mut acl = null_mut();
-    let result = unsafe { SetEntriesInAclW(1, &entry, old_acl, &mut acl) };
-    if result != 0 {
-        return Err(io::Error::from_raw_os_error(result as i32));
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-    let acl = LocalAllocation(acl.cast());
+    let preserved = control & (SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED);
+    let (acl_revision, acl_size, ace_count) = unsafe {
+        let acl = &*old_acl;
+        (
+            u32::from(acl.AclRevision),
+            usize::from(acl.AclSize),
+            acl.AceCount,
+        )
+    };
+    let added = if grant {
+        size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + unsafe { GetLengthSid(sid) } as usize
+    } else {
+        0
+    };
+    let size = acl_size + added;
+    if size > 0xFFFC {
+        return Err(io::Error::other("edited DACL exceeds the ACL size limit"));
+    }
+    // ACLs must be DWORD aligned.
+    let mut storage = vec![0_u32; size.div_ceil(size_of::<u32>())];
+    let new_acl = storage.as_mut_ptr().cast::<ACL>();
+    if unsafe {
+        InitializeAcl(
+            new_acl,
+            (storage.len() * size_of::<u32>()) as u32,
+            acl_revision,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut merged = access;
+    let mut inserted = !grant;
+    for index in 0..u32::from(ace_count) {
+        let mut ace = null_mut();
+        if unsafe { GetAce(old_acl, index, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let flags = u32::from(header.AceFlags);
+        let inherited = flags & INHERITED_ACE != 0;
+        // Only ACCESS_ALLOWED_ACE carries its SID at SidStart.
+        let ours = u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
+            && usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>()
+            && unsafe {
+                EqualSid(
+                    std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                    sid,
+                )
+            } != 0;
+        if ours && grant && !inherited && flags == inheritance {
+            // GRANT_ACCESS semantics: combine with the existing explicit grant.
+            merged |= unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask };
+            continue;
+        }
+        if ours && !grant {
+            // Retirement removes explicit entries and the stale inherited
+            // copies left after the parent's grant was revoked first.
+            continue;
+        }
+        if !inserted && inherited {
+            // Explicit entries precede inherited ones.
+            if unsafe { AddAccessAllowedAceEx(new_acl, acl_revision, inheritance, merged, sid) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            inserted = true;
+        }
+        if unsafe {
+            AddAce(
+                new_acl,
+                acl_revision,
+                u32::MAX,
+                ace,
+                u32::from(header.AceSize),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if !inserted
+        && unsafe { AddAccessAllowedAceEx(new_acl, acl_revision, inheritance, merged, sid) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut security: SECURITY_DESCRIPTOR = unsafe { zeroed() };
+    let security_ptr = (&mut security as *mut SECURITY_DESCRIPTOR).cast();
+    // NTFS stores this descriptor as given, with no inheritance merge. The
+    // kernel keeps SE_DACL_AUTO_INHERITED only when SE_DACL_AUTO_INHERIT_REQ
+    // accompanies it, so request it exactly when the object already had it;
+    // otherwise the object would silently become a legacy DACL.
+    let requested = preserved
+        | if preserved & SE_DACL_AUTO_INHERITED != 0 {
+            SE_DACL_AUTO_INHERIT_REQ
+        } else {
+            0
+        };
+    if unsafe { InitializeSecurityDescriptor(security_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
+        || unsafe { SetSecurityDescriptorDacl(security_ptr, 1, new_acl, 0) } == 0
+        || unsafe {
+            SetSecurityDescriptorControl(
+                security_ptr,
+                SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED,
+                requested,
+            )
+        } == 0
+        || unsafe {
+            SetKernelObjectSecurity(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                security_ptr,
+            )
+        } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    drop(descriptor);
+    let (still_granted, control) = read_back_dacl(file, sid)?;
+    if control & (SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED) != preserved {
+        return Err(io::Error::other(
+            "edited DACL changed its inheritance control bits",
+        ));
+    }
+    if !grant && still_granted {
+        return Err(io::Error::other(
+            "retired profile SID is still present after ACL retirement",
+        ));
+    }
+    Ok(())
+}
+
+/// Read back the object's DACL: whether any allow entry names `sid`, and the
+/// descriptor's control bits.
+fn read_back_dacl(file: &File, sid: PSID) -> io::Result<(bool, u16)> {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, GetSecurityDescriptorControl,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    let mut acl: *mut ACL = null_mut();
+    let mut descriptor = null_mut();
     let result = unsafe {
-        SetSecurityInfo(
+        GetSecurityInfo(
             file.as_raw_handle(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             null_mut(),
             null_mut(),
-            acl.0.cast(),
-            null(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
         )
     };
-    drop((acl, descriptor));
     if result != 0 {
         return Err(io::Error::from_raw_os_error(result as i32));
     }
-    Ok(())
+    let descriptor = LocalAllocation(descriptor);
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if acl.is_null() {
+        return Ok((false, control));
+    }
+    for index in 0..u32::from(unsafe { (*acl).AceCount }) {
+        let mut ace = null_mut();
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
+            && usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>()
+            && unsafe {
+                EqualSid(
+                    std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                    sid,
+                )
+            } != 0
+        {
+            return Ok((true, control));
+        }
+    }
+    Ok((false, control))
 }
 
 struct LocalAllocation(*mut core::ffi::c_void);

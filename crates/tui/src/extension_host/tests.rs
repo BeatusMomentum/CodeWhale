@@ -3967,6 +3967,12 @@ fn memory_cap_supervision() -> super::SupervisionOptions {
         } else {
             super::supervisor::HOST_MEMORY_CAP
         },
+        // Production hang detection. With the fast 600 ms hang timeout, a host
+        // stalled in GC near its cap was killed for a missed heartbeat and
+        // restarted before the memory limit itself stopped it, so the test
+        // never observed the enforcement it exists to prove.
+        ping_timeout: Duration::from_secs(3),
+        hang_timeout: super::supervisor::PING_DEADLINE,
         ..fast_supervision()
     }
 }

@@ -526,10 +526,18 @@ impl WindowsDirectory {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).share_mode(1).custom_flags(0x0220_0000);
         if acl_target {
-            // SetSecurityInfo must not recursively follow/modify descendants:
-            // SDK-documented MAXIMUM_ALLOWED disables propagation. Each child
-            // is fenced/granted explicitly, without reopening pinned ancestors.
-            options.access_mode(windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED);
+            // The Native ACL writer uses SetKernelObjectSecurity, which never
+            // propagates to descendants; each child is fenced and granted
+            // explicitly. So the target needs only READ_CONTROL|WRITE_DAC plus a
+            // read right that records share access: read-only sharing still
+            // blocks rename, delete and data writes while it is edited. Unlike
+            // MAXIMUM_ALLOWED, which includes DELETE, it does not collide with a
+            // live host whose current directory is this directory.
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            };
+            options
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES);
         }
         let file = options.open(path)?;
         let metadata = file.metadata()?;
@@ -547,8 +555,8 @@ impl WindowsDirectory {
         Ok(self.directory.join(name))
     }
 
-    /// Extend the actual held direct-parent chain. Reopening a MAXIMUM_ALLOWED
-    /// ancestor would conflict with its deliberate no-write/no-delete sharing.
+    /// Extend the actual held direct-parent chain instead of reopening pinned
+    /// ancestors by path.
     pub(crate) fn open_acl_child(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
         let directory = self.child_path(name)?;
         let file = Self::open_component(&directory, true)?;

@@ -725,7 +725,8 @@ A classifier call happens only when `[auto.router]` names both `provider` and
 `ModelInventory::from_config` (`crates/tui/src/model_inventory.rs`). If either
 condition fails, or the classifier call errors or times out, the local
 fallback decides: the default model, or the fast sibling under `cost_saving`.
-The turn's route receipt (`/status` → Auto) records which path was taken, and a
+The turn's route receipt (Turn Inspector, Ctrl+Alt+O or `/turn inspect`, "Model
+route + tokens/cost") records which path was taken, and a
 router you configured that cannot run or fails (missing key, HTTP error,
 timeout, invalid answer) is shown as `Auto router: failing — …` rather than
 silently ignored.

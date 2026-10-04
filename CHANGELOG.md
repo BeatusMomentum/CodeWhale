@@ -31,8 +31,14 @@ note below before upgrading.
   reviewed and enabled first. The host is sandboxed on macOS (Seatbelt) and on
   Linux with bubblewrap, with no direct network and no reads of the protected
   credential locations (Codewhale's secret stores and the Codewhale, Codex and
-  DSH homes); if bubblewrap is missing or cannot start, it runs unsandboxed and
-  says so. On Windows it always runs with your user permissions. Other files you
+  DSH homes). A Native extension starts only after that sandbox is verified at
+  launch: if bubblewrap is missing or its namespace probe fails, activation is
+  refused with the concrete error. Codewhale's own pinned built-in host modules
+  keep a diagnosed exception, and every effect still needs a Rust operation
+  ticket. On Windows a Native extension starts only in a freshly created Less
+  Privileged AppContainer with no capabilities, after Codewhale checks its
+  token and a real file and network probe; otherwise activation is refused.
+  Other files you
   can read, such as project `.env` files, stay readable, and plugins sharing the
   host can interfere with each other, so enable only plugins you have reviewed
   ([docs/EXTENSIONS.md](docs/EXTENSIONS.md)).
@@ -79,9 +85,10 @@ note below before upgrading.
   The Rust backend stays the default until platform and rollout gates pass;
   its protocol adapters remain through the compatibility window.
 - A plugin can declare several `native` entries (`native.paths`, up to 64). They
-  activate in order as one plugin, so one disable, review change or crash takes
-  all of them down, and if one entry fails to activate, nothing from the entries
-  before it stays registered.
+  activate in order under one owner, so one disable, review change or crash
+  takes all of them down. If one entry fails to activate, only that entry is
+  withdrawn: entries that already activated stay registered, and the plugin
+  fails only when no entry activates.
 - Plugin settings and context: `[plugins."<name>".config]` in your own
   `config.toml` is passed to the plugin's `apply(ctx, config)` and checked
   against its exported `Config` schema; a project's `.codewhale/config.toml`
@@ -163,9 +170,10 @@ note below before upgrading.
   ([#6580](https://github.com/Hmbown/Codewhale/pull/6580), thanks @gaord).
 - Official model routing: `/router` (also `/model router`) sets up the Auto
   router with presets: Jev (TypeSafe's decision model, via OpenRouter or a
-  TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes
-  one test call before it saves, `/status` shows the router's choice, cost and
-  latency, and a failing router is shown as failing
+  TypeSafe key), your provider's fast tier, Off, or Custom. Jev and Fast each
+  make one test call before you save, the Turn Inspector (Ctrl+Alt+O or
+  `/turn inspect`) shows the router's choice, cost and latency, and a failing
+  router is shown as failing
   ([#6525](https://github.com/Hmbown/Codewhale/issues/6525)).
 - ChatGPT sign-in uses Codewhale-owned protected credentials and a model roster
   fetched for the signed-in account. Account, workspace and issuer changes
@@ -176,7 +184,9 @@ note below before upgrading.
   `execute_tools` programs can call MCP tools, and each nested call passes the
   same approval gate as a direct call, pausing the program for approval when
   needed. Every nested call keeps its receipt, including calls that finish
-  before a deadline, and `code_mode = false` turns it off. `codewhale mcp list`
+  before a deadline, and `[features] code_mode = false` stops offering
+  `execute_tools` up front (it stays reachable through tool search).
+  `codewhale mcp list`
   and `codewhale doctor` warn when a user MCP server duplicates the built-in
   Computer Use bundle
   ([#6562](https://github.com/Hmbown/Codewhale/issues/6562),
@@ -189,9 +199,11 @@ note below before upgrading.
 
 ### Changed
 
-- On Windows, every PowerShell command Codewhale starts now passes
+- On Windows, every PowerShell command the shell tool starts now passes
   `-ExecutionPolicy Bypass` for that process only, so a local `Restricted` or
-  `AllSigned` policy no longer blocks multi-line commands. A policy set by
+  `AllSigned` policy no longer blocks multi-line commands. (`.ps1` script tools
+  still start as `powershell -File` without the flag and remain subject to the
+  local policy.) A policy set by
   Group Policy still wins and the command is refused with PowerShell's own
   message. Scripts that a command invokes run under the same process-scoped
   setting. To let the machine or user policy apply instead, start Codewhale
@@ -242,6 +254,15 @@ note below before upgrading.
 
 ### Fixed
 
+- Optional MCP servers can be found before they connect. `tool_search` matches
+  the query against configured, enabled server names (or an `mcp_<server>_`
+  prefix), connects up to eight matches within the existing boot wait, and
+  returns their real tool schemas. Before, a lazily started server exposed no
+  tools, so the model could never trigger its connection
+  ([#6828](https://github.com/Hmbown/Codewhale/issues/6828)). Known limit: a
+  query that names neither the server nor `mcp` does not wake it.
+  `codewhale mcp connect`, `validate` and `tools` run their own connection and
+  do not attach to a running session.
 - `/undo` and `/restore <N>` refuse while a turn is running in the workspace,
   instead of rewriting files under it.
 - `--resume <id>` after a crash recovers that session's interrupted turn from
@@ -373,9 +394,9 @@ note below before upgrading.
   and verification keep their existing delay and cadence, while translation
   uses the same earned marker and five-frame-per-second cadence. The Engine
   still supplies workflow state, clocks, localized text, custom themes and
-  terminal adaptation. This is partial adoption: composer,
-  transcript, dock, posture/metrics, pending input, ocean and whale rendering
-  retain their existing native implementations.
+  terminal adaptation. The composer, transcript viewports, dock tabs,
+  posture/metrics rows, pending-input cards, approval band, Ocean background
+  and the whale's Braille raster now also render through the pinned kit.
 - Calm transcript previews keep the latest three rows of live thought and a
   single duration header when it settles. Successful tool headers are quieter;
   failed generic and MCP calls keep a bounded head-and-tail excerpt, with full
@@ -391,8 +412,9 @@ note below before upgrading.
   file not saved."), in every supported language. The full reason, including the
   write error, goes to the transcript once.
 - Model-facing guidance names callable tools and explains discovery before a
-  deferred read. The stopship workflow uses bounded `grep_files` evidence,
-  optional `tool_search` activation and the current workflow source path
+  deferred read. The stopship workflow's scout activates the deferred
+  `grep_files` with one required `tool_search` call, then gathers bounded
+  `grep_files` evidence from the current workflow source paths
   ([#6747](https://github.com/Hmbown/Codewhale/issues/6747)).
 - Simplified and Traditional Chinese permission, provider and session wording
   now follows the current behavior. Chinese guides correct hook receipts,
@@ -421,16 +443,17 @@ note below before upgrading.
   cancellation ([#6573](https://github.com/Hmbown/Codewhale/issues/6573),
   [#6728](https://github.com/Hmbown/Codewhale/issues/6728)).
 - Idle task workers check the queue file's metadata about once a second instead
-  of five times a second, so a Codewhale left open with nothing to run no longer
-  polls the disk. An in-process notification still wakes a worker at once; a
+  of five times a second, and no longer reloads the store when nothing changed.
+  An in-process notification still wakes a worker at once; a
   write by another Codewhale process that shares the data directory is noticed
   within about a second instead of about 200 ms. A worker with pending work, a
   retry deadline or a failed claim keeps the short interval
   ([#6728](https://github.com/Hmbown/Codewhale/issues/6728),
   [#6573](https://github.com/Hmbown/Codewhale/issues/6573)).
 - After five seconds without session activity, the UI loop polls every 250 ms
-  instead of 48 ms, the automation-panel scan backs off, and the Git probe uses
-  one `git status` every 15 seconds instead of the full probe every two seconds.
+  instead of 48 ms and the automation-panel scan backs off to 15 seconds. After
+  thirty quiet seconds, the Git probe runs one `git status` every 15 seconds
+  instead of the full probe every two seconds, unless the Git panel is showing.
   User input and engine events restore the active cadence. This reduces idle
   work; it does not remove every cost that grows with session history
   ([#6728](https://github.com/Hmbown/Codewhale/issues/6728)).
@@ -613,8 +636,10 @@ note below before upgrading.
 - Network audit lines now go to the same `audit.log` as every other audit
   event (`$CODEWHALE_HOME` included), and test runs no longer append to your
   real one.
-- Auto-Review verdicts now reach `audit.log`, as `/permissions` said they
-  did. They were written only when `CODEWHALE_TOOL_AUDIT_LOG` was set.
+- In the terminal UI, Auto-Review verdicts now reach `audit.log`, as
+  `/permissions` said they did; before, they were written only when
+  `CODEWHALE_TOOL_AUDIT_LOG` was set. Headless `exec` and Runtime API sessions
+  do not write them yet.
 - A turn that stops producing output now reports itself: the turn loop records
   its phase and last progress, and an overdue phase surfaces instead of
   hanging silently until the stream idle timeout. A delegated agent's final result is
@@ -763,7 +788,8 @@ note below before upgrading.
   reloads and new tabs, and stream tickets retry after transient failures.
   Fleet SSH known-host checks support OpenSSH 7.x and later. SSH host configs
   using `host_key_fingerprint` must migrate to `known_hosts` with verified host
-  keys; the unsupported fingerprint field now fails at configuration load.
+  keys; the unsupported fingerprint field is now refused when an SSH worker
+  starts, before any connection is made, instead of being silently ignored.
 - Harden workspace instruction, note, and anchor file access with shared
   no-follow reads and writes. Compaction loads pinned anchors only from
   trusted workspaces. Validate registry skill names before selecting cache paths.
@@ -871,9 +897,10 @@ note below before upgrading.
   read-only plan, because the completion gates run workspace build and test
   scripts.
 - Git commands no longer hand provider credentials to programs that a
-  workspace's git config can start (`core.fsmonitor`, hooks, filters): every
-  git child starts from the scrubbed environment plus the ssh agent, global
-  config location and author identity. The read-only `git_status`,
+  workspace's git config can start (`core.fsmonitor`, hooks, filters) when
+  they run through Codewhale's shared git helper: those start from the scrubbed
+  environment plus the ssh agent, global config location and author identity.
+  Sub-agent worktree provisioning and delivery do not use it yet. The read-only `git_status`,
   `git_diff`, history and `verify` tools also disable the workspace's
   fsmonitor, hooks and clean/process filters.
 - Language servers started for post-edit diagnostics, and every Python and
@@ -886,8 +913,9 @@ note below before upgrading.
   `RUSTFLAGS`, `RUST_LOG`, `RUST_BACKTRACE`, `VIRTUAL_ENV`, `JAVA_HOME`, Go
   paths, `NVM_*`/`NODE_OPTIONS` and CA-bundle variables — so `run_tests` and
   gates keep the user's target dir, job limit and toolchain. Connection
-  strings such as `DATABASE_URL` are still dropped; declare them in a
-  verifier gate's `env` or the project's own config when a build needs them.
+  strings such as `DATABASE_URL` are still dropped; set them in the project's
+  own config, or wrap the command in a script that sets them, when a build
+  needs them.
 - Deny rules in the permission settings now hold for these ways of hiding a
   command word until the shell runs it: a variable (`$v`), a substitution, a
   glob or brace list, escaped ANSI-C quoting, or a shell reading its script

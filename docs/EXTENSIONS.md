@@ -41,10 +41,11 @@ A plugin may split its code across several entries with `native.paths` (up to
 64, alone or beside `path`). They are activated in the order declared, as the
 fibers of one plugin: they share one owner, so one disable, review change or
 crash tears all of them down together. Each entry is a separate module with its
-own `apply`, and tool and command names must be unique across them. If any entry
+own `apply`, and tool and command names must be unique across them. If an entry
 fails to activate (throws, requires a service the host does not provide, or has
-a registration refused), the whole plugin fails and nothing from the entries
-before it stays registered. Listing the same file twice is one entry.
+a registration refused), only that entry is withdrawn: entries that already
+activated stay registered, later entries still activate, and the plugin fails
+only when no entry activates. Listing the same file twice is one entry.
 
 ## Runtime
 

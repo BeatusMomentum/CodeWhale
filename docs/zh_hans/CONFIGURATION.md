@@ -350,7 +350,7 @@ thinking = "off"        # optional; defaults to off
 timeout_secs = 4        # optional; default 4, 0 = default, capped at 300
 ```
 
-只有当 `[auto.router]` 同时指定了 `provider` 和 `model`，**并且**该 provider 有 key 时，才会发生分类器调用：`ModelInventory::from_config`（`crates/tui/src/model_inventory.rs`）中的 `router_available = router_configured && has_api_key_for(...)`。任一条件不满足，或分类器调用出错/超时时，由本地回退决定：默认模型，或在 `cost_saving` 下的快速同系模型。回合的路由回执（`/status` → Auto）会记录走了哪条路径；你配置了但无法运行或失败的路由器（缺 key、HTTP 错误、超时、无效回答）会显示为 `Auto router: failing — …`，而不是被静默忽略。
+只有当 `[auto.router]` 同时指定了 `provider` 和 `model`，**并且**该 provider 有 key 时，才会发生分类器调用：`ModelInventory::from_config`（`crates/tui/src/model_inventory.rs`）中的 `router_available = router_configured && has_api_key_for(...)`。任一条件不满足，或分类器调用出错/超时时，由本地回退决定：默认模型，或在 `cost_saving` 下的快速同系模型。回合的路由回执（回合检查器：Ctrl+Alt+O 或 `/turn inspect` 的“Model route + tokens/cost”）会记录走了哪条路径；你配置了但无法运行或失败的路由器（缺 key、HTTP 错误、超时、无效回答）会显示为 `Auto router: failing — …`，而不是被静默忽略。
 
 #### 设置模型路由
 
