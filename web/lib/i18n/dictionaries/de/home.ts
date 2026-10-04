@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "Wo es läuft",
   availabilityHeading: "Wo du Codewhale nutzen kannst",
   availabilityLede:
-    "Du kannst Codewhale heute schon im Terminal, im lokalen Browser und mit der Community-GUI CodeWhale GUI nutzen, während wir an der Web-App, der Desktop-App und den Cloud-Computern arbeiten.",
+    "Du kannst Codewhale heute schon im Terminal, im lokalen Browser und mit der von der Community gepflegten CodeWhale GUI nutzen, während wir an der Web-App, der Desktop-App und den Cloud-Computern arbeiten.",
   availability: [
     [
       "Terminal",
@@ -76,7 +76,7 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI (VS Code)",
       "Verfügbar",
-      "Grafische Oberfläche aus der Community, in einem eigenen Projekt: Chat, Threads und Dateiänderungen in einer VS Code-Seitenleiste über dieselbe Runtime. Installation über den VS Code Marketplace."
+      "Grafische Oberfläche aus der Community, in einem eigenen Projekt: Chat, Threads und Dateiänderungen in einer VS Code-Seitenleiste über dieselbe Runtime. Installiere sie über den VS Code Marketplace."
     ],
     [
       "Web-App",

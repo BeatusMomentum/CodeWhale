@@ -67,7 +67,7 @@ export const home: HomeDict = {
   availabilityHeading:
     "Tempat Anda dapat menggunakan Codewhale",
   availabilityLede:
-    "Anda dapat menggunakan Codewhale di terminal, di peramban lokal, dan dengan antarmuka CodeWhale GUI yang dipelihara komunitas sekarang, sementara kami mengembangkan aplikasi web, aplikasi desktop, dan komputer cloud.",
+    "Anda dapat menggunakan Codewhale di terminal, di peramban lokal, dan dengan antarmuka CodeWhale GUI yang dipelihara oleh komunitas sekarang, sementara kami mengembangkan aplikasi web, aplikasi desktop, dan komputer cloud.",
   availability: [
     [
       "Terminal",
@@ -77,7 +77,7 @@ export const home: HomeDict = {
     [
       "CodeWhale GUI (VS Code)",
       "Tersedia",
-      "Antarmuka grafis yang dipelihara komunitas, dalam proyek terpisah: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Runtime yang sama. Pasang dari VS Code Marketplace."
+      "Antarmuka grafis yang dipelihara oleh komunitas, dalam proyek terpisah: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Runtime yang sama. Pasang dari VS Code Marketplace."
     ],
     [
       "Aplikasi web",
