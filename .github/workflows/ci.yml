@@ -804,9 +804,10 @@ jobs:
     # A cold GitHub-hosted Mac spent 77-80 minutes in Test on 2026-09-23
     # (fork PRs #6431, #6417), too close to the old 90-minute limit.
     # On 2026-10-04 a PR leg spent 111 minutes compiling with no cache and
-    # was cancelled at 120 with 12,356 tests passed and none failed; macOS
-    # gets 165 until the CI speed redesign lands.
-    timeout-minutes: ${{ matrix.os == 'macos-latest' && 165 || 120 }}
+    # was cancelled at 120 with 12,356 tests passed and none failed. The
+    # limit stays a literal (release-workflows.test.js, #5496); 165 bounds
+    # hangs for every leg until the CI speed redesign lands.
+    timeout-minutes: 165
     # macOS legs go to the self-hosted Mac ONLY when all three hold: the
     # change is heavy, the event is trusted (not a fork PR), and the
     # CW_SELF_HOSTED_MAC repo variable is 'true'. That variable is the kill
