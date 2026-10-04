@@ -45,10 +45,12 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
 
 use crate::dependencies::HostRuntime;
 use crate::fleet::files::WindowsDirectory;
@@ -651,7 +653,7 @@ impl NativeSandbox {
         let (stdin, child_stdin) = pipe(false, overlapped)?;
         let (stdout, child_stdout) = pipe(true, overlapped)?;
         let (stderr, child_stderr) = pipe(true, overlapped)?;
-        let mut attrs = Attributes::new(3)?;
+        let mut attrs = Attributes::new(4)?;
         let registry_read = CapabilitySid::registry_read()?;
         let mut capability = SID_AND_ATTRIBUTES {
             Sid: registry_read.sid(),
@@ -664,6 +666,11 @@ impl NativeSandbox {
             Reserved: 0,
         };
         let lpac = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+        // Core creates this LPAC from an unrestricted process, so it can opt
+        // the runtime into spawning descendants. Windows gives those children
+        // the parent's AppContainer token and, by default, the same Job; the
+        // startup probe verifies that they keep the same file/network limits.
+        let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
         let handles = [
             child_stdin.as_raw_handle(),
             child_stdout.as_raw_handle(),
@@ -671,6 +678,10 @@ impl NativeSandbox {
         ];
         attrs.set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &capabilities)?;
         attrs.set(PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &lpac)?;
+        attrs.set(
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+            &child_process_policy,
+        )?;
         attrs.set_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles)?;
         let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -1082,6 +1093,7 @@ fn token_has_lpac_attribute(token: &OwnedHandle) -> io::Result<bool> {
 /// no file, network or COM access; socket creation stays denied, which the
 /// isolation probe checks.
 struct CapabilitySid {
+    sid: PSID,
     sids: *mut PSID,
     count: u32,
     groups: *mut PSID,
@@ -1093,6 +1105,7 @@ impl CapabilitySid {
         use windows_sys::Win32::Security::DeriveCapabilitySidsFromName;
         let name = wide(OsStr::new("registryRead"))?;
         let mut value = Self {
+            sid: null_mut(),
             sids: null_mut(),
             count: 0,
             groups: null_mut(),
@@ -1117,12 +1130,15 @@ impl CapabilitySid {
                 "registryRead did not derive exactly one capability SID",
             ));
         }
+        // SAFETY: DeriveCapabilitySidsFromName succeeded, and the checked
+        // count says its owned array contains exactly one PSID. The array and
+        // SID stay alive in `value` until its Drop implementation frees them.
+        value.sid = unsafe { std::slice::from_raw_parts(value.sids, 1)[0] };
         Ok(value)
     }
 
     fn sid(&self) -> PSID {
-        // SAFETY: registry_read verified exactly one non-null entry.
-        unsafe { *self.sids }
+        self.sid
     }
 }
 
