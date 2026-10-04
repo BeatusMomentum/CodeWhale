@@ -635,7 +635,7 @@
   "CmdBranchDescription": "Zweig auf einen Eintrag setzen, Verlauf bleibt unverändert",
   "CmdResumeDescription": "Sitzung fortsetzen, optional durch Import einer exportierten Sitzungs-JSON-Datei",
   "CmdNewDescription": "Neue gespeicherte Sitzung starten",
-  "CmdSessionsDescription": "Sitzungsverlauf öffnen; archive und prune verwalten alte",
+  "CmdSessionsDescription": "Sitzungsverlauf öffnen; Sitzungen archivieren/bereinigen",
   "CmdSettingsDescription": "Typisierten Einstellungs-Editor öffnen",
   "CmdSidebarDescription": "Seitenleiste platzieren (bottom/top/left/right/off)",
   "CmdSkillDescription": "Skill aktivieren oder Community-Skill installieren/aktualisieren/deinstallieren/vertrauen",

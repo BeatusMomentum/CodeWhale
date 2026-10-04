@@ -635,7 +635,7 @@
   "CmdBranchDescription": "Pointer la branche sur une entrée sans réécrire l’historique",
   "CmdResumeDescription": "Reprendre une session, avec la possibilité d’importer un fichier JSON de session exporté",
   "CmdNewDescription": "Démarrer une nouvelle session enregistrée",
-  "CmdSessionsDescription": "Ouvrir l'historique ; archive et prune gèrent les anciennes",
+  "CmdSessionsDescription": "Historique des sessions ; archiver ou purger",
   "CmdSettingsDescription": "Ouvrir l'éditeur de paramètres typés",
   "CmdSidebarDescription": "Placer la barre latérale (bottom/top/left/right/off)",
   "CmdSkillDescription": "Activer une skill, ou installer/mettre à jour/désinstaller/approuver une skill communautaire",
