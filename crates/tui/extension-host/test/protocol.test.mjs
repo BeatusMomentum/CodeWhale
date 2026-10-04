@@ -81,3 +81,19 @@ test('bad magic, oversized length, and non-JSON payloads are framing errors', ()
   bad.write('{', 8)
   assert.throws(() => new FrameDecoder().push(bad), /not JSON/)
 })
+
+test('wire JSON guard refuses values that would serialize differently', async () => {
+  const { isJson } = await import('../src/json.ts')
+  assert.equal(isJson({ a: [1, 'two', null, { b: true }] }), true)
+  // A hole serializes as null, a non-index array property is dropped, a symbol
+  // key is ignored, and a getter can answer differently when serialized.
+  assert.equal(isJson(new Array(2)), false)
+  const extra = [1]
+  extra.note = 'dropped'
+  assert.equal(isJson(extra), false)
+  assert.equal(isJson({ [Symbol('s')]: 1 }), false)
+  let reads = 0
+  assert.equal(isJson({ get value() { reads += 1; return reads } }), false)
+  assert.equal(isJson(Object.defineProperty({}, 'hidden', { value: 1, enumerable: false })), false)
+  assert.equal(isJson(new Date(0)), false)
+})

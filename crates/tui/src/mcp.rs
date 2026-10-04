@@ -7231,7 +7231,8 @@ pub fn mutate_config<T>(
         if rendered.len() as u64 > MAX_MCP_CONFIG_BYTES {
             anyhow::bail!("MCP config exceeds the 1 MiB limit");
         }
-        write_atomic(path, rendered.as_bytes())?;
+        write_atomic(path, rendered.as_bytes())
+            .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
         Ok((result, config_revision(Some(&rendered))))
     })
 }

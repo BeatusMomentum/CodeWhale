@@ -769,7 +769,11 @@ impl WorkspaceFile {
 }
 
 #[cfg(windows)]
-fn rename_windows_opened(file: &File, filename: &std::ffi::OsStr, replace: bool) -> io::Result<()> {
+pub(crate) fn rename_windows_opened(
+    file: &File,
+    filename: &std::ffi::OsStr,
+    replace: bool,
+) -> io::Result<()> {
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;

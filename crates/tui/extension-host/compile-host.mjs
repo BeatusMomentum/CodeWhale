@@ -38,7 +38,9 @@ const run = (argv) => {
 }
 run([
   '--no-install', '--no-env-file', `--config=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, 'build', '--compile', `--compile-executable-path=${binary}`,
-  `--compile-exec-argv=--no-install --no-env-file --config=${process.platform === 'win32' ? 'NUL' : '/dev/null'} --no-addons`,
+  // A Windows Native host runs in an LPAC, which cannot open the NUL device;
+  // --no-compile-autoload-bunfig below already keeps bunfig.toml unread there.
+  `--compile-exec-argv=--no-install --no-env-file${process.platform === 'win32' ? '' : ' --config=/dev/null'} --no-addons`,
   '--no-compile-autoload-dotenv', '--no-compile-autoload-bunfig',
   '--no-compile-autoload-tsconfig', '--no-compile-autoload-package-json',
   '--define=CODEWHALE_COMPILED_HOST=true',

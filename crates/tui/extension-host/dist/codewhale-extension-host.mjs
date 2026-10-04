@@ -19,7 +19,7 @@ var __export = (target, all) => {
 var define_BUILTIN_MODULE_DIGESTS_default;
 var init_define_BUILTIN_MODULE_DIGESTS = __esm({
   "<define:__BUILTIN_MODULE_DIGESTS__>"() {
-    define_BUILTIN_MODULE_DIGESTS_default = { harness: "8b40ab8734838da9513106ba576b7140656ff254f67c81c0b52365bc2b497aaa", mcp: "d5eb38941113934f9768e90ab3f1db021b93980e41be5cdf8836489b7f233b55" };
+    define_BUILTIN_MODULE_DIGESTS_default = { harness: "bf685db5e808ab708ec698e1bc038d173db59f2facb6907fdbd689f336123f8f", mcp: "d5eb38941113934f9768e90ab3f1db021b93980e41be5cdf8836489b7f233b55" };
   }
 });
 
@@ -6188,10 +6188,20 @@ function isJson(value, depth = 0) {
       return true;
     case "number":
       return Number.isFinite(value);
-    case "object":
-      if (Array.isArray(value)) return value.every((v) => isJson(v, depth + 1));
-      if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
-      return Object.values(value).every((v) => isJson(v, depth + 1));
+    case "object": {
+      const array = Array.isArray(value);
+      if (!array && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+      const keys = Reflect.ownKeys(value);
+      if (array && keys.length !== value.length + 1) return false;
+      for (const key of keys) {
+        if (array && key === "length") continue;
+        if (typeof key !== "string") return false;
+        if (array && (!/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length)) return false;
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor.enumerable || !("value" in descriptor) || !isJson(descriptor.value, depth + 1)) return false;
+      }
+      return true;
+    }
     default:
       return false;
   }
@@ -13648,23 +13658,8 @@ function checkKey(key) {
     throw new StorageError("invalid", `storage key must contain 1 to ${STORAGE_LIMITS.keyBytes} UTF-8 bytes and no NUL`);
   }
 }
-function plainJson(value, depth = 0) {
-  if (depth > 64) return false;
-  if (value === null || typeof value !== "object") return true;
-  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
-  const keys = Reflect.ownKeys(value);
-  if (Array.isArray(value) && keys.length !== value.length + 1) return false;
-  for (const key of keys) {
-    if (Array.isArray(value) && key === "length") continue;
-    if (typeof key !== "string") return false;
-    if (Array.isArray(value) && (!/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length)) return false;
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor.enumerable || !("value" in descriptor) || !plainJson(descriptor.value, depth + 1)) return false;
-  }
-  return true;
-}
 function snapshot2(value) {
-  if (!plainJson(value) || !isJson(value)) throw new StorageError("invalid", "storage value must be plain JSON");
+  if (!isJson(value)) throw new StorageError("invalid", "storage value must be plain JSON");
   const encoded = JSON.stringify(value);
   if (Buffer.byteLength(encoded) > STORAGE_LIMITS.valueBytes) throw new StorageError("limit", "storage value exceeds its byte limit");
   return JSON.parse(encoded);

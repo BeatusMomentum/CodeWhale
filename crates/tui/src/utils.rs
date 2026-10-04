@@ -469,6 +469,31 @@ pub fn write_atomic_batch(files: &[(PathBuf, Vec<u8>)]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The file name Windows will create for `path`. The native rename used by
+/// `write_atomic_scoped` takes the name literally, while Win32 path APIs drop
+/// trailing dots and spaces and map device names (`CON`); refuse a name that
+/// Windows would rewrite instead of creating a file nothing else can open.
+#[cfg(windows)]
+fn windows_atomic_target_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Windows would not write this file name as given: {}",
+                path.display()
+            ),
+        )
+    };
+    let name = path.file_name().ok_or_else(invalid)?;
+    let absolute = std::path::absolute(path)?;
+    if absolute.file_name() != Some(name)
+        || absolute.as_os_str().to_string_lossy().starts_with(r"\\.\")
+    {
+        return Err(invalid());
+    }
+    Ok(name.to_owned())
+}
+
 fn write_atomic_scoped(
     path: &Path,
     contents: &[u8],
@@ -529,41 +554,69 @@ fn write_atomic_scoped(
         sweep_stale_atomic_write_temps(parent);
     }
 
+    // Validated before any temp exists, so a refused name leaves nothing.
+    #[cfg(windows)]
+    let target_name = windows_atomic_target_name(path)?;
+    #[cfg(not(windows))]
     let mut tmp = builder.tempfile_in(parent)?;
-    std::io::Write::write_all(&mut tmp, contents)?;
+    // DELETE on the temp handle lets Windows rename through that handle.
+    #[cfg(windows)]
+    let mut tmp = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        };
+        builder.make_in(parent, |temp| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+                .share_mode(FILE_SHARE_READ)
+                .open(temp)
+        })?
+    };
 
-    // Atomic replacement creates a new inode. Restore ordinary access /
-    // executable bits of an existing workspace file before persisting.
-    #[cfg(unix)]
-    if let Some(mode) = existing_workspace_mode {
-        use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(mode))?;
+    #[cfg(not(windows))]
+    {
+        std::io::Write::write_all(&mut tmp, contents)?;
+
+        // Atomic replacement creates a new inode. Restore ordinary access /
+        // executable bits of an existing workspace file before persisting.
+        #[cfg(unix)]
+        if let Some(mode) = existing_workspace_mode {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+
+        tmp.as_file().sync_all()?;
+        tmp.persist(path)?;
     }
-
-    tmp.as_file().sync_all()?;
     #[cfg(windows)]
     {
-        // Keep the already-synced tempfile and retry only the transient Win32
-        // sharing/lock failures; permanent permission errors still surface.
-        let mut pending = tmp;
-        let mut attempt = 0;
-        loop {
-            match pending.persist(path) {
-                Ok(_) => break,
-                Err(err) => {
-                    let Some(backoff) = windows_publish_retry_delay(&err.error, attempt) else {
-                        return Err(err.error);
-                    };
-                    pending = err.file;
-                    std::thread::sleep(backoff);
-                    attempt += 1;
-                }
+        // MoveFileExW (tempfile::persist) reopens the destination directory
+        // with FILE_ADD_FILE, which conflicts with Fleet's read-only-shared
+        // ancestor pins (fleet/files.rs). Rename through the synced temp handle
+        // with a bare file name, so the parent is never reopened; the rename
+        // retries transient sharing/lock failures itself.
+        let result = (|| {
+            std::io::Write::write_all(&mut tmp, contents)?;
+            tmp.as_file().sync_all()?;
+            crate::fleet::files::rename_windows_opened(tmp.as_file(), &target_name, true)
+        })();
+        match result {
+            // The temp name is vacant now; never unlink a later entry.
+            Ok(()) => tmp.disable_cleanup(true),
+            Err(err) => {
+                // Close the delete-denying handle before deleting the temp.
+                let _ = tmp.into_temp_path().close();
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!("replace {}: {err}", path.display()),
+                ));
             }
         }
     }
-    #[cfg(not(windows))]
-    tmp.persist(path)?;
     // Fsync the parent directory so the rename (the new directory entry) is
     // itself durable — otherwise a power loss right after the rename can lose
     // it even though the file data was synced, silently dropping a
@@ -1217,6 +1270,38 @@ mod atomic_write_tests {
         write_atomic(&path, b"new content").expect("retry contended atomic replacement");
         release.join().expect("release destination handle");
         assert_eq!(fs::read(&path).expect("read replacement"), b"new content");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_atomic_writes_beside_live_fleet_pins_and_refuses_rewritten_names() {
+        // A live Fleet ledger keeps every ancestor of its files open with
+        // read-only sharing, so MoveFileExW could not add an entry there
+        // (hosted os error 32 writing mcp.json).
+        let workspace = tempdir().expect("tempdir");
+        let _pins = crate::fleet::files::WorkspaceFile::open(
+            workspace.path(),
+            Path::new(".codewhale/fleet.jsonl"),
+            true,
+        )
+        .expect("pin workspace ancestors");
+        let created = workspace.path().join("created.json");
+        write_atomic(&created, b"new").expect("create beside pins");
+        assert_eq!(fs::read(&created).expect("read created"), b"new");
+        write_atomic(&created, b"replaced").expect("replace beside pins");
+        assert_eq!(fs::read(&created).expect("read replaced"), b"replaced");
+        for name in ["trailing.", "trailing ", "CON"] {
+            assert!(
+                write_atomic(&workspace.path().join(name), b"x").is_err(),
+                "{name}"
+            );
+        }
+        let strays: Vec<_> = fs::read_dir(workspace.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "{strays:?}");
     }
 
     #[test]

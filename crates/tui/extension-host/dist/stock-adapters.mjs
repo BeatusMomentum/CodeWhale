@@ -444,10 +444,20 @@ function isJson(value, depth = 0) {
       return true;
     case "number":
       return Number.isFinite(value);
-    case "object":
-      if (Array.isArray(value)) return value.every((v) => isJson(v, depth + 1));
-      if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
-      return Object.values(value).every((v) => isJson(v, depth + 1));
+    case "object": {
+      const array2 = Array.isArray(value);
+      if (!array2 && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+      const keys = Reflect.ownKeys(value);
+      if (array2 && keys.length !== value.length + 1) return false;
+      for (const key of keys) {
+        if (array2 && key === "length") continue;
+        if (typeof key !== "string") return false;
+        if (array2 && (!/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length)) return false;
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor.enumerable || !("value" in descriptor) || !isJson(descriptor.value, depth + 1)) return false;
+      }
+      return true;
+    }
     default:
       return false;
   }

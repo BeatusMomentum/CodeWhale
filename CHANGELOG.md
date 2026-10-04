@@ -36,8 +36,9 @@ note below before upgrading.
   refused with the concrete error. Codewhale's own pinned built-in host modules
   keep a diagnosed exception, and every effect still needs a Rust operation
   ticket. On Windows a Native extension starts only in a freshly created Less
-  Privileged AppContainer with no capabilities, after Codewhale checks its
-  token and a real file and network probe; otherwise activation is refused.
+  Privileged AppContainer whose only capability is `registryRead` (Winsock
+  cannot start without it), after Codewhale checks its token and a real file
+  and network probe; otherwise activation is refused.
   Other files you
   can read, such as project `.env` files, stay readable, and plugins sharing the
   host can interfere with each other, so enable only plugins you have reviewed
@@ -199,6 +200,10 @@ note below before upgrading.
 
 ### Changed
 
+- The pinned prompt header follows the turn at the top of the viewport,
+  handing over to the previous prompt as you scroll, and clicking it jumps back
+  to the message it names
+  ([#6830](https://github.com/Hmbown/Codewhale/pull/6830), thanks @SparkofSpike).
 - On Windows, every PowerShell command the shell tool starts now passes
   `-ExecutionPolicy Bypass` for that process only, so a local `Restricted` or
   `AllSigned` policy no longer blocks multi-line commands. (`.ps1` script tools
@@ -254,6 +259,13 @@ note below before upgrading.
 
 ### Fixed
 
+- Diff lines and tool output wrap at grapheme boundaries, so emoji families,
+  skin tones and variation selectors no longer split across lines
+  ([#6829](https://github.com/Hmbown/Codewhale/pull/6829), thanks @Lstarsky0).
+- Twelve translated packs now translate the context inspector's making-room
+  and anchors rows, the Ctrl+O hint and the `/turn inspect` and `/advisor`
+  descriptions instead of showing English
+  ([#6831](https://github.com/Hmbown/Codewhale/pull/6831), thanks @Lstarsky0).
 - Optional MCP servers can be found before they connect. `tool_search` matches
   the query against configured, enabled server names (or an `mcp_<server>_`
   prefix), connects up to eight matches within the existing boot wait, and
@@ -767,6 +779,19 @@ note below before upgrading.
 
 ### Security
 
+- On Windows, a broad Node kill (`Stop-Process -Name node`,
+  `Get-Process node | Stop-Process`, `taskkill /IM node.exe`, and wrapped,
+  aliased or nested-shell forms) is held by a built-in safety floor: it is
+  refused in Full Access, Auto-Review and Never, and asks in other modes. With
+  the npm launcher such a command ended this and every other npm-launched
+  Codewhale session without cleanup. Stopping a server by PID or port still
+  works, and the Windows installer and archives have no Node launcher
+  ([#6827](https://github.com/Hmbown/Codewhale/issues/6827), thanks @jayanthvee).
+- `code_execution` and `js_execution` now start their Python and Node
+  interpreters through the same permission-aware launcher as other commands, so
+  the session's execution policy applies to them. Before, an approved call ran
+  the interpreter directly, and its working directory was the only boundary
+  ([#6820](https://github.com/Hmbown/Codewhale/pull/6820), thanks @Guan0923).
 - A saved task without an `auto_approve` field is no longer treated as
   auto-approved. Updates accept HTTPS URLs only from the release-host
   allow-list, and the npm release-asset check bounds every request.
@@ -1175,10 +1200,10 @@ note below before upgrading.
 
 ### Contributors
 
-Sixteen contributors and issue reporters are credited below, including
+Seventeen contributors and issue reporters are credited below, including
 @cenab's provider report.
 
-- **[@Guan0923](https://github.com/Guan0923)** — accepted case-insensitive HTTP(S) schemes in `config doctor` without rewriting the configured URL ([#6819](https://github.com/Hmbown/Codewhale/pull/6819)).
+- **[@Guan0923](https://github.com/Guan0923)** — accepted case-insensitive HTTP(S) schemes in `config doctor` without rewriting the configured URL ([#6819](https://github.com/Hmbown/Codewhale/pull/6819)), and routed the Python and JavaScript execution tools through the session's execution policy ([#6820](https://github.com/Hmbown/Codewhale/pull/6820)).
 - **[@harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host, starting on the vendor's recommended `qwen3.8-flash` model ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
 - **[@asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving their original contributor commits ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)); made context rule and chain-segment source labels repository-relative ([#6739](https://github.com/Hmbown/Codewhale/pull/6739)).
 - **[@qiuYliangM](https://github.com/qiuYliangM)** — made provider-bound project instruction and constitution labels stable across directory moves and kept their absolute paths in operator reports ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
@@ -1186,14 +1211,15 @@ Sixteen contributors and issue reporters are credited below, including
 - **[@Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/Hmbown/Codewhale/pull/6604), [#6603](https://github.com/Hmbown/Codewhale/issues/6603)).
 - **[@aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/Hmbown/Codewhale/pull/6761)).
 - **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
-- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
+- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)), wrapped diff and tool output at grapheme boundaries ([#6829](https://github.com/Hmbown/Codewhale/pull/6829)), and translated the context inspector rows twelve packs still shipped in English ([#6831](https://github.com/Hmbown/Codewhale/pull/6831)).
 - **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)). Completed the seventeen-command portable session group, including `/structcopy` ([#6793](https://github.com/Hmbown/Codewhale/pull/6793)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
+- **[@jayanthvee](https://github.com/jayanthvee)** — reported and diagnosed that killing the npm launcher's `node.exe` ends Windows sessions without cleanup, with reproductions and fix directions ([#6827](https://github.com/Hmbown/Codewhale/issues/6827)).
 - **[@cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/Hmbown/Codewhale/issues/6695)).
 - **[@BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/Hmbown/Codewhale/issues/6616)).
 - **[@Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
 - **[@wuisabel-gif](https://github.com/wuisabel-gif)** — designed the `tool_call_after` execution-receipt contract and its tests on a reference branch, which landed re-implemented on the current hook seam ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), [#6713](https://github.com/Hmbown/Codewhale/pull/6713)).
-- **[@SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)). Translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)); added regression coverage for rejecting unknown website locales before dictionary lookup ([#6786](https://github.com/Hmbown/Codewhale/pull/6786)).
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)). Translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)); added regression coverage for rejecting unknown website locales before dictionary lookup ([#6786](https://github.com/Hmbown/Codewhale/pull/6786)); made the pinned prompt header follow the viewport's turn and jump on click ([#6830](https://github.com/Hmbown/Codewhale/pull/6830)).
 
 ## [0.10.0] - 2026-09-22
 

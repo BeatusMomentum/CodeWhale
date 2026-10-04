@@ -1,4 +1,5 @@
-//! Native-only Windows launch boundary. LPAC with no capabilities supplies
+//! Native-only Windows launch boundary. LPAC with only the `registryRead`
+//! capability (Winsock cannot initialize without it) supplies
 //! filesystem/network denial; the existing Job supplies lifetime and memory.
 //! A fresh profile never inherits ACLs from a retired host. Profiles/assets
 //! created here are disposed by their exact owner after the process ends;
@@ -30,7 +31,7 @@ use windows_sys::Win32::Security::Isolation::{
 };
 use windows_sys::Win32::Security::{
     ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, GetTokenInformation,
-    OBJECT_INHERIT_ACE, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    OBJECT_INHERIT_ACE, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_QUERY, TokenAppContainerSid,
     TokenCapabilities, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer,
 };
@@ -60,6 +61,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 0x1;
 const MAX_GRANT_ENTRIES: usize = 65_536;
 const MAX_GRANT_SCOPES: usize = 1024;
+/// Empty Bun config in the granted runtime-copy directory (see spawn_inner).
+const EMPTY_BUN_CONFIG: &str = "empty-bunfig.toml";
 // Serialize Core's read/merge/write ACL operations across old-profile cleanup
 // and a new host admission. Never overwrite a concurrently admitted profile.
 static ACL_EDITS: Mutex<()> = Mutex::new(());
@@ -381,6 +384,7 @@ impl NativeSandbox {
                     .tempdir_in(&parent)?,
             );
             let program = assets.path().join("runtime.exe");
+            fs::write(assets.path().join(EMPTY_BUN_CONFIG), b"")?;
             // The selected runtime is copied, never granted access in an
             // installation/user directory. Pin its opened bytes while copying.
             let original = runtime.path.canonicalize()?;
@@ -648,10 +652,15 @@ impl NativeSandbox {
         let (stdout, child_stdout) = pipe(true, overlapped)?;
         let (stderr, child_stderr) = pipe(true, overlapped)?;
         let mut attrs = Attributes::new(3)?;
+        let registry_read = CapabilitySid::registry_read()?;
+        let mut capability = SID_AND_ATTRIBUTES {
+            Sid: registry_read.sid(),
+            Attributes: windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED as u32,
+        };
         let capabilities = SECURITY_CAPABILITIES {
             AppContainerSid: self.profile.sid,
-            Capabilities: null_mut(),
-            CapabilityCount: 0,
+            Capabilities: &mut capability,
+            CapabilityCount: 1,
             Reserved: 0,
         };
         let lpac = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
@@ -671,7 +680,23 @@ impl NativeSandbox {
         startup.StartupInfo.hStdError = child_stderr.as_raw_handle();
         startup.lpAttributeList = attrs.ptr();
         let application = wide(self.program.as_os_str())?;
-        let mut command = command_line(self.program.as_os_str(), args)?;
+        // An LPAC cannot open the NUL device, so a Bun host reads its empty
+        // config from the granted runtime-copy directory instead.
+        let empty_config = format!(
+            "--config={}",
+            self._assets.path().join(EMPTY_BUN_CONFIG).display()
+        );
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| {
+                if arg == "--config=NUL" {
+                    empty_config.clone()
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        let mut command = command_line(self.program.as_os_str(), &args)?;
         let directory = wide(self.data.as_os_str())?;
         let mut env = env.to_vec();
         let temp = self.data.join("tmp").into_os_string();
@@ -711,7 +736,7 @@ impl NativeSandbox {
                 &process,
             )?);
             tree.limit_process_memory(memory_cap)?;
-            verify_token(&process, self.profile.sid)?;
+            verify_token(&process, self.profile.sid, registry_read.sid())?;
             // No Native byte executes until Job, memory and actual LPAC token
             // identity/capabilities have all been checked by Rust.
             if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
@@ -820,7 +845,7 @@ fn wait(process: &OwnedHandle, timeout: u32) -> io::Result<std::process::ExitSta
     }
 }
 
-fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
+fn verify_token(process: &OwnedHandle, sid: PSID, capability: PSID) -> io::Result<()> {
     let mut token = null_mut();
     if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
@@ -918,7 +943,9 @@ fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
                 let value = &*buffer.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>();
                 !value.TokenAppContainer.is_null() && EqualSid(value.TokenAppContainer, sid) != 0
             } else {
-                (*buffer.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount == 0
+                // Exactly the one granted capability, and nothing else.
+                let groups = &*buffer.as_ptr().cast::<TOKEN_GROUPS>();
+                groups.GroupCount == 1 && EqualSid(groups.Groups[0].Sid, capability) != 0
             }
         };
         if !valid {
@@ -1049,6 +1076,73 @@ fn token_has_lpac_attribute(token: &OwnedHandle) -> io::Result<bool> {
     Ok(false)
 }
 
+/// The only capability a Native LPAC host receives: `registryRead`. Without
+/// it an LPAC cannot open any registry key, so Winsock initialization, which
+/// reads its catalog under HKLM, fails and Node aborts at startup. It grants
+/// no file, network or COM access; socket creation stays denied, which the
+/// isolation probe checks.
+struct CapabilitySid {
+    sids: *mut PSID,
+    count: u32,
+    groups: *mut PSID,
+    group_count: u32,
+}
+
+impl CapabilitySid {
+    fn registry_read() -> io::Result<Self> {
+        use windows_sys::Win32::Security::DeriveCapabilitySidsFromName;
+        let name = wide(OsStr::new("registryRead"))?;
+        let mut value = Self {
+            sids: null_mut(),
+            count: 0,
+            groups: null_mut(),
+            group_count: 0,
+        };
+        // SAFETY: nul-terminated name and initialized out pointers; the
+        // returned arrays and SIDs are freed by Drop with LocalFree.
+        if unsafe {
+            DeriveCapabilitySidsFromName(
+                name.as_ptr(),
+                &mut value.groups,
+                &mut value.group_count,
+                &mut value.sids,
+                &mut value.count,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if value.count != 1 || value.sids.is_null() {
+            return Err(io::Error::other(
+                "registryRead did not derive exactly one capability SID",
+            ));
+        }
+        Ok(value)
+    }
+
+    fn sid(&self) -> PSID {
+        // SAFETY: registry_read verified exactly one non-null entry.
+        unsafe { *self.sids }
+    }
+}
+
+impl Drop for CapabilitySid {
+    fn drop(&mut self) {
+        // SAFETY: each SID and each array came from DeriveCapabilitySidsFromName.
+        unsafe {
+            for (array, count) in [(self.sids, self.count), (self.groups, self.group_count)] {
+                if array.is_null() {
+                    continue;
+                }
+                for index in 0..count as usize {
+                    LocalFree(*array.add(index));
+                }
+                LocalFree(array.cast());
+            }
+        }
+    }
+}
+
 fn set_acl(file: &File, sid: PSID, access: u32, inheritance: u32) -> io::Result<()> {
     edit_acl(file, sid, access, inheritance, GRANT_ACCESS)
 }
@@ -1109,8 +1203,17 @@ fn edit_acl(
         return Err(io::Error::last_os_error());
     }
     let preserved = control & (SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED);
-    let (acl_revision, acl_size, ace_count) = unsafe {
-        let acl = &*old_acl;
+    // An unprotected file has no children, so SetSecurityInfo cannot
+    // propagate from it; with UNPROTECTED it re-derives the inherited entries
+    // from the parent. Writing a file's inherited entries back (either API)
+    // turned them into explicit ones on hosted Windows. Directories and
+    // protected DACLs keep the exact kernel write, which never propagates.
+    let derive_inherited = preserved & SE_DACL_PROTECTED == 0 && !file.metadata()?.is_dir();
+    let old = std::ptr::NonNull::new(old_acl)
+        .ok_or_else(|| io::Error::other("refusing to replace an unrestricted DACL"))?;
+    let (acl_revision, acl_size, ace_count) = {
+        // SAFETY: GetSecurityInfo returned this DACL inside `descriptor`.
+        let acl = unsafe { old.as_ref() };
         (
             u32::from(acl.AclRevision),
             usize::from(acl.AclSize),
@@ -1146,7 +1249,10 @@ fn edit_acl(
         if unsafe { GetAce(old_acl, index, &mut ace) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let ace = std::ptr::NonNull::new(ace)
+            .ok_or_else(|| io::Error::other("GetAce returned no entry"))?;
+        // SAFETY: GetAce returned a pointer to an entry inside the live DACL.
+        let header = unsafe { ace.cast::<ACE_HEADER>().as_ref() };
         let flags = u32::from(header.AceFlags);
         let inherited = flags & INHERITED_ACE != 0;
         // Only ACCESS_ALLOWED_ACE carries its SID at SidStart.
@@ -1154,13 +1260,18 @@ fn edit_acl(
             && usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>()
             && unsafe {
                 EqualSid(
-                    std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                    std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>().as_ptr()).SidStart)
+                        .cast(),
                     sid,
                 )
             } != 0;
         if ours && grant && !inherited && flags == inheritance {
             // GRANT_ACCESS semantics: combine with the existing explicit grant.
-            merged |= unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask };
+            merged |= unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().as_ref().Mask };
+            continue;
+        }
+        if derive_inherited && inherited {
+            // Windows re-derives these from the parent on write.
             continue;
         }
         if ours && !grant {
@@ -1182,7 +1293,7 @@ fn edit_acl(
                 new_acl,
                 acl_revision,
                 u32::MAX,
-                ace,
+                ace.as_ptr(),
                 u32::from(header.AceSize),
             )
         } == 0
@@ -1195,40 +1306,67 @@ fn edit_acl(
     {
         return Err(io::Error::last_os_error());
     }
-    let mut security: SECURITY_DESCRIPTOR = unsafe { zeroed() };
-    let security_ptr = (&mut security as *mut SECURITY_DESCRIPTOR).cast();
-    // NTFS stores this descriptor as given, with no inheritance merge. The
-    // kernel keeps SE_DACL_AUTO_INHERITED only when SE_DACL_AUTO_INHERIT_REQ
-    // accompanies it, so request it exactly when the object already had it;
-    // otherwise the object would silently become a legacy DACL.
-    let requested = preserved
-        | if preserved & SE_DACL_AUTO_INHERITED != 0 {
-            SE_DACL_AUTO_INHERIT_REQ
-        } else {
-            0
-        };
-    if unsafe { InitializeSecurityDescriptor(security_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
-        || unsafe { SetSecurityDescriptorDacl(security_ptr, 1, new_acl, 0) } == 0
-        || unsafe {
-            SetSecurityDescriptorControl(
-                security_ptr,
-                SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED,
-                requested,
-            )
-        } == 0
-        || unsafe {
-            SetKernelObjectSecurity(
+    if derive_inherited {
+        use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
+        use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
+        // SAFETY: the pinned handle and the explicit-only ACL outlive the call.
+        let result = unsafe {
+            SetSecurityInfo(
                 file.as_raw_handle(),
-                DACL_SECURITY_INFORMATION,
-                security_ptr,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                new_acl,
+                null(),
             )
-        } == 0
-    {
-        return Err(io::Error::last_os_error());
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+    } else {
+        let mut security: SECURITY_DESCRIPTOR = unsafe { zeroed() };
+        let security_ptr = (&mut security as *mut SECURITY_DESCRIPTOR).cast();
+        // NTFS stores this descriptor as given, with no inheritance merge. The
+        // kernel keeps SE_DACL_AUTO_INHERITED only when SE_DACL_AUTO_INHERIT_REQ
+        // accompanies it, so request it exactly when the object already had it;
+        // otherwise the object would silently become a legacy DACL.
+        let requested = preserved
+            | if preserved & SE_DACL_AUTO_INHERITED != 0 {
+                SE_DACL_AUTO_INHERIT_REQ
+            } else {
+                0
+            };
+        if unsafe { InitializeSecurityDescriptor(security_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
+            || unsafe { SetSecurityDescriptorDacl(security_ptr, 1, new_acl, 0) } == 0
+            || unsafe {
+                SetSecurityDescriptorControl(
+                    security_ptr,
+                    SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED,
+                    requested,
+                )
+            } == 0
+            || unsafe {
+                SetKernelObjectSecurity(
+                    file.as_raw_handle(),
+                    DACL_SECURITY_INFORMATION,
+                    security_ptr,
+                )
+            } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
     drop(descriptor);
     let (still_granted, control) = read_back_dacl(file, sid)?;
-    if control & (SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED) != preserved {
+    // A re-derived file DACL is auto-inherited by construction; it must stay
+    // unprotected. A kernel-written DACL keeps both bits exactly.
+    let checked = if derive_inherited {
+        SE_DACL_PROTECTED
+    } else {
+        SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED
+    };
+    if control & checked != preserved & checked {
         return Err(io::Error::other(
             "edited DACL changed its inheritance control bits",
         ));
@@ -1271,20 +1409,25 @@ fn read_back_dacl(file: &File, sid: PSID) -> io::Result<(bool, u16)> {
     if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    if acl.is_null() {
+    let Some(dacl) = std::ptr::NonNull::new(acl) else {
         return Ok((false, control));
-    }
-    for index in 0..u32::from(unsafe { (*acl).AceCount }) {
+    };
+    // SAFETY: GetSecurityInfo returned this DACL inside `descriptor`.
+    for index in 0..u32::from(unsafe { dacl.as_ref().AceCount }) {
         let mut ace = null_mut();
         if unsafe { GetAce(acl, index, &mut ace) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let ace = std::ptr::NonNull::new(ace)
+            .ok_or_else(|| io::Error::other("GetAce returned no entry"))?;
+        // SAFETY: GetAce returned a pointer to an entry inside the live DACL.
+        let header = unsafe { ace.cast::<ACE_HEADER>().as_ref() };
         if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
             && usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>()
             && unsafe {
                 EqualSid(
-                    std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                    std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>().as_ptr()).SidStart)
+                        .cast(),
                     sid,
                 )
             } != 0

@@ -43,24 +43,8 @@ function checkKey(key: string): void {
 }
 
 /** Reject accessors, symbols, sparse arrays and extra properties before isJson reads values. */
-function plainJson(value: unknown, depth = 0): boolean {
-  if (depth > 64) return false
-  if (value === null || typeof value !== 'object') return true
-  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false
-  const keys = Reflect.ownKeys(value)
-  if (Array.isArray(value) && keys.length !== value.length + 1) return false
-  for (const key of keys) {
-    if (Array.isArray(value) && key === 'length') continue
-    if (typeof key !== 'string') return false
-    if (Array.isArray(value) && (!/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length)) return false
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)!
-    if (!descriptor.enumerable || !('value' in descriptor) || !plainJson(descriptor.value, depth + 1)) return false
-  }
-  return true
-}
-
 function snapshot(value: unknown): Json {
-  if (!plainJson(value) || !isJson(value)) throw new StorageError('invalid', 'storage value must be plain JSON')
+  if (!isJson(value)) throw new StorageError('invalid', 'storage value must be plain JSON')
   const encoded = JSON.stringify(value)
   if (Buffer.byteLength(encoded) > STORAGE_LIMITS.valueBytes) throw new StorageError('limit', 'storage value exceeds its byte limit')
   return JSON.parse(encoded)
