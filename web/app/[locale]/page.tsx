@@ -30,8 +30,9 @@ export const revalidate = 300;
 // Row order is shared by every locale's `gain` and `availability` lists, so
 // the marks and states follow the row, not a word.
 const GAIN_ICONS: IconName[] = ["terminal", "repeat", "shield"];
-// Released · development preview · development build · in development.
-const AVAILABILITY_TONES: StatusTone[] = ["ready", "attention", "idle", "idle"];
+// Released · GUI available · development preview · development build · in
+// development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
 
 /**
  * The whale-road homepage: the promise and the install plate in the sky over
@@ -274,9 +275,9 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             }
           >
             <dl className="ruled-list">
-              {d.availability.map(([surface, status, detail], index) => (
+              {d.availability.map(([surface, status, detail, href], index) => (
                 <div key={surface}>
-                  <dt>{surface}</dt>
+                  <dt>{href ? <a href={href} className="body-link">{surface}</a> : surface}</dt>
                   <dd>
                     <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{status}</Status>
                     {detail}

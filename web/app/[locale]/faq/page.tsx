@@ -72,6 +72,15 @@ brew install Hmbown/deepseek-tui/codewhale
     sources: ["README.md", "docs/INSTALL.md", "#1860", "#1914"],
   },
   {
+    q: "Can I use Codewhale from VS Code?",
+    a: (
+      <>
+        Yes. CodeWhale GUI (VS Code) is the community-maintained graphical frontend for the same engine: agent chat, threads, and file changes in a VS Code sidebar, over the local Runtime you already run. Install it from the <a href="https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode" className="body-link">VS Code Marketplace</a>; the source is on <a href="https://github.com/HengQuWorld/CodeWhale-VSCode" className="body-link">GitHub</a>.
+      </>
+    ),
+    sources: ["README.md"],
+  },
+  {
     q: "What's the difference between codewhale and codewhale-tui?",
     a: (
       <>
@@ -436,6 +445,15 @@ brew install Hmbown/deepseek-tui/codewhale
       </>
     ),
     sources: ["README.md", "docs/INSTALL.md", "#1860", "#1914"],
+  },
+  {
+    q: "可以在 VS Code 中使用 Codewhale 吗？",
+    a: (
+      <>
+        可以。CodeWhale GUI（VS Code）是社区维护的图形前端，运行同一个引擎：在 VS Code 侧边栏中对话、管理线程并查看文件变更，连接你本机已在运行的 Runtime。可从 <a href="https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode" className="body-link">VS Code Marketplace</a> 安装；源码见 <a href="https://github.com/HengQuWorld/CodeWhale-VSCode" className="body-link">GitHub</a>。
+      </>
+    ),
+    sources: ["README.md"],
   },
   {
     q: "codewhale 和 codewhale-tui 有什么区别？",

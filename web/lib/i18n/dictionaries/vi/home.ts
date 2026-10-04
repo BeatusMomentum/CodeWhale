@@ -66,12 +66,18 @@ export const home: HomeDict = {
   chapterAvailability: "Chạy ở đâu",
   availabilityHeading: "Nơi bạn có thể sử dụng Codewhale",
   availabilityLede:
-    "Bạn có thể sử dụng Codewhale trong terminal ngay hôm nay, trong khi chúng tôi đang phát triển ứng dụng web, ứng dụng máy tính và máy tính đám mây.",
+    "Bạn có thể sử dụng Codewhale trong terminal, trên trình duyệt cục bộ và với giao diện CodeWhale GUI do cộng đồng duy trì ngay hôm nay, trong khi chúng tôi đang phát triển ứng dụng web, ứng dụng máy tính và máy tính đám mây.",
   availability: [
     [
       "Terminal",
       "Đã phát hành",
       "Các bản nhị phân phát hành trên GitHub dành cho Linux, macOS và Windows; bạn cũng có thể cài qua npm hoặc Cargo. Phiên bản Android trên Termux là bản xem trước."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Có sẵn",
+      "Giao diện đồ họa do cộng đồng duy trì, trong một dự án riêng: trò chuyện, chủ đề và thay đổi tệp trong thanh bên VS Code trên cùng Runtime. Cài đặt từ VS Code Marketplace.",
+      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
     ],
     [
       "Ứng dụng web",
@@ -90,7 +96,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Bạn có thể dùng terminal mà không cần tài khoản Codewhale; phí sử dụng các mô hình do nhà cung cấp vận hành sẽ do nhà cung cấp đó tính.",
+    "Bạn có thể dùng terminal và giao diện đồ họa mà không cần tài khoản Codewhale; phí sử dụng các mô hình do nhà cung cấp vận hành sẽ do nhà cung cấp đó tính.",
   accountLink: "Tạo tài khoản",
   surfacesHeading: "Các cách làm việc với Codewhale",
   surfaces: [

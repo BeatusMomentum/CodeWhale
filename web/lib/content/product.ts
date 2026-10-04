@@ -2,8 +2,11 @@
  * product.ts — the copy for /product, the "what is this and what do I get"
  * page behind the primary nav's first link.
  *
- * TRUTH CONTRACT: availability is stated per surface as it is today and
- * mirrors the homepage's availability chapter and docs/public-surface-facts.json.
+ * TRUTH CONTRACT: availability is stated per surface as it is today. The
+ * terminal, browser, hosted web, desktop, and cloud rows mirror the homepage's
+ * availability chapter and docs/public-surface-facts.json; the GUI row states
+ * the community graphical frontend — a separate project from this repository's
+ * own VS Code extension — exactly as README.md links it.
  * Nothing here claims cloud execution; the web app is described as account
  * sign-in plus a development preview; desktop is a development build.
  * Counts (providers, tools, sandbox backends) come from the facts layer at
@@ -21,7 +24,7 @@ export interface ProductAvailabilityRow {
   surface: LocalizedText;
   status: LocalizedText;
   detail: LocalizedText;
-  /** Locale-relative route with the full story, or null. */
+  /** Locale-relative route with the full story, an absolute external URL, or null. */
   href: string | null;
   linkLabel: LocalizedText | null;
 }
@@ -39,8 +42,8 @@ export const PRODUCT_COPY = {
     zh: "用你选择的模型，创造与自动化。",
   },
   lede: {
-    en: "Codewhale is an open-source agent that can read a project, edit files, run commands, and use connected tools. Direct the work from your terminal or local browser, choose the model, and keep the conversation and tool results in a saved session.",
-    zh: "Codewhale 是一个开源智能体，能够读取项目、编辑文件、运行命令并使用连接的工具。在终端或本地浏览器中指挥任务，选择模型，并将对话和工具结果保存在会话中。",
+    en: "Codewhale is an open-source agent that can read a project, edit files, run commands, and use connected tools. Direct the work from your terminal, the local browser, or the CodeWhale GUI in VS Code, choose the model, and keep the conversation and tool results in a saved session.",
+    zh: "Codewhale 是一个开源智能体，能够读取项目、编辑文件、运行命令并使用连接的工具。在终端、本地浏览器或 VS Code 中的 CodeWhale GUI 里指挥任务，选择模型，并将对话和工具结果保存在会话中。",
   },
 
   gainHeading: { en: "Models, teamwork, and control", zh: "模型、协作与控制" },
@@ -70,8 +73,8 @@ export const PRODUCT_COPY = {
 
   availabilityHeading: { en: "Where to use Codewhale", zh: "在哪里使用 Codewhale" },
   availabilityLede: {
-    en: "The terminal and local browser client are available now. Desktop and hosted web apps are being developed around the same session model; their availability is separate. The terminal and local browser work without a Codewhale account. Hosted web and desktop access use an account, while the model connection remains your choice.",
-    zh: "终端与本地浏览器客户端现已可用，无需 Codewhale 账户。桌面和托管网页应用正基于同一会话模型开发，开放状态分别说明；访问这些应用需要账户，模型连接仍由你选择。",
+    en: "The terminal, the local browser client, and the community CodeWhale GUI are available now. Desktop and hosted web apps are being developed around the same session model; their availability is separate. The terminal, local browser, and GUI work without a Codewhale account. Hosted web and desktop access use an account, while the model connection remains your choice.",
+    zh: "终端、本地浏览器客户端与社区维护的 CodeWhale GUI 现已可用，无需 Codewhale 账户。桌面和托管网页应用正基于同一会话模型开发，开放状态分别说明；访问这些应用需要账户，模型连接仍由你选择。",
   },
   availability: [
     {
@@ -93,6 +96,16 @@ export const PRODUCT_COPY = {
       },
       href: "/docs/web",
       linkLabel: { en: "Local browser guide", zh: "本地浏览器指南" },
+    },
+    {
+      surface: { en: "CodeWhale GUI (VS Code)", zh: "CodeWhale GUI（VS Code）" },
+      status: { en: "Available", zh: "可用" },
+      detail: {
+        en: "A separate community project: the graphical frontend for the same engine, with chat, threads, and file changes in a VS Code sidebar over the local Runtime. Install it from the VS Code Marketplace; the source is on GitHub.",
+        zh: "独立的社区项目：同一引擎的图形前端，在 VS Code 侧边栏中进行对话、管理线程并查看文件变更，连接本地 Runtime。可从 VS Code Marketplace 安装；源码见 GitHub。",
+      },
+      href: "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode",
+      linkLabel: { en: "VS Code Marketplace", zh: "VS Code Marketplace" },
     },
     {
       surface: { en: "Hosted web app", zh: "托管网页应用" },

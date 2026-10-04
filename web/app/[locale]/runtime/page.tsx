@@ -64,6 +64,15 @@ const INTEGRATIONS: Integration[] = [
     href: "https://github.com/Hmbown/CodeWhale/tree/main/extensions/vscode",
   },
   {
+    name: "CodeWhale GUI (VS Code)",
+    icon: "monitor",
+    desc: {
+      en: "The community-maintained graphical frontend, in a separate repository: chat, threads, live file changes, and task tracking in a VS Code sidebar over this Runtime API. Install it from the VS Code Marketplace; the source is on GitHub.",
+      zh: "社区维护的图形前端，位于独立仓库：在 VS Code 侧边栏中基于此 Runtime API 进行对话、管理线程、查看实时文件变更与任务进度。可从 VS Code Marketplace 安装；源码见 GitHub。",
+    },
+    href: "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode",
+  },
+  {
     name: "Telegram Bridge",
     icon: "message",
     desc: {
