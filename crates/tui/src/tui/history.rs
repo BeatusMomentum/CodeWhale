@@ -1090,14 +1090,10 @@ impl ExecCell {
             return wrap_card_rail(lines, self.status);
         }
 
-        // A successful shell call does not earn its full body in live mode —
-        // failures stay fully verbose so errors remain visible, and Transcript
-        // mode keeps everything for the pager/clipboard. But it does earn a
-        // glimpse: collapsing success to the bare header meant a `run` card
-        // showed literally nothing of what the command produced, and you had
-        // to expand every single one to find out whether anything happened.
-        // `TOOL_SUCCESS_OUTPUT_PREVIEW_LINES` rows show roughly half of real
-        // successful runs in full and the opening of the rest.
+        // Routine successes get a three-row glimpse (two opening rows plus
+        // the tail) so they take less space in the live transcript. Failures
+        // keep their larger preview, and Transcript mode retains the full
+        // result for the pager and clipboard.
         if mode == RenderMode::Live
             && self
                 .output
