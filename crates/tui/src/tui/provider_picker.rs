@@ -597,7 +597,18 @@ impl ProviderDashboardRow {
                     provider,
                     identity: None,
                     provider_id: provider_id.clone(),
+                    // The blank `Custom` catalog slot is not a configured route,
+                    // so admission fails by design; it keeps its catalog label.
                     display_name: presentation
+                        .or_else(|| {
+                            (provider == ProviderKind::Custom && configured.is_none())
+                                .then(|| {
+                                    codewhale_config::descriptors::compatibility_for_id(
+                                        &provider_id,
+                                    )
+                                })
+                                .flatten()
+                        })
                         .map(|row| row.label.to_string())
                         .unwrap_or_else(|| format!("{provider_id} (custom)")),
                     kind: configured
@@ -1027,6 +1038,9 @@ impl ProviderDashboardRow {
                 // A row you cannot use yet says what it needs, once. The
                 // bundled-model count beside it only repeated itself down a
                 // fifty-row list; the Details pane still carries it.
+                if self.is_custom_placeholder() {
+                    return "needs endpoint".to_string();
+                }
                 match self.readiness {
                     ResolvedProviderReadiness::MissingKey => return "needs key".to_string(),
                     ResolvedProviderReadiness::MissingLogin => return "needs sign-in".to_string(),
@@ -1041,6 +1055,14 @@ impl ProviderDashboardRow {
             }
             ProviderListView::Local => format!("local · {}", self.default_route.logical_model),
         }
+    }
+
+    /// The blank `Custom` slot: Enter opens the endpoint form (see
+    /// `activate_selected_row`), so it is neither a broken route nor legacy.
+    fn is_custom_placeholder(&self) -> bool {
+        self.provider == ProviderKind::Custom
+            && !self.is_configured
+            && provider_descriptor(&self.provider_id).is_none()
     }
 
     fn catalog_label(&self) -> String {
@@ -2721,7 +2743,9 @@ impl ProviderPickerView {
     }
 
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
-        let enter_action = if !self.selected_route_is_valid() {
+        let enter_action = if self.rows[self.selected_idx].is_custom_placeholder() {
+            self.tr(MessageId::PickerActionCustom)
+        } else if !self.selected_route_is_valid() {
             self.tr(MessageId::PickerActionUnavailable)
         } else if self.selected_has_key() {
             self.tr(MessageId::PickerActionApply)
@@ -5733,6 +5757,25 @@ mod tests {
             }
             other => panic!("expected custom provider submit event, got {other:?}"),
         }
+    }
+
+    /// First-run catalog: the blank Custom slot fails route admission by
+    /// design, but it is the way into the endpoint form, not a legacy route.
+    #[test]
+    fn blank_custom_slot_reads_as_setup_not_legacy() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ProviderKind::Deepseek, &config);
+        let row = picker
+            .rows
+            .iter()
+            .find(|row| row.provider_id == ProviderKind::Custom.as_str())
+            .expect("blank custom slot");
+        assert_eq!(row.display_name, "Custom (OpenAI-compatible)");
+        assert!(row.is_custom_placeholder());
+        assert_eq!(
+            row.list_row_hint(ProviderListView::Catalog),
+            "needs endpoint"
+        );
     }
 
     #[test]
