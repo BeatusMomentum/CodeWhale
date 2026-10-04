@@ -297,7 +297,11 @@ impl MemoryEnforcement {
 /// not in CI: under `RLIMIT_DATA` Node 24 aborts when it creates the host's
 /// watchdog Worker at 512 MiB, and Bun 1.4 aborts at startup at 256 MiB.
 /// Both started and ran at 1 GiB and failed an allocation past it. An idle
-/// host used 34–67 MB resident.
+/// host used 34–67 MB resident. On hosted x64 Linux (Node 24.21) each V8
+/// isolate's executable code range is charged to `RLIMIT_DATA` in full, and
+/// a default-sized second isolate aborted the host at this cap; the
+/// watchdog Worker therefore asks for a 16 MiB code range (`src/main.ts`).
+/// Plugins cannot start Workers (`denyNativeCode`), so it is the only one.
 pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 
 /// Runtime flags, before the bundle path. Keep in sync with

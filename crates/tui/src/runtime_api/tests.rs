@@ -1162,15 +1162,30 @@ fn spawn_product_stack_server(
                             .expect("nonblocking test listener");
                         let listener =
                             TcpListener::from_std(listener).expect("register test listener");
+                        // Stop the owner the way the product does: trigger its
+                        // shutdown and await it while this runtime is alive, so
+                        // the owner receipt is retired before the thread exits.
+                        let owner_handle =
+                            owner_frontend.as_ref().map(|owner| owner.shutdown_handle());
+                        let mut owner_task =
+                            owner_frontend.map(|owner| tokio::spawn(owner.serve()));
                         tokio::select! {
                             _ = serve_runtime_api(listener, app, shutdown) => {}
                             _ = shutdown_rx => {}
                             _ = async {
-                                match owner_frontend {
-                                    Some(owner) => { let _ = owner.serve().await; }
+                                match owner_task.as_mut() {
+                                    Some(task) => { let _ = task.await; }
                                     None => std::future::pending::<()>().await,
                                 }
-                            } => {}
+                            } => {
+                                owner_task = None;
+                            }
+                        }
+                        if let Some(handle) = owner_handle {
+                            handle.trigger();
+                        }
+                        if let Some(task) = owner_task {
+                            let _ = task.await;
                         }
                     }
                     Ok(None) => {
@@ -23006,12 +23021,21 @@ async fn mcp_server_management_blocks_credential_retargeting() -> Result<()> {
     Ok(())
 }
 
+/// Like `error_for_status`, but keeps the server's `ApiError` body so a hosted
+/// failure names the refusing handler instead of only its status.
+async fn mcp_test_success(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let url = response.url().clone();
+    let body = response.text().await.unwrap_or_default();
+    bail!("{status} for {url}: {body}")
+}
+
 async fn mcp_test_revision(client: &reqwest::Client, base: &str) -> Result<String> {
-    let listing: Value = client
-        .get(base)
-        .send()
+    let listing: Value = mcp_test_success(client.get(base).send().await?)
         .await?
-        .error_for_status()?
         .json()
         .await?;
     Ok(format!(

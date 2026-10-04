@@ -1120,13 +1120,15 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
     // persisted global mutation settles. No pool replacement or replay occurs.
     let pending = selected_pool.lock().await;
     let base = format!("http://{original}/v1/apps/mcp/servers");
-    client
-        .post(&base)
-        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
-        .json(&json!({"name":"scope-proof","command":"scope-proof-never-executed"}))
-        .send()
-        .await?
-        .error_for_status()?;
+    mcp_test_success(
+        client
+            .post(&base)
+            .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+            .json(&json!({"name":"scope-proof","command":"scope-proof-never-executed"}))
+            .send()
+            .await?,
+    )
+    .await?;
     assert!(!pending.server_names().contains(&"scope-proof".to_string()));
     drop(pending);
     for (method, suffix, body) in [
@@ -1147,14 +1149,16 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
             if let Some(body) = body {
                 request = request.json(&body);
             }
-            request.send().await?.error_for_status()?;
+            mcp_test_success(request.send().await?).await?;
         }
         for address in [original, first_ready.endpoint, second_ready.endpoint] {
-            client
-                .get(format!("http://{address}/v1/apps/mcp/servers"))
-                .send()
-                .await?
-                .error_for_status()?;
+            mcp_test_success(
+                client
+                    .get(format!("http://{address}/v1/apps/mcp/servers"))
+                    .send()
+                    .await?,
+            )
+            .await?;
         }
         let generation = scopes
             .mcp_generation

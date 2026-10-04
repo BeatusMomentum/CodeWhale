@@ -134,7 +134,12 @@ const watchdog = new Worker(
     if (process.ppid === parent) return
     try { process.kill(workerData.group ? -workerData.pid : workerData.pid, 'SIGKILL') } catch {}
   }, 500)`,
-  { eval: true, workerData: { pid: process.pid, group: OWN_GROUP }, resourceLimits: { maxOldGenerationSizeMb: 8 } },
+  // A Worker isolate reserves its own executable code range. On Linux x64
+  // with Node 24 that reservation is charged in full to the host's 1 GiB
+  // RLIMIT_DATA cap, so a default-sized range aborted the host at startup
+  // ("Failed to reserve virtual memory for CodeRange"). This loop needs
+  // almost no generated code.
+  { eval: true, workerData: { pid: process.pid, group: OWN_GROUP }, resourceLimits: { maxOldGenerationSizeMb: 8, codeRangeSizeMb: 16 } },
 )
 watchdog.unref()
 

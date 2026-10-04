@@ -855,8 +855,10 @@ fn validate_windows_handle_path(
 
     // Compare the current selection to the captured object, not its lexical
     // spelling: Windows can select the same object through an 8.3 short name.
-    // Keep every selected parent open without delete sharing until comparison
-    // finishes, and refuse reparse points at every component.
+    // Reparse points are refused at every component. These attribute-only
+    // handles do not pin the path (they bypass share checks); a component
+    // swapped mid-walk either fails to open or selects a different identity,
+    // which this comparison refuses.
     let components = open_windows_selected_components(expected, expect_directory)?;
     let selected = components
         .last()

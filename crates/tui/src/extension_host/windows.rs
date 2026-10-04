@@ -336,6 +336,10 @@ fn enqueue_pinned_children(
     pending.extend(children.into_iter().map(|child| (child, pin.clone())));
     Ok(())
 }
+/// Name the admission step in an error, so a refusal says where it stopped.
+fn in_step<T>(step: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|error| io::Error::new(error.kind(), format!("{step}: {error}")))
+}
 fn acl_file(path: &Path) -> io::Result<File> {
     acl_file_with_share(path, 1)
 }
@@ -370,7 +374,7 @@ impl NativeSandbox {
             let profile = Arc::new(Profile::create()?);
             let parent = home.join("extension-host").join("native-launch");
             fs::create_dir_all(&parent)?;
-            let _parent = WindowsDirectory::open(&parent)?;
+            let _parent = in_step("pin launch parent", WindowsDirectory::open(&parent))?;
             let assets = Arc::new(
                 tempfile::Builder::new()
                     .prefix("host-")
@@ -380,12 +384,18 @@ impl NativeSandbox {
             // The selected runtime is copied, never granted access in an
             // installation/user directory. Pin its opened bytes while copying.
             let original = runtime.path.canonicalize()?;
-            let source_pin = WindowsDirectory::open(
-                original
-                    .parent()
-                    .ok_or_else(|| io::Error::other("runtime has no parent"))?,
+            let source_pin = in_step(
+                "pin runtime directory",
+                WindowsDirectory::open(
+                    original
+                        .parent()
+                        .ok_or_else(|| io::Error::other("runtime has no parent"))?,
+                ),
             )?;
-            let mut source = crate::plugins::manifest::open_bundle_file(&original)?;
+            let mut source = in_step(
+                "open runtime",
+                crate::plugins::manifest::open_bundle_file(&original),
+            )?;
             if source.metadata()?.len() > 512 * 1024 * 1024 {
                 return Err(io::Error::other(
                     "selected runtime exceeds 512 MiB launch limit",
@@ -405,13 +415,19 @@ impl NativeSandbox {
                 program,
                 data: data.to_path_buf(),
             };
-            sandbox.grant_tree(sandbox._assets.path(), false)?;
+            in_step(
+                "grant runtime copy",
+                sandbox.grant_tree(sandbox._assets.path(), false),
+            )?;
             // Exact canonical bundle file only: never recursively grant its
             // parent, which also contains the Builtin's private data.
-            sandbox.grant_file(bundle, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, true)?;
+            in_step(
+                "grant host bundle",
+                sandbox.grant_file(bundle, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, true),
+            )?;
             fs::create_dir_all(data.join("tmp"))?;
-            sandbox.grant_tree(data, true)?;
-            sandbox.probe(runtime, memory_cap)?;
+            in_step("grant data directory", sandbox.grant_tree(data, true))?;
+            in_step("isolation probe", sandbox.probe(runtime, memory_cap))?;
             Ok(sandbox)
         };
         work().map_err(|error| format!("Windows Native isolation could not be verified: {error}"))
@@ -488,7 +504,10 @@ impl NativeSandbox {
     }
 
     // The owning grant entrypoint holds ACL_EDITS. Tree files reuse the parent
-    // chain rather than reopen MAXIMUM_ALLOWED directory objects.
+    // chain rather than reopen MAXIMUM_ALLOWED directory objects. The
+    // child_path comparison is only a lexical invariant; the protection is the
+    // held no-write/no-delete parent chain plus acl_file's no-follow,
+    // regular, single-link checks.
     fn grant_pinned_file(
         &self,
         parent_pin: &WindowsDirectory,
@@ -807,10 +826,20 @@ fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    for class in [TokenIsAppContainer, TokenIsLessPrivilegedAppContainer] {
+    // Both flags must be exactly 1. Report each observation, so a refusal
+    // says which property the kernel did not confirm.
+    let mut observed = Vec::new();
+    let mut confirmed = true;
+    for (name, class) in [
+        ("TokenIsAppContainer", TokenIsAppContainer),
+        (
+            "TokenIsLessPrivilegedAppContainer",
+            TokenIsLessPrivilegedAppContainer,
+        ),
+    ] {
         let mut value = 0_u32;
         let mut read = 0;
-        if unsafe {
+        let queried = unsafe {
             GetTokenInformation(
                 token.as_raw_handle(),
                 class,
@@ -818,11 +847,22 @@ fn verify_token(process: &OwnedHandle, sid: PSID) -> io::Result<()> {
                 size_of::<u32>() as u32,
                 &mut read,
             )
-        } == 0
-            || value != 1
-        {
-            return Err(io::Error::other("Windows refused the required LPAC token"));
+        } != 0;
+        if queried {
+            observed.push(format!("{name}={value}"));
+        } else {
+            observed.push(format!(
+                "{name} query failed: {}",
+                io::Error::last_os_error()
+            ));
         }
+        confirmed &= queried && value == 1;
+    }
+    if !confirmed {
+        return Err(io::Error::other(format!(
+            "Windows refused the required LPAC token ({})",
+            observed.join(", ")
+        )));
     }
     // Variable-size token buffers are aligned for their SDK structs.
     for class in [TokenAppContainerSid, TokenCapabilities] {

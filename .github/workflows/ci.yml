@@ -494,7 +494,10 @@ jobs:
   lint:
     name: Lint
     needs: changes
-    timeout-minutes: 45
+    # Measured on 89ee629e with runner headroom: clippy 10 min, runtime-contract
+    # budget 16 min, and persistence-backlog still running at the old 45-minute
+    # cancellation. Commands, filters and budgets are unchanged.
+    timeout-minutes: 75
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
