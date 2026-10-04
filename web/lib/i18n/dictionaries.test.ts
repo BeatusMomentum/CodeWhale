@@ -398,7 +398,7 @@ describe("website dictionaries", () => {
       const home = getHome(locale);
       expect(home.gain, `${locale} gain`).toHaveLength(3);
       expect(home.modelsFacts, `${locale} modelsFacts`).toHaveLength(3);
-      expect(home.availability, `${locale} availability`).toHaveLength(4);
+      expect(home.availability, `${locale} availability`).toHaveLength(5);
       expect(home.surfaces, `${locale} surfaces`).toHaveLength(5);
       for (const row of [...home.gain, ...home.modelsFacts, ...home.availability, ...home.surfaces]) {
         for (const cell of row) {

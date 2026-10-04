@@ -66,12 +66,17 @@ export const home: HomeDict = {
   chapterAvailability: "Nerede çalışır",
   availabilityHeading: "Codewhale'i nerelerde kullanabilirsin",
   availabilityLede:
-    "Biz web uygulamasını, masaüstü uygulamasını ve bulut bilgisayarlarını geliştirirken sen Codewhale'i bugün terminalinde kullanabilirsin.",
+    "Biz web uygulamasını, masaüstü uygulamasını ve bulut bilgisayarlarını geliştirirken sen Codewhale'i bugün terminalinde, yerel tarayıcında ve topluluk tarafından sürdürülen CodeWhale GUI ile kullanabilirsin.",
   availability: [
     [
       "Terminal",
       "Yayınlandı",
       "Linux, macOS ve Windows için GitHub sürüm ikili dosyaları; npm ve Cargo alternatiflerdir. Termux üzerinde Android desteği önizleme aşamasında."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Kullanılabilir",
+      "Topluluk tarafından sürdürülen grafik arayüz, ayrı bir projede: aynı Runtime üzerinde VS Code kenar çubuğunda sohbet, konu başlıkları ve dosya değişiklikleri. VS Code Marketplace'ten kur."
     ],
     [
       "Web uygulaması",
@@ -90,7 +95,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Terminali Codewhale hesabı olmadan kullanabilirsin; barındırılan model kullanımını ise sağlayıcın faturalandırır.",
+    "Terminali ve grafik arayüzü Codewhale hesabı olmadan kullanabilirsin; barındırılan model kullanımını ise sağlayıcın faturalandırır.",
   accountLink: "Hesap oluştur",
   surfacesHeading: "Codewhale ile çalışma yolları",
   surfaces: [

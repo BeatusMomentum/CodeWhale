@@ -104,12 +104,17 @@
     "startVocabularyLink": "查名词",
     "chapterAvailability": "在哪里运行",
     "availabilityHeading": "你可以在哪里使用 Codewhale",
-    "availabilityLede": "终端与本地浏览器客户端现已可用。桌面和托管网页应用正基于同一会话模型开发；各端的开放状态分别列在下方。",
+    "availabilityLede": "终端、本地浏览器客户端与社区维护的 CodeWhale GUI 现已可用。桌面和托管网页应用正基于同一会话模型开发；各端的开放状态分别列在下方。",
     "availability": [
       [
         "终端与本地浏览器",
         "已发布",
         "支持 Linux、macOS 和 Windows。运行 codewhale 使用终端，或运行 codewhale web 打开本地浏览器客户端。也可通过 npm 或 Cargo 安装；Android 上的 Termux 版本为预览版。"
+      ],
+      [
+        "CodeWhale GUI（VS Code）",
+        "可用",
+        "社区维护的图形前端，独立项目：在 VS Code 侧边栏中连接同一个 Codewhale Runtime，进行对话、管理线程并查看文件变更。可从 VS Code Marketplace 安装。"
       ],
       [
         "托管网页应用",
@@ -127,7 +132,7 @@
         "用于运行任务的托管计算机。"
       ]
     ],
-    "availabilityNote": "终端和本地浏览器不需要 Codewhale 账户。账户用于托管网页和桌面端访问，不能代替模型连接。使用自己的密钥调用云端模型时，费用由该提供商收取。",
+    "availabilityNote": "终端、本地浏览器和 GUI 不需要 Codewhale 账户。账户用于托管网页和桌面端访问，不能代替模型连接。使用自己的密钥调用云端模型时，费用由该提供商收取。",
     "accountLink": "创建账户",
     "surfacesHeading": "工具、应用连接与保存的工作",
     "surfaces": [

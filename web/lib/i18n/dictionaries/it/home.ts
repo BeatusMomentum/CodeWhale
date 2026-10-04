@@ -65,12 +65,17 @@ export const home: HomeDict = {
   chapterAvailability: "Dove funziona",
   availabilityHeading: "Dove puoi usare Codewhale",
   availabilityLede:
-    "Puoi già usare Codewhale nel tuo terminale mentre sviluppiamo l’app web, l’app desktop e i computer cloud.",
+    "Puoi già usare Codewhale nel terminale, nel browser locale e con l’interfaccia grafica CodeWhale GUI mantenuta dalla comunità, mentre sviluppiamo l’app web, l’app desktop e i computer cloud.",
   availability: [
     [
       "Terminale",
       "Rilasciato",
       "Binari delle versioni pubblicate su GitHub per Linux, macOS e Windows; npm e Cargo sono alternative. Android su Termux è disponibile in anteprima."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Disponibile",
+      "Interfaccia grafica mantenuta dalla comunità, in un progetto separato: chat, thread e modifiche ai file in una barra laterale di VS Code sullo stesso Runtime. Installala dal VS Code Marketplace."
     ],
     [
       "App web",
@@ -89,7 +94,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Puoi usare il terminale senza un account Codewhale, e qualsiasi utilizzo di modelli ospitati viene fatturato dal tuo provider.",
+    "Puoi usare il terminale e l’interfaccia grafica senza un account Codewhale, e qualsiasi utilizzo di modelli ospitati viene fatturato dal tuo provider.",
   accountLink: "Crea un account",
   surfacesHeading: "Modi di lavorare con Codewhale",
   surfaces: [

@@ -22,9 +22,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
 // Row order is fixed by PRODUCT_COPY and the home dictionary, so marks and
 // states follow the row, not a translated word.
 const GAIN_ICONS: IconName[] = ["layers", "users", "shield"];
-// Terminal released · local browser ships with it · hosted web preview ·
-// desktop development build · cloud computers in development.
-const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
+// Terminal released · local browser ships with it · CodeWhale GUI
+// available · hosted web preview · desktop development build · cloud
+// computers in development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "ready", "attention", "idle", "idle"];
 
 /**
  * /product — what Codewhale is and what a person gains, with availability
@@ -145,9 +146,20 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
                   {row.href && row.linkLabel && (
                     <>
                       {" "}
-                      <Link href={`/${locale}${row.href}`} className="link">
-                        {t(row.linkLabel)}
-                      </Link>
+                      {row.href.startsWith("http") ? (
+                        <a
+                          href={row.href}
+                          className="link"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          {t(row.linkLabel)}
+                        </a>
+                      ) : (
+                        <Link href={`/${locale}${row.href}`} className="link">
+                          {t(row.linkLabel)}
+                        </Link>
+                      )}
                     </>
                   )}
                 </dd>

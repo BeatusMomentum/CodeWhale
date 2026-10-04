@@ -74,12 +74,17 @@ export const home: HomeDict = {
   chapterAvailability: "Where it runs",
   availabilityHeading: "Where you can use Codewhale",
   availabilityLede:
-    "The terminal and local browser client are available now. Desktop and hosted web apps are being developed around the same session model; their availability is listed separately below.",
+    "The terminal, the local browser client, and the community CodeWhale GUI are available now. Desktop and hosted web apps are being developed around the same session model; their availability is listed separately below.",
   availability: [
     [
       "Terminal and local browser",
       "Released",
       "Install on Linux, macOS, or Windows. Run codewhale in your terminal, or codewhale web for the local browser client. npm and Cargo are alternatives; Android on Termux is a preview.",
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Available",
+      "The community-maintained graphical frontend, a separate project: chat, threads, and file changes in a VS Code sidebar over the same Codewhale Runtime. Install it from the VS Code Marketplace.",
     ],
     [
       "Hosted web app",
@@ -98,7 +103,7 @@ export const home: HomeDict = {
     ],
   ],
   availabilityNote:
-    "The terminal and local browser do not require a Codewhale account. An account is used for hosted web and desktop access; it does not replace your model connection. Hosted model usage with your own key is billed by that provider.",
+    "The terminal, local browser, and GUI do not require a Codewhale account. An account is used for hosted web and desktop access; it does not replace your model connection. Hosted model usage with your own key is billed by that provider.",
   accountLink: "Create an account",
 
   surfacesHeading: "Tools, connected apps, and saved work",

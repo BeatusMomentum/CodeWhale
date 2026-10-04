@@ -30,8 +30,9 @@ export const revalidate = 300;
 // Row order is shared by every locale's `gain` and `availability` lists, so
 // the marks and states follow the row, not a word.
 const GAIN_ICONS: IconName[] = ["terminal", "repeat", "shield"];
-// Released · development preview · development build · in development.
-const AVAILABILITY_TONES: StatusTone[] = ["ready", "attention", "idle", "idle"];
+// Released · GUI available · development preview · development build · in
+// development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
 
 /**
  * The whale-road homepage: the promise and the install plate in the sky over

@@ -66,12 +66,17 @@ export const home: HomeDict = {
   chapterAvailability: "On funciona",
   availabilityHeading: "On pots fer servir Codewhale",
   availabilityLede:
-    "Ja pots fer servir Codewhale al teu terminal mentre desenvolupem l’aplicació web, l’aplicació d’escriptori i els ordinadors al núvol.",
+    "Ja pots fer servir Codewhale al terminal, al navegador local i amb la interfície CodeWhale GUI mantinguda per la comunitat, mentre desenvolupem l’aplicació web, l’aplicació d’escriptori i els ordinadors al núvol.",
   availability: [
     [
       "Terminal",
       "Publicat",
       "Binaris de les versions publicades a GitHub per a Linux, macOS i Windows; npm i Cargo són alternatives. Android amb Termux és una vista prèvia."
+    ],
+    [
+      "CodeWhale GUI (VS Code)",
+      "Disponible",
+      "Interfície gràfica mantinguda per la comunitat, en un projecte a part: xat, fils i canvis de fitxers en una barra lateral del VS Code sobre el mateix Runtime. Instal·la-la des del VS Code Marketplace."
     ],
     [
       "Aplicació web",
@@ -90,7 +95,7 @@ export const home: HomeDict = {
     ]
   ],
   availabilityNote:
-    "Pots fer servir el terminal sense un compte de Codewhale, i el teu proveïdor factura qualsevol ús de models allotjats.",
+    "Pots fer servir el terminal i la interfície gràfica sense un compte de Codewhale, i el teu proveïdor factura qualsevol ús de models allotjats.",
   accountLink: "Crear un compte",
   surfacesHeading: "Maneres de treballar amb Codewhale",
   surfaces: [
