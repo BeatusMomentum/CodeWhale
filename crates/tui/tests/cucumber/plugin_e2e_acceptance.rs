@@ -1103,3 +1103,78 @@ async fn run_scenario(name: &'static str, expected_steps: usize) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A continued session must stay resumable: resume it, run a turn, quit, and
+/// resume again, twice. The second resume used to fail for good with "saved
+/// holder checkpoint does not cover the full source" (0.10.1 QA), because the
+/// runtime holder mounted by the first resume stayed behind the document the
+/// resumed turn was saved to.
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[test]
+fn a_continued_session_resumes_again_after_each_turn() {
+    let workspace = make_sealed_workspace().expect("sealed workspace");
+    let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
+    let launch = |args: &[&str]| {
+        Harness::builder(Harness::codewhale_binary())
+            .cwd(workspace.workspace())
+            .clear_env()
+            .seal_home(workspace.home())
+            .env("DEEPSEEK_API_KEY", "sealed-resume-acceptance-key")
+            .env("DEEPSEEK_BASE_URL", &base_url)
+            .env("DEEPSEEK_MODEL", "deepseek-v4-pro")
+            .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
+            .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+            .env("NO_ANIMATIONS", "1")
+            .env("RUST_LOG", "warn")
+            .args(args.iter().copied())
+            .size(40, 160)
+            .spawn()
+            .expect("start TUI")
+    };
+    let workspace_arg = workspace.workspace().to_str().expect("workspace UTF-8");
+    let mut tui = launch(&[
+        "--workspace",
+        workspace_arg,
+        "--no-project-config",
+        "--skip-onboarding",
+        "--fresh",
+    ]);
+    begin_new_session_from_startup(&mut tui);
+    expect_visible(&mut tui, "binary fixture acknowledged", "first reply");
+    wait_for_composer_ready(&mut tui);
+    submit_tui_command(&mut tui, "/exit");
+    assert_eq!(tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT), Some(0));
+    let _ = tui.shutdown();
+
+    for round in 1..=2 {
+        let mut tui = launch(&["resume", "--last"]);
+        if tui
+            .wait_for_text("Resumed session", BINARY_ACCEPTANCE_TIMEOUT)
+            .is_err()
+        {
+            panic!(
+                "resume {round} of a continued session failed\n{}",
+                short_diagnostics(&mut tui, None)
+            );
+        }
+        wait_for_composer_ready(&mut tui);
+        let prompt = format!("continue round {round}");
+        tui.type_line(&prompt).expect("send the resumed turn");
+        expect_visible(&mut tui, &prompt, "resumed prompt");
+        tui.wait_for_idle(
+            std::time::Duration::from_millis(500),
+            BINARY_ACCEPTANCE_TIMEOUT,
+        )
+        .expect("resumed turn settles");
+        wait_for_composer_ready(&mut tui);
+        submit_tui_command(&mut tui, "/exit");
+        assert_eq!(
+            tui.wait_for_exit(BINARY_ACCEPTANCE_TIMEOUT),
+            Some(0),
+            "round {round} exits cleanly"
+        );
+        let _ = tui.shutdown();
+    }
+    let _ = shutdown_tx.send(());
+    let _ = model_thread.join();
+}

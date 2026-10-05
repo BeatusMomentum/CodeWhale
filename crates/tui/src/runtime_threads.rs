@@ -15520,6 +15520,17 @@ impl RuntimeThreadManager {
         self.store.save_thread(&stored)
     }
 
+    /// Release a canonical holder whose saved document has moved past it, using
+    /// the same compare-and-swap unbind and reconcile receipt as a stale
+    /// binding found while restoring messages.
+    pub(crate) fn release_stale_session_holder(
+        &self,
+        thread: &ThreadRecord,
+        reason: &str,
+    ) -> Result<()> {
+        self.unbind_stale_session(thread, reason)
+    }
+
     /// Unbind every thread in this store that names `session_id` (#6144).
     /// Called when that document is deleted: the threads keep their turns and
     /// hydrate from them instead of failing with "Cannot read saved session".
