@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Spanish home dictionary — native copy for the Tidal Folio landing page,
+ * Spanish home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "Dónde funciona",
   availabilityHeading: "Dónde puedes usar Codewhale",
   availabilityLede:
-    "Ya puedes usar Codewhale en tu terminal, en el navegador local y con la interfaz gráfica CodeWhale GUI mantenida por la comunidad, mientras desarrollamos la aplicación web, la aplicación de escritorio y las computadoras en la nube.",
+    "Ya puedes usar Codewhale en la terminal, en el navegador local y con la interfaz gráfica CodeWhale GUI mantenida por la comunidad. La aplicación de escritorio se está convirtiendo en el cliente principal de Codewhale y la aplicación web alojada se está reconstruyendo para igualarla; ambas comparten el mismo modelo de sesión, y su disponibilidad se indica a continuación.",
   availability: [
     [
       "Terminal",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "Aplicación web",
       "Vista previa de desarrollo",
-      "Acceso a la cuenta y vinculación con el navegador en la vista previa de desarrollo."
+      "Se está reconstruyendo para igualar la aplicación de escritorio. Hoy puedes iniciar sesión y luego escribir /rc en una sesión de terminal en ejecución para continuarla desde la web. La ejecución de tareas alojadas aún se está validando."
     ],
     [
       "Escritorio",
       "Build de desarrollo",
-      "La aplicación para macOS está en desarrollo; la descarga pública llegará más adelante."
+      "La aplicación nativa que se está convirtiendo en el cliente principal de Codewhale: carpetas, conversaciones y conexiones de modelos en una sola ventana de escritorio. La descarga pública llegará más adelante."
     ],
     [
       "Computadoras en la nube",

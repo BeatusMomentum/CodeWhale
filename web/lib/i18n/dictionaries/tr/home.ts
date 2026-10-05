@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Turkish home dictionary — native copy for the Tidal Folio landing page,
+ * Turkish home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "Nerede çalışır",
   availabilityHeading: "Codewhale'i nerelerde kullanabilirsin",
   availabilityLede:
-    "Biz web uygulamasını, masaüstü uygulamasını ve bulut bilgisayarlarını geliştirirken sen Codewhale'i bugün terminalinde, yerel tarayıcında ve topluluk tarafından sürdürülen CodeWhale GUI ile kullanabilirsin.",
+    "Terminal, yerel tarayıcı istemcisi ve topluluk tarafından sürdürülen CodeWhale GUI şu anda kullanılabilir. Masaüstü uygulaması Codewhale'in ana istemcisi haline geliyor, barındırılan web uygulaması da ona uyacak şekilde yeniden yapılıyor; ikisi de aynı oturum modelini paylaşıyor ve kullanılabilirlikleri aşağıda listelenmiştir.",
   availability: [
     [
       "Terminal",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "Web uygulaması",
       "Geliştirme önizlemesi",
-      "Geliştirme önizlemesinde hesap erişimi ve tarayıcı eşleştirme."
+      "Masaüstü uygulamasına uyacak şekilde yeniden yapılıyor. Bugün oturum açabilir, ardından çalışan bir terminal oturumuna /rc yazarak onu web üzerinden sürdürebilirsin. Barındırılan görev yürütme hâlâ doğrulanıyor."
     ],
     [
       "Masaüstü",
       "Geliştirme sürümü",
-      "macOS uygulaması geliştirme aşamasında; herkese açık indirme daha sonra sunulacak."
+      "Codewhale'in ana istemcisi haline gelen yerel uygulama: klasörler, sohbetler ve model bağlantıları tek bir masaüstü penceresinde. Herkese açık indirme daha sonra sunulacak."
     ],
     [
       "Bulut bilgisayarları",

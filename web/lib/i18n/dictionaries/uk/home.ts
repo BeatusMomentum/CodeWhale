@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Ukrainian home dictionary — native copy for the Tidal Folio landing page,
+ * Ukrainian home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -65,7 +65,7 @@ export const home: HomeDict = {
   chapterAvailability: "Де працює",
   availabilityHeading: "Де можна користуватися Codewhale",
   availabilityLede:
-    "Ви вже можете користуватися Codewhale у терміналі, в локальному браузері та в графічному інтерфейсі CodeWhale GUI, який підтримує спільнота, поки ми розробляємо вебзастосунок, настільний застосунок і хмарні комп’ютери.",
+    "Ви вже можете користуватися Codewhale у терміналі, в локальному браузері та в графічному інтерфейсі CodeWhale GUI, який підтримує спільнота. Настільний застосунок стає основним клієнтом Codewhale, а вебзастосунок перебудовують за його зразком; у них спільна модель сесій, а їхню доступність указано нижче.",
   availability: [
     [
       "Термінал",
@@ -81,12 +81,12 @@ export const home: HomeDict = {
     [
       "Вебзастосунок",
       "Попередня версія в розробці",
-      "Доступ до облікового запису й підключення браузера в попередній версії, яка перебуває в розробці."
+      "Перебудовується за зразком настільного застосунку. Зараз можна увійти в обліковий запис і ввести /rc у запущеній терміналовій сесії, щоб продовжити її у вебі. Виконання завдань у хмарі досі проходить перевірку."
     ],
     [
       "Настільний застосунок",
       "Збірка в розробці",
-      "Застосунок для macOS перебуває в розробці; загальнодоступне завантаження з’явиться пізніше."
+      "Нативний застосунок, який стає основним клієнтом Codewhale: теки, розмови та підключення моделей в одному вікні. Загальнодоступне завантаження з’явиться пізніше."
     ],
     [
       "Хмарні комп’ютери",

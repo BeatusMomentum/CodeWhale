@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Indonesian home dictionary — native copy for the Tidal Folio landing page,
+ * Indonesian home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -67,7 +67,7 @@ export const home: HomeDict = {
   availabilityHeading:
     "Tempat Anda dapat menggunakan Codewhale",
   availabilityLede:
-    "Anda dapat menggunakan Codewhale di terminal, di peramban lokal, dan dengan antarmuka CodeWhale GUI yang dipelihara oleh komunitas sekarang, sementara kami mengembangkan aplikasi web, aplikasi desktop, dan komputer cloud.",
+    "Terminal, klien peramban lokal, dan CodeWhale GUI yang dipelihara komunitas sudah tersedia sekarang. Aplikasi desktop sedang menjadi klien utama Codewhale, dan aplikasi web hosted sedang dibangun ulang agar sesuai; keduanya berbagi model sesi yang sama, dan ketersediaannya tercantum di bawah.",
   availability: [
     [
       "Terminal",
@@ -83,12 +83,12 @@ export const home: HomeDict = {
     [
       "Aplikasi web",
       "Pratinjau pengembangan",
-      "Akses akun dan penautan peramban dalam pratinjau pengembangan."
+      "Sedang dibangun ulang agar sesuai dengan aplikasi desktop. Saat ini Anda dapat masuk, lalu mengetik /rc di sesi terminal yang sedang berjalan untuk melanjutkannya dari web. Eksekusi tugas hosted masih dalam kualifikasi."
     ],
     [
       "Desktop",
       "Build pengembangan",
-      "Aplikasi macOS masih dalam pengembangan; unduhan untuk publik akan tersedia nanti."
+      "Aplikasi native yang sedang menjadi klien utama Codewhale: folder, percakapan, dan koneksi model dalam satu jendela desktop. Unduhan untuk publik akan tersedia nanti."
     ],
     [
       "Komputer cloud",

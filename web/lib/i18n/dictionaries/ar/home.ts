@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Arabic home dictionary — native copy for the Tidal Folio landing page,
+ * Arabic home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "أين يعمل",
   availabilityHeading: "أين يمكنك استخدام Codewhale",
   availabilityLede:
-    "يمكنك استخدام الطرفية والمتصفح المحلي وواجهة CodeWhale GUI التي يصونها المجتمع اليوم، بينما نعمل على تطوير تطبيق الويب وتطبيق سطح المكتب وأجهزة الكمبيوتر السحابية.",
+    "الطرفية وعميل المتصفح المحلي وواجهة CodeWhale GUI التي يصونها المجتمع متاحة الآن. يتحول تطبيق سطح المكتب إلى العميل الرئيسي لـ Codewhale، ويُعاد بناء تطبيق الويب المستضاف ليطابقه؛ وكلاهما يشترك في نموذج الجلسات نفسه، وتتوفر حالة إتاحتهما أدناه.",
   availability: [
     [
       "الطرفية",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "تطبيق الويب",
       "معاينة قيد التطوير",
-      "الوصول إلى الحساب وإقران المتصفح ضمن المعاينة قيد التطوير."
+      "يُعاد بناؤه ليطابق تطبيق سطح المكتب. يمكنك اليوم تسجيل الدخول، ثم كتابة /rc في جلسة طرفية قيد التشغيل لمتابعتها من الويب. ما زال تنفيذ المهام المستضاف قيد التأهيل."
     ],
     [
       "سطح المكتب",
       "نسخة قيد التطوير",
-      "تطبيق macOS قيد التطوير؛ وسيتاح تنزيله للجميع لاحقًا."
+      "التطبيق الأصلي الذي يتحول إلى العميل الرئيسي لـ Codewhale: المجلدات والمحادثات واتصالات النماذج في نافذة سطح مكتب واحدة. سيتوفر تنزيل عام لاحقًا."
     ],
     [
       "أجهزة الكمبيوتر السحابية",

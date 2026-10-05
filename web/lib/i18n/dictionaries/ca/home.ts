@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Catalan home dictionary — native copy for the Tidal Folio landing page,
+ * Catalan home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "On funciona",
   availabilityHeading: "On pots fer servir Codewhale",
   availabilityLede:
-    "Ja pots fer servir Codewhale al terminal, al navegador local i amb la interfície CodeWhale GUI mantinguda per la comunitat, mentre desenvolupem l’aplicació web, l’aplicació d’escriptori i els ordinadors al núvol.",
+    "Ja pots fer servir Codewhale al terminal, al navegador local i amb la interfície CodeWhale GUI mantinguda per la comunitat. L’aplicació d’escriptori s’està convertint en el client principal de Codewhale i l’aplicació web allotjada s’està reconstruint per igualar-la; totes dues comparteixen el mateix model de sessió, i la seva disponibilitat s’indica a continuació.",
   availability: [
     [
       "Terminal",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "Aplicació web",
       "Vista prèvia de desenvolupament",
-      "Accés al compte i vinculació amb el navegador a la vista prèvia de desenvolupament."
+      "S’està reconstruint per igualar l’aplicació d’escriptori. Avui pots iniciar sessió i després escriure /rc en una sessió de terminal en execució per continuar-la des del web. L’execució de tasques allotjades encara s’està validant."
     ],
     [
       "Escriptori",
       "Build de desenvolupament",
-      "L’aplicació per a macOS està en desenvolupament; la descàrrega pública arribarà més endavant."
+      "L’aplicació nativa que s’està convertint en el client principal de Codewhale: carpetes, converses i connexions de models en una sola finestra d’escriptori. La descàrrega pública arribarà més endavant."
     ],
     [
       "Ordinadors al núvol",

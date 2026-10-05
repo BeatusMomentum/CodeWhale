@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * French home dictionary — native copy for the Tidal Folio landing page,
+ * French home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "Où l’utiliser",
   availabilityHeading: "Où vous pouvez utiliser Codewhale",
   availabilityLede:
-    "Vous pouvez utiliser Codewhale dans votre terminal, dans votre navigateur local et avec l’interface graphique CodeWhale GUI maintenue par la communauté dès aujourd’hui, pendant que nous développons l’application web, l’application de bureau et les ordinateurs cloud.",
+    "Le terminal, le client de navigateur local et l’interface graphique CodeWhale GUI maintenue par la communauté sont disponibles dès aujourd’hui. L’application de bureau devient le client principal de Codewhale et l’application web hébergée est reconstruite pour lui ressembler ; toutes deux reposent sur le même modèle de session, et leur disponibilité est indiquée ci-dessous.",
   availability: [
     [
       "Terminal",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "Application web",
       "Aperçu de développement",
-      "Accès au compte et association avec le navigateur dans l’aperçu de développement."
+      "En cours de reconstruction pour correspondre à l’application de bureau. Vous pouvez dès maintenant vous connecter, puis saisir /rc dans une session de terminal en cours pour la poursuivre depuis le web. L’exécution de tâches hébergées est encore en cours de qualification."
     ],
     [
       "Bureau",
       "Build de développement",
-      "L’application macOS est en développement ; un téléchargement public sera proposé ultérieurement."
+      "L’application native qui devient le client principal de Codewhale : dossiers, conversations et connexions de modèles dans une seule fenêtre de bureau. Un téléchargement public sera proposé ultérieurement."
     ],
     [
       "Ordinateurs cloud",

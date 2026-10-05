@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Italian home dictionary — native copy for the Tidal Folio landing page,
+ * Italian home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -65,7 +65,7 @@ export const home: HomeDict = {
   chapterAvailability: "Dove funziona",
   availabilityHeading: "Dove puoi usare Codewhale",
   availabilityLede:
-    "Puoi già usare Codewhale nel terminale, nel browser locale e con l’interfaccia grafica CodeWhale GUI mantenuta dalla comunità, mentre sviluppiamo l’app web, l’app desktop e i computer cloud.",
+    "Il terminale, il client browser locale e l’interfaccia grafica CodeWhale GUI mantenuta dalla comunità sono già disponibili. L’app desktop sta diventando il client principale di Codewhale e l’app web ospitata viene ricostruita per corrispondervi; entrambe condividono lo stesso modello di sessione e la loro disponibilità è indicata di seguito.",
   availability: [
     [
       "Terminale",
@@ -81,12 +81,12 @@ export const home: HomeDict = {
     [
       "App web",
       "Anteprima di sviluppo",
-      "Accesso all’account e abbinamento con il browser nell’anteprima di sviluppo."
+      "In fase di ricostruzione per corrispondere all’app desktop. Oggi puoi accedere e poi digitare /rc in una sessione di terminale in esecuzione per continuarla dal web. L’esecuzione di attività ospitate è ancora in fase di qualificazione."
     ],
     [
       "Desktop",
       "Build di sviluppo",
-      "L’app per macOS è in sviluppo; il download pubblico arriverà in seguito."
+      "L’app nativa che sta diventando il client principale di Codewhale: cartelle, conversazioni e connessioni ai modelli in un’unica finestra desktop. Un download pubblico arriverà in seguito."
     ],
     [
       "Computer cloud",

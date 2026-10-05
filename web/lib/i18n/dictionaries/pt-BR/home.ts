@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Brazilian Portuguese home dictionary — native copy for the Tidal Folio landing page,
+ * Brazilian Portuguese home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "Onde funciona",
   availabilityHeading: "Onde você pode usar o Codewhale",
   availabilityLede:
-    "Você já pode usar o Codewhale no terminal, no navegador local e com a interface CodeWhale GUI mantida pela comunidade, enquanto desenvolvemos o aplicativo web, o aplicativo desktop e os computadores na nuvem.",
+    "Você já pode usar o Codewhale no terminal, no navegador local e com a interface CodeWhale GUI mantida pela comunidade. O aplicativo desktop está se tornando o cliente principal do Codewhale e o aplicativo web hospedado está sendo reconstruído para acompanhá-lo; ambos compartilham o mesmo modelo de sessão, e a disponibilidade de cada um está indicada abaixo.",
   availability: [
     [
       "Terminal",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "Aplicativo web",
       "Prévia de desenvolvimento",
-      "Acesso à conta e pareamento com o navegador na prévia de desenvolvimento."
+      "Está sendo reconstruído para acompanhar o aplicativo desktop. Hoje você pode entrar na conta e depois digitar /rc em uma sessão de terminal em execução para continuá-la pela web. A execução de tarefas hospedadas ainda está sendo qualificada."
     ],
     [
       "Desktop",
       "Build de desenvolvimento",
-      "O aplicativo para macOS está em desenvolvimento; o download público virá mais adiante."
+      "O aplicativo nativo que está se tornando o cliente principal do Codewhale: pastas, conversas e conexões de modelos em uma única janela de desktop. O download público virá mais adiante."
     ],
     [
       "Computadores na nuvem",

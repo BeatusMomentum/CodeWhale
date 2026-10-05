@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Japanese home dictionary — native copy for the Tidal Folio landing page,
+ * Japanese home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -62,7 +62,7 @@ export const home: HomeDict = {
   startVocabularyLink: "製品用語を見る",
   chapterAvailability: "動作環境",
   availabilityHeading: "Codewhale を使える場所",
-  availabilityLede: "Codewhale は今すぐターミナルとローカルブラウザーで使え、コミュニティが保守する CodeWhale GUI も利用できます。Web アプリ、デスクトップアプリ、クラウドコンピューターは現在開発しています。",
+  availabilityLede: "Codewhale は今すぐターミナルとローカルブラウザーで使え、コミュニティが保守する CodeWhale GUI も利用できます。デスクトップアプリは Codewhale の主要なクライアントになりつつあり、ホスト型 Web アプリもそれに合わせて作り直しています。どちらも同じセッションモデルを共有し、提供状況は以下に記載しています。",
   availability: [
     [
       "ターミナル",
@@ -78,12 +78,12 @@ export const home: HomeDict = {
     [
       "ウェブアプリ",
       "開発プレビュー",
-      "開発プレビューでアカウントへのアクセスとブラウザのペアリングを利用できます。"
+      "デスクトップアプリに合わせて作り直しています。現在はサインインしたうえで、実行中のターミナルセッションで /rc と入力すると、そのセッションを Web で続けられます。ホスト型のタスク実行は引き続き検証中です。"
     ],
     [
       "デスクトップ",
       "開発ビルド",
-      "macOS アプリは開発中です。一般向けのダウンロードは後日提供予定です。"
+      "Codewhale の主要なクライアントになりつつあるネイティブアプリです。フォルダー、会話、モデル接続をひとつのデスクトップウィンドウにまとめます。一般向けのダウンロードは後日提供予定です。"
     ],
     [
       "クラウドコンピューター",

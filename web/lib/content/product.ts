@@ -111,8 +111,8 @@ export const PRODUCT_COPY = {
       surface: { en: "Hosted web app", zh: "托管网页应用" },
       status: { en: "Development preview", zh: "开发预览" },
       detail: {
-        en: "Sign in with a Codewhale account, then type /rc in a running terminal session to continue it from the web app. Hosted task execution is still being qualified.",
-        zh: "使用 Codewhale 账户登录后，在正在运行的终端会话中输入 /rc，即可在网页应用中继续。托管任务执行仍在验证中。",
+        en: "Being rebuilt to match the desktop app. Today you can sign in, then type /rc in a running terminal session to continue it from the web. Hosted task execution is still being qualified.",
+        zh: "正在按桌面应用重新构建。目前可以先登录，再在正在运行的终端会话中输入 /rc，即可在网页中继续。托管任务执行仍在验证中。",
       },
       href: "/signin",
       linkLabel: { en: "Sign in", zh: "登录" },
@@ -121,8 +121,8 @@ export const PRODUCT_COPY = {
       surface: { en: "Desktop", zh: "桌面端" },
       status: { en: "Development build", zh: "开发版本" },
       detail: {
-        en: "The macOS app brings folders, conversations, and model connections into a desktop window. A public download is coming later.",
-        zh: "macOS 应用将文件夹、对话和模型连接整合在桌面窗口中，将来会提供公开下载。",
+        en: "The native app that is becoming the main Codewhale client: folders, conversations, and model connections in one desktop window. A public download is coming later.",
+        zh: "正在成为 Codewhale 主要客户端的原生应用：在一个桌面窗口中整合文件夹、对话和模型连接。将来会提供公开下载。",
       },
       href: null,
       linkLabel: null,

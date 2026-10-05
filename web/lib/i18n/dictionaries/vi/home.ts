@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Vietnamese home dictionary — native copy for the Tidal Folio landing page,
+ * Vietnamese home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "Chạy ở đâu",
   availabilityHeading: "Nơi bạn có thể sử dụng Codewhale",
   availabilityLede:
-    "Bạn có thể sử dụng Codewhale trong terminal, trên trình duyệt cục bộ và với giao diện CodeWhale GUI do cộng đồng duy trì ngay hôm nay, trong khi chúng tôi đang phát triển ứng dụng web, ứng dụng máy tính và máy tính đám mây.",
+    "Terminal, client trình duyệt cục bộ và CodeWhale GUI do cộng đồng duy trì hiện đã có thể dùng. Ứng dụng desktop đang trở thành client chính của Codewhale, còn ứng dụng web được lưu trữ trực tuyến đang được xây dựng lại cho khớp với nó; cả hai dùng chung một mô hình phiên, và tình trạng phát hành được liệt kê bên dưới.",
   availability: [
     [
       "Terminal",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "Ứng dụng web",
       "Bản xem trước đang phát triển",
-      "Truy cập tài khoản và ghép nối trình duyệt trong bản xem trước đang phát triển."
+      "Đang được xây dựng lại cho khớp với ứng dụng desktop. Hiện nay bạn có thể đăng nhập, rồi gõ /rc trong một phiên terminal đang chạy để tiếp tục phiên đó trên web. Việc thực thi tác vụ được lưu trữ trực tuyến vẫn đang được thẩm định."
     ],
     [
       "Máy tính để bàn",
       "Bản phát triển",
-      "Ứng dụng macOS đang được phát triển; bản tải xuống công khai sẽ có sau."
+      "Ứng dụng gốc đang trở thành client chính của Codewhale: thư mục, cuộc trò chuyện và kết nối mô hình trong một cửa sổ desktop. Bản tải xuống công khai sẽ có sau."
     ],
     [
       "Máy tính đám mây",

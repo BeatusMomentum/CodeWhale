@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * English reference home dictionary — the copy contract for the Tidal Folio
+ * English reference home dictionary — the copy contract for the whale-road
  * landing page. Public-copy and public-surface tests assert against these
  * values, not against raw JSX strings.
  *
@@ -74,7 +74,7 @@ export const home: HomeDict = {
   chapterAvailability: "Where it runs",
   availabilityHeading: "Where you can use Codewhale",
   availabilityLede:
-    "The terminal, the local browser client, and the community CodeWhale GUI are available now. Desktop and hosted web apps are being developed around the same session model; their availability is listed separately below.",
+    "The terminal, the local browser client, and the community CodeWhale GUI are available now. The desktop app is becoming the main Codewhale client, and the hosted web app is being rebuilt to match it; both share the same session model, and their availability is listed below.",
   availability: [
     [
       "Terminal and local browser",
@@ -90,12 +90,12 @@ export const home: HomeDict = {
     [
       "Hosted web app",
       "Development preview",
-      "Sign in with a Codewhale account, then type /rc in a running terminal session to continue it from the web app. Hosted task execution is still being qualified.",
+      "Being rebuilt to match the desktop app. Today you can sign in, then type /rc in a running terminal session to continue it from the web. Hosted task execution is still being qualified.",
     ],
     [
       "Desktop",
       "Development build",
-      "The macOS app brings folders, conversations, and model connections into a desktop window. A public download is coming later.",
+      "The native app that is becoming the main Codewhale client: folders, conversations, and model connections in one desktop window. A public download is coming later.",
     ],
     [
       "Cloud computers",

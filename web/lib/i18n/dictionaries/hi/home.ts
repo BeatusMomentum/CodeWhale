@@ -1,7 +1,7 @@
 import type { HomeDict } from "../types";
 
 /**
- * Hindi home dictionary — native copy for the Tidal Folio landing page,
+ * Hindi home dictionary — native copy for the whale-road landing page,
  * in the current direction: your models, more capable together; agents
  * and control on your own machine; availability stated per surface as it
  * is today. Product vocabulary stays literal (Plan / Work / Operate, Ask /
@@ -66,7 +66,7 @@ export const home: HomeDict = {
   chapterAvailability: "कहाँ चलता है",
   availabilityHeading: "आप Codewhale कहाँ इस्तेमाल कर सकते हैं",
   availabilityLede:
-    "आप आज ही Codewhale को अपने टर्मिनल में, लोकल ब्राउज़र में और समुदाय द्वारा अनुरक्षित CodeWhale GUI के साथ इस्तेमाल कर सकते हैं, जबकि हम वेब ऐप, डेस्कटॉप ऐप और क्लाउड कंप्यूटर बनाने पर काम कर रहे हैं।",
+    "टर्मिनल, लोकल ब्राउज़र क्लाइंट और समुदाय द्वारा अनुरक्षित CodeWhale GUI अभी उपलब्ध हैं। डेस्कटॉप ऐप Codewhale का मुख्य क्लाइंट बन रहा है और होस्टेड वेब ऐप को उसी के अनुरूप फिर से बनाया जा रहा है; दोनों एक ही सेशन मॉडल साझा करते हैं, और उनकी उपलब्धता नीचे दी गई है।",
   availability: [
     [
       "टर्मिनल",
@@ -82,12 +82,12 @@ export const home: HomeDict = {
     [
       "वेब ऐप",
       "डेवलपमेंट प्रीव्यू",
-      "डेवलपमेंट प्रीव्यू में खाते तक पहुँच और ब्राउज़र पेयरिंग।"
+      "डेस्कटॉप ऐप के अनुरूप फिर से बनाया जा रहा है। आज आप साइन इन कर सकते हैं, फिर चल रहे टर्मिनल सेशन में /rc टाइप करके उसे वेब से जारी रख सकते हैं। होस्टेड कार्य निष्पादन की अभी जाँच चल रही है।"
     ],
     [
       "डेस्कटॉप",
       "विकासाधीन बिल्ड",
-      "macOS ऐप अभी विकासाधीन है; सभी के लिए डाउनलोड बाद में उपलब्ध होगा।"
+      "नेटिव ऐप, जो Codewhale का मुख्य क्लाइंट बन रहा है: फ़ोल्डर, बातचीत और मॉडल कनेक्शन एक डेस्कटॉप विंडो में। सार्वजनिक डाउनलोड बाद में उपलब्ध होगा।"
     ],
     [
       "क्लाउड कंप्यूटर",
