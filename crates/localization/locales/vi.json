@@ -802,7 +802,7 @@
   "SettingsTuiPrefsQuarantined": "Các khóa tui.toml không có thiết lập tương ứng được giữ trong {path}: {keys}",
   "ClearConversation": "Đã xóa cuộc trò chuyện",
   "ClearConversationBusy": "Chưa xóa nội dung nào (trạng thái Công việc hoặc tác vụ thời gian chạy đang bận; hãy chờ rồi thử lại /clear)",
-  "ModelChanged": "Đã thay đổi mô hình: {old} → {new}",
+  "ModelChanged": "Mô hình hiện là {new} (trước đó là {old}).",
   "LinksProjectTitle": "Codewhale và cộng đồng:",
   "LinksDocumentation": "Tài liệu:",
   "LinksCommunity": "Cộng đồng và đóng góp:",

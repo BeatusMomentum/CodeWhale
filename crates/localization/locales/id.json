@@ -785,7 +785,7 @@
   "SettingsTuiPrefsQuarantined": "Kunci tui.toml tanpa pengaturan yang cocok disimpan di {path}: {keys}",
   "ClearConversation": "Percakapan dibersihkan",
   "ClearConversationBusy": "Tidak ada yang dibersihkan (status Work atau pekerjaan runtime sibuk; tunggu, lalu coba /clear lagi)",
-  "ModelChanged": "Model diubah: {old} → {new}",
+  "ModelChanged": "Model sekarang {new} (sebelumnya {old}).",
   "LinksProjectTitle": "Codewhale & komunitas:",
   "LinksDocumentation": "Dokumentasi:",
   "LinksCommunity": "Komunitas & kontribusi:",
