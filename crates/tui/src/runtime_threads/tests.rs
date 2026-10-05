@@ -22051,9 +22051,9 @@ async fn a_pending_turn_workspace_is_reconciled_on_restart() -> Result<()> {
     Ok(())
 }
 /// #6582: a Runtime API `bash` completion hands the command's exit code and
-/// status to `tool_call_after` and `on_error`, as the TUI does. The runtime
-/// path used to pass `None`; and a failing command, which `bash` reports as a
-/// `ToolError`, reached hooks with no exit code on either surface.
+/// status to `tool_call_after` and `on_error`, as the TUI does. A nonzero
+/// exit is a `ToolError`. A foreground wait that expires is not: the command
+/// moves to the background and stays running, so `on_error` does not fire.
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Result<()> {
@@ -22121,7 +22121,7 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
     let (after, errors) = loop {
         let after = read_lines(&after_log);
         let errors = read_lines(&error_log);
-        if (after.len() >= 4 && errors.len() >= 3) || Instant::now() >= deadline {
+        if (after.len() >= 4 && errors.len() >= 2) || Instant::now() >= deadline {
             break (after, errors);
         }
         sleep(Duration::from_millis(20)).await;
@@ -22132,7 +22132,7 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
             "call-exit-0 0 completed true",
             "call-exit-1 1 failed false",
             "call-exit-127 127 failed false",
-            "call-timeout unset timed_out false",
+            "call-timeout unset running true",
         ]
     );
     assert_eq!(
@@ -22140,7 +22140,6 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
         vec![
             "call-exit-1 1 failed false",
             "call-exit-127 127 failed false",
-            "call-timeout unset timed_out false",
         ]
     );
     Ok(())
