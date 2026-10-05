@@ -324,7 +324,7 @@ note below before upgrading.
   at runtime cannot lift the kernel no-new-privileges flag set at startup,
   so `sudo` and setuid helpers still fail; start with
   `sandbox_mode = "danger-full-access"` or `CODEWHALE_NO_NEW_PRIVS=0` if
-  agents need them.
+  agents need them ([#6787](https://github.com/codewhale-hq/Codewhale/issues/6787)).
 - Stream limits and transport settings share a typed `[stream]` configuration
   table, including retry budgets, TCP keepalive and HTTP/2 keepalive. Explicit
   values take precedence over legacy `[tui]` aliases; omitted values preserve
