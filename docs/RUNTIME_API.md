@@ -1620,6 +1620,16 @@ human gate. Auto-merge is `scripts/check-auto-merge.py --repo … --pr …
 - `GET /v1/workspace/files?path=<dir>&limit=<1-2000>`, `GET /v1/workspace/files/read?path=<file>&offset=&limit=`
   and `PUT /v1/workspace/files` (see workspace files and session artifacts above)
 - `GET /v1/skills`
+- `GET /v1/skills/{name}` — one skill's routing metadata (`source`,
+  `invocation`, `aliases`, `bundled_tier`, `enabled`) plus its full
+  `SKILL.md` body, so a client can compose an activation instruction for its
+  own next turn the way TUI's `/skill <name>` does. `404` for a name no
+  discovery root holds; `403` for a plugin snapshot whose authority is no
+  longer current; native rows whose file has since been deleted also `404`
+  rather than serving the stale body. Advertised as
+  `capabilities.skill_detail` on `GET /v1/runtime/info`, which is the source a
+  client should use rather than probing this path: a `404` here means "no such
+  skill" and is indistinguishable from "no such route".
 - `GET /v1/apps/mcp/servers`
 - `GET /v1/apps/mcp/tools?server=<optional>`
 
@@ -1627,6 +1637,10 @@ Skill activation toggles are persisted under a cross-process transaction lock.
 Each mutation reloads and merges the latest exact-name state before an atomic
 write, and `GET /v1/skills` refreshes that shared state so another Codewhale
 process's successful toggle is visible without restarting the Runtime API.
+
+Skill rows on `GET /v1/skills` carry `invocation`, `aliases`, and
+`bundled_tier` alongside the fields they always carried, so a client can build
+a picker, autocomplete, or activation gate without a second request per row.
 
 **Usage** (token/cost aggregation across threads)
 - `GET /v1/usage?since=<rfc3339>&until=<rfc3339>&group_by=<day|model|provider|thread>`

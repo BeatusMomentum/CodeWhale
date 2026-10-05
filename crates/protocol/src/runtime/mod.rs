@@ -109,6 +109,12 @@ pub struct RuntimeCapabilities {
     /// are available via the HTTP API.
     #[serde(default)]
     pub skill_lifecycle: bool,
+    /// `GET /v1/skills/{name}` returns one skill's full body and routing
+    /// metadata, so a client can compose an activation instruction for its
+    /// next turn. `GET /v1/skills` rows also carry `invocation`, `aliases`,
+    /// and `bundled_tier` routing fields when this flag is set.
+    #[serde(default)]
+    pub skill_detail: bool,
     /// Plugin bundle and marketplace lifecycle operations (list/detail,
     /// install/update/uninstall, trust/enable/disable/revoke, marketplace
     /// add/remove/install) are available via the `/v1/apps/plugins` and
@@ -441,6 +447,7 @@ mod tests {
             memory: true,
             mcp_server_management: false,
             skill_lifecycle: false,
+            skill_detail: false,
             plugin_management: false,
             agent_mail: true,
             terminal_stream: false,

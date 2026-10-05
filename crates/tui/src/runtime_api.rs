@@ -998,6 +998,10 @@ struct ThreadSummary {
     pending_attention_count: usize,
 }
 
+/// `GET /v1/skills` row. Routing metadata (`invocation`, `aliases`,
+/// `bundled_tier`) rides along so a client can build a picker or autocomplete
+/// without a second request per row; the body itself stays behind
+/// `GET /v1/skills/{name}`.
 #[derive(Debug, Serialize)]
 struct SkillEntry {
     name: String,
@@ -1011,6 +1015,12 @@ struct SkillEntry {
     plugin_content_hash: Option<String>,
     enabled: bool,
     is_bundled: bool,
+    /// `model+user` | `explicit-only` | `model-only` | `disabled`.
+    invocation: &'static str,
+    /// Alternate lookup names for the same body; never separate entries.
+    aliases: Vec<String>,
+    /// `core` | `tools` for bundled skills, absent for custom ones.
+    bundled_tier: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1019,6 +1029,18 @@ struct SkillsResponse {
     directories: Vec<PathBuf>,
     warnings: Vec<String>,
     skills: Vec<SkillEntry>,
+}
+
+/// `GET /v1/skills/{name}` — one skill's body plus the routing metadata a
+/// client needs to offer activation: the `/v1/skills` row, plus the full
+/// SKILL.md body. Flattened rather than repeated field-by-field so the two
+/// shapes cannot drift apart.
+#[derive(Debug, Serialize)]
+struct SkillDetailResponse {
+    #[serde(flatten)]
+    skill: SkillEntry,
+    /// Full SKILL.md body (frontmatter stripped) for client-side activation.
+    body: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1230,6 +1252,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         memory: true,
         mcp_server_management: true,
         skill_lifecycle: true,
+        skill_detail: true,
         plugin_management: true,
         agent_mail: true,
         // SSE journal frames carry their durable `seq` as the event id, and the
@@ -2464,7 +2487,9 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/hooks", get(list_hooks))
         .route(
             "/v1/skills/{name}",
-            post(set_skill_enabled).delete(uninstall_skill_api),
+            post(set_skill_enabled)
+                .get(get_skill_detail)
+                .delete(uninstall_skill_api),
         )
         .route(
             "/v1/apps/mcp/imports",
@@ -4837,40 +4862,9 @@ async fn list_skills(
         .list()
         .iter()
         .map(|skill| {
-            let (path, source, plugin_id, plugin_generation, plugin_content_hash) =
-                match &skill.source {
-                    crate::skills::SkillSource::Native => (
-                        Some(skill.path.clone()),
-                        "native".to_string(),
-                        None,
-                        None,
-                        None,
-                    ),
-                    crate::skills::SkillSource::Plugin {
-                        plugin_id,
-                        plugin_name,
-                        authority,
-                        ..
-                    } => (
-                        None,
-                        format!("reviewed-plugin-snapshot:{plugin_name}"),
-                        Some(plugin_id.clone()),
-                        Some(authority.state_generation),
-                        Some(authority.content_hash.clone()),
-                    ),
-                };
-            SkillEntry {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                path,
-                source,
-                plugin_id,
-                plugin_generation,
-                plugin_content_hash,
-                enabled: skill_state
-                    .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref()),
-                is_bundled: skill_entry_is_bundled(skill, &skills_dir),
-            }
+            let enabled = skill_state
+                .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+            skill_entry_for(skill, enabled, &skills_dir)
         })
         .collect();
     Ok(Json(SkillsResponse {
@@ -4916,6 +4910,90 @@ async fn set_skill_enabled(
     Ok(Json(SetSkillEnabledResponse {
         name,
         enabled: req.enabled,
+    }))
+}
+
+/// `GET /v1/skills/{name}` — one skill's full routing metadata plus its body.
+///
+/// Clients that activate a skill client-side (TUI's `/skill`, the VS Code GUI)
+/// need the SKILL.md body to compose the next turn's instruction. `load_skill`
+/// serves the model inside a turn; this endpoint serves the *client* before
+/// one. The same discovery walk backs both, so a name the listing shows is a
+/// name this resolves. Plugin bodies are already content-bound in the
+/// in-memory registry snapshot; native bodies are re-checked against disk so
+/// a deleted SKILL.md fails loudly instead of serving a stale body.
+async fn get_skill_detail(
+    State(state): State<RuntimeApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<SkillDetailResponse>, ApiError> {
+    let (skills_dir, mode) = {
+        let config = state.config.read();
+        let skills_dir = resolve_skills_dir(&config, &state.workspace);
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
+        (skills_dir, mode)
+    };
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
+    let Some(skill) = registry.get(&name) else {
+        return Err(ApiError::not_found(format!(
+            "skill '{name}' not found in searched directories: {}",
+            format_skill_search_paths(&directories)
+        )));
+    };
+
+    // Only the checks the listing does not need: this route hands the body to
+    // a client, so a native skill whose file has gone must fail rather than
+    // serve the cached instructions, and a plugin must still hold the
+    // authority its snapshot was reviewed under. Field derivation itself is
+    // `skill_entry_for`'s, shared with the listing.
+    match &skill.source {
+        crate::skills::SkillSource::Native if !skill.path.is_file() => {
+            return Err(ApiError::not_found(format!(
+                "skill '{}' is registered at {} but that file no longer exists on disk",
+                skill.name,
+                skill.path.display()
+            )));
+        }
+        crate::skills::SkillSource::Plugin { authority, .. } => {
+            // The same gate the TUI's own activation path runs: a plugin whose
+            // trust or enablement changed since discovery must not hand its
+            // body to a client.
+            crate::plugins::registry::verify_plugin_component_authority(
+                authority,
+                crate::plugins::activation::PluginActivationCapability::Skills,
+            )
+            .map_err(|reason| {
+                ApiError::forbidden(format!(
+                    "plugin skill '{}' is no longer active: {reason}",
+                    skill.name
+                ))
+            })?;
+            if authority.workspace != state.workspace {
+                return Err(ApiError::forbidden(format!(
+                    "plugin skill '{}' belongs to a different workspace",
+                    skill.name
+                )));
+            }
+        }
+        crate::skills::SkillSource::Native => {}
+    }
+
+    let mut skill_state = state.skill_state.lock().await;
+    skill_state
+        .refresh()
+        .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
+    let enabled =
+        skill_state.is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+    Ok(Json(SkillDetailResponse {
+        skill: skill_entry_for(skill, enabled, &skills_dir),
+        body: skill.body.clone(),
     }))
 }
 
@@ -9373,6 +9451,61 @@ fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> 
 
     let expected_path = skills_dir.join(&skill.name).join("SKILL.md");
     paths_refer_to_same_file(&skill.path, &expected_path)
+}
+
+/// One `/v1/skills` row, and the row half of `GET /v1/skills/{name}`. Both
+/// sites read the same fields from the same `Skill`, so a new routing field
+/// lands in the listing and the detail together or not at all.
+fn skill_entry_for(skill: &crate::skills::Skill, enabled: bool, skills_dir: &FsPath) -> SkillEntry {
+    let (path, source, plugin_id, plugin_generation, plugin_content_hash) = match &skill.source {
+        crate::skills::SkillSource::Native => (
+            Some(skill.path.clone()),
+            "native".to_string(),
+            None,
+            None,
+            None,
+        ),
+        crate::skills::SkillSource::Plugin {
+            plugin_id,
+            plugin_name,
+            authority,
+            ..
+        } => (
+            None,
+            format!("reviewed-plugin-snapshot:{plugin_name}"),
+            Some(plugin_id.clone()),
+            Some(authority.state_generation),
+            Some(authority.content_hash.clone()),
+        ),
+    };
+    let is_bundled = skill_entry_is_bundled(skill, skills_dir);
+    SkillEntry {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        path,
+        source,
+        plugin_id,
+        plugin_generation,
+        plugin_content_hash,
+        enabled,
+        is_bundled,
+        invocation: match skill.invocation {
+            crate::skills::SkillInvocation::ModelAndUser => "model+user",
+            crate::skills::SkillInvocation::ExplicitOnly => "explicit-only",
+            crate::skills::SkillInvocation::ModelOnly => "model-only",
+            crate::skills::SkillInvocation::Disabled => "disabled",
+        },
+        aliases: skill.aliases.clone(),
+        // Reported only when `is_bundled` is true, so the two fields cannot
+        // disagree: a row that is not the bundle-path copy of its name gets no
+        // curated tier, however its name reads. `is_bundled` itself is the
+        // pre-existing path test (`skills_dir/<name>/SKILL.md`), and this does
+        // not change what it means.
+        bundled_tier: is_bundled
+            .then(|| crate::skills::bundled_skill_tier(&skill.name))
+            .flatten()
+            .map(|tier| tier.label()),
+    }
 }
 
 fn paths_refer_to_same_file(left: &FsPath, right: &FsPath) -> bool {
