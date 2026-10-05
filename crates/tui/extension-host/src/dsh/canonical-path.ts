@@ -10,6 +10,13 @@
  * never compared with a raw one. Both sides go through `canonicalPath`, then
  * `pathKey`, and containment is `relative(canonical root, canonical target)`.
  *
+ * Under LPAC, `realpathSync.native` still fails with EPERM on some paths —
+ * especially directories such as the reviewed `source/` root — because the
+ * open uses FILE_FLAG_BACKUP_SEMANTICS. Core already refused links while
+ * granting that tree, so on EPERM/EACCES we keep a stable stripped spelling
+ * instead of throwing and aborting admitReviewedClosure. Link refusal for
+ * files still goes through the same helper when native succeeds.
+ *
  * Elsewhere `realpathSync` is unchanged.
  */
 import { realpathSync } from 'node:fs'
@@ -18,7 +25,19 @@ import { posix, win32 } from 'node:path'
 type Platform = NodeJS.Platform
 
 export function canonicalPath(path: string, platform: Platform = process.platform): string {
-  return stripVerbatim(platform === 'win32' ? realpathSync.native(path) : realpathSync(path), platform)
+  if (platform !== 'win32') return realpathSync(path)
+  try {
+    return stripVerbatim(realpathSync.native(path), platform)
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? (error as { code?: string }).code : undefined
+    // LPAC cannot open some granted paths the way native realpath requires
+    // (notably directories). Fall back to a stable spelling; Core's grant
+    // already refused links/reparse points in the admitted tree.
+    if (code === 'EPERM' || code === 'EACCES') {
+      return stripVerbatim(win32.normalize(path), platform)
+    }
+    throw error
+  }
 }
 
 /** Drop the Win32 verbatim prefix: `\\?\C:\x` → `C:\x`, `\\?\UNC\h\s` → `\\h\s`. Case is kept. */
