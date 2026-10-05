@@ -102,24 +102,29 @@ const MAX_AGENT_TOPOLOGY_ROWS: usize = 24;
 /// never part of the pinned system prompt or tool catalog, so Plan, Work, and
 /// Operate keep one shared prefix (`every_mode_shares_one_prompt_per_host`).
 /// The engine appends it only when the session log does not already hold one.
+///
+/// The host does not create the goal, and Operate is not a quieter Work.
+/// Same tools, same authority. The difference is that a durable request is
+/// worked until verified: `create_goal` when it will outlast this turn,
+/// parallel children for separable work, evidence before a claim of done.
+/// A session that already holds an older wording gets this text once; older
+/// wordings stay recognizable as legacy.
 const OPERATE_CONTRACT_EVENT: &str = concat!(
     "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
-    "This is an internal runtime event, not user input. This session is in Operate and you ",
-    "are the operator. The host turns the user's prompt into the session goal; do not ",
-    "create a second one. Keep small, chat, one-file, or tightly coupled work in the parent. ",
-    "For multi-step delegation, first state a compact plan with named steps, dependencies, ",
-    "bounded file scopes and a completion check. Use `workflow` with its structured `plan` ",
-    "argument to run those phases through the existing sub-agent runtime. Fleet configures ",
-    "these same sub-agents and roles. Inspect `agent(action=\"roster\")` before assigning ",
-    "steps; choose from its saved models or role/profile assignments and respect unavailable ",
-    "routes. Parallelize only independent steps; pass completed ",
-    "results into dependent steps and inspect failures before continuing. Use one direct ",
-    "`agent` call for a single bounded independent task when a workflow adds no value. ",
-    "Reuse an existing worker with followup for corrections; do not spawn replacements or ",
-    "extra reviewers merely to stay busy. Every write-capable child must return a VERDICT ",
-    "with real verification evidence. Inspect and integrate those results before marking ",
-    "the step complete. Dispatch is not completion: dispatched ≠ settled ≠ verified. ",
-    "Report progress by completed, blocked and next steps, then synthesize the receipts.\n",
+    "This is an internal runtime event, not user input. This session is in Operate: ",
+    "Work's tools and authority, used at full strength until the user's request is verified. ",
+    "Treat each substantive request as a goal: call `create_goal` with the user's full ",
+    "objective (the host does not create it; `/goal` is the user's control and wins). Keep ",
+    "the plan visible with `todo_write`. Orchestrate by default: run a `workflow` for ",
+    "multi-part work (understand, change, verify) and parallel `agent` workers for ",
+    "independent slices; do conversational, one-file, or tightly coupled work yourself. ",
+    "Verify before you call anything done: run the checks, and for a non-trivial change have ",
+    "an independent reviewer try to refute it. Long commands keep running in the background; ",
+    "keep working and inspect them when they report. When work recurs or needs watching ",
+    "(CI, deploys, scheduled checks), propose an `automation` and create it once the user ",
+    "approves. Cost is not a reason to stop; stop when the goal is verified, blocked on the ",
+    "user, or paused. A write-capable child owes a VERDICT with evidence you inspect before ",
+    "you trust it. Report what is done, what is blocked, and what is next.\n",
     "</codewhale:runtime_event>",
 );
 // Keep old persisted runtime messages recognizable for restore/display while
@@ -1393,6 +1398,18 @@ mod tests {
         let current = operate_contract_runtime_message();
         assert!(is_operate_contract_message(&current));
         assert!(is_current_operate_contract_message(&current));
+        let current_text = match current.content.first() {
+            Some(ContentBlock::Text { text, .. }) => text.as_str(),
+            other => panic!("operate contract must be text, got {other:?}"),
+        };
+        // The host does not create the goal. The contract must name the
+        // tool that does, and must not forbid it.
+        assert!(current_text.contains("call `create_goal`"));
+        assert!(current_text.contains("used at full strength"));
+        assert!(!current_text.contains("do not create a second one"));
+        assert!(!current_text.contains("host turns the user's prompt"));
+        assert!(!current_text.contains("do not spawn"));
+        assert!(!current_text.contains("merely to stay busy"));
         let mut quoted = current;
         quoted.content.pop();
         assert!(!is_operate_contract_message(&quoted));

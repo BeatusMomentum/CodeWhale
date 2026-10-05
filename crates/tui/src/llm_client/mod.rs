@@ -475,7 +475,8 @@ impl LlmError {
         {
             return error;
         }
-        if matches!(status, 400 | 402 | 429) && has_explicit_quota_evidence(body) {
+        // xAI refuses an exhausted account with a 403, not a 402/429.
+        if matches!(status, 400 | 402 | 403 | 429) && has_explicit_quota_evidence(body) {
             return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
                 body.to_string(),
             ));
@@ -872,7 +873,19 @@ fn has_explicit_quota_phrase(body: &str) -> bool {
     .into_iter()
     .any(|phrase| lower.contains(phrase));
 
-    lower.contains("billing hard limit has been reached")
+    // xAI: "You have run out of credits or need a Grok subscription."
+    let credits_exhausted = [
+        "run out of credits",
+        "out of credits",
+        "insufficient credits",
+        "used all available credits",
+        "monthly spending limit",
+    ]
+    .into_iter()
+    .any(|phrase| lower.contains(phrase));
+
+    credits_exhausted
+        || lower.contains("billing hard limit has been reached")
         || lower.contains("credit balance exhausted")
         || lower.contains("credit balance is exhausted")
         || durable_scope_exhausted
