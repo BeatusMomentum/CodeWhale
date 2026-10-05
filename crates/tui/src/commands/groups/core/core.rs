@@ -556,7 +556,7 @@ pub fn codewhale_links(app: &mut App) -> CommandResult {
     );
     let _ = writeln!(
         message,
-        "{} `https://github.com/Hmbown/CodeWhale`",
+        "{} `https://github.com/codewhale-hq/CodeWhale`",
         tr(locale, MessageId::LinksGitHub)
     );
     let _ = writeln!(
@@ -1659,7 +1659,7 @@ mod tests {
         assert!(msg.contains("Codewhale & community"));
         assert!(msg.contains("https://codewhale.net/en/docs"));
         assert!(msg.contains("https://codewhale.net/en/community"));
-        assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+        assert!(msg.contains("https://github.com/codewhale-hq/CodeWhale"));
         assert!(msg.contains("https://app.codewhale.net"));
         assert!(msg.contains("separate sign-in"));
         assert!(msg.contains("not connected to the current local session"));

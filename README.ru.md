@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale — агент с открытым исходным кодом, который читает ваш проект, редактирует файлы, выполняет команды и проверяет свою работу с помощью выбранной вами облачной или локальной модели. Начните с одной задачи в терминале. Для большой работы поручайте её части агентам с разными моделями и ролями.
@@ -9,7 +9,7 @@ Codewhale — агент с открытым исходным кодом, кот
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 Установщик выбирает последний опубликованный выпуск. В [журнале изменений](CHANGELOG.md) также описан ещё не опубликованный кандидат следующего выпуска; эти изменения появятся в доступных для скачивания выпусках только после публикации.
 
-В Windows скачайте подходящий установщик или архив из [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Для обновления существующей прямой установки запустите `codewhale update`; для проверки без установки — `codewhale update --check`. Обновление показывает путь к исполняемому файлу и сохраняет более новые сборки. npm и Cargo — дополнительные способы установки. Переход с менеджера пакетов и настройка PATH описаны в [руководстве по установке](docs/INSTALL.md).
+В Windows скачайте подходящий установщик или архив из [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest). Для обновления существующей прямой установки запустите `codewhale update`; для проверки без установки — `codewhale update --check`. Обновление показывает путь к исполняемому файлу и сохраняет более новые сборки. npm и Cargo — дополнительные способы установки. Переход с менеджера пакетов и настройка PATH описаны в [руководстве по установке](docs/INSTALL.md).
 
 Первый запуск сразу открывает поле ввода; мастера настройки нет. Для ответов модели требуется подключённая облачная или локальная модель: пока её нет, на стартовом экране написано "no model connected". Выполните `/provider` (или нажмите F3), чтобы добавить ключ облачного провайдера или выбрать локальную среду. Если Ollama уже запущена с чат-моделью, Codewhale переключится на неё сам. Codewhale также поддерживает npm и Cargo как дополнительные способы установки, а также Docker, Nix, Scoop, Android/Termux и необязательное зеркало CNB. Для существующих установок через менеджер пакетов предусмотрены инструкции по переходу. См. [помощь по установке и PATH](docs/INSTALL.md).
 
@@ -88,7 +88,7 @@ Codewhale работает на вашем компьютере с предос�
 
 ## Присоединяйтесь к сообществу
 
-**Мы рады сообщениям об ошибках, идеям новых функций и pull request**, независимо от того, пользуетесь ли вы Codewhale несколько месяцев или пробуете его впервые. Если нужного провайдера нет, рабочий процесс неудобен или интерфейс терминала мешает работе, [создайте issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) или [отправьте pull request](CONTRIBUTING.md), чтобы мы могли улучшить проект вместе. Мы рады первым вкладам, а авторство принятой работы сохраняется за участниками.
+**Мы рады сообщениям об ошибках, идеям новых функций и pull request**, независимо от того, пользуетесь ли вы Codewhale несколько месяцев или пробуете его впервые. Если нужного провайдера нет, рабочий процесс неудобен или интерфейс терминала мешает работе, [создайте issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) или [отправьте pull request](CONTRIBUTING.md), чтобы мы могли улучшить проект вместе. Мы рады первым вкладам, а авторство принятой работы сохраняется за участниками.
 
 Присоединяйтесь к [Discord](https://discord.gg/37gfS3ksug) или добавьте Hunter в WeChat (`hunterbown`) и попросите принять вас в группу Whale Brothers.
 

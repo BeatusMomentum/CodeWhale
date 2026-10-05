@@ -10,7 +10,7 @@
  */
 import type { ChromeDict } from "./dictionaries/types";
 
-export const REPO_URL = "https://github.com/Hmbown/CodeWhale";
+export const REPO_URL = "https://github.com/codewhale-hq/CodeWhale";
 export const REPO_ISSUES_URL = `${REPO_URL}/issues`;
 export const REPO_RELEASES_URL = `${REPO_URL}/releases`;
 export const REPO_LICENSE_URL = `${REPO_URL}/blob/main/LICENSE`;

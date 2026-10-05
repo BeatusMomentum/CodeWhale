@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
@@ -9,7 +9,7 @@ Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menja
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ Jika menjalankan `codewhale` saja menampilkan "command not found", berarti `~/.l
 
 Installer memilih rilis terbaru yang sudah dipublikasikan. [Catatan perubahan](CHANGELOG.md) juga menjelaskan kandidat yang belum dipublikasikan untuk rilis berikutnya; perubahan tersebut baru disertakan dalam unduhan publik setelah rilisnya tersedia.
 
-Di Windows, unduh installer atau arsip yang sesuai dari [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Untuk instalasi biner langsung yang sudah ada, jalankan `codewhale update`, atau `codewhale update --check` untuk memeriksa tanpa memasang. Updater menampilkan jalur executable dan mempertahankan build yang lebih baru. npm dan Cargo adalah pilihan sekunder; lihat [panduan instalasi](docs/INSTALL.md) untuk migrasi dari pengelola paket dan pengaturan PATH.
+Di Windows, unduh installer atau arsip yang sesuai dari [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest). Untuk instalasi biner langsung yang sudah ada, jalankan `codewhale update`, atau `codewhale update --check` untuk memeriksa tanpa memasang. Updater menampilkan jalur executable dan mempertahankan build yang lebih baru. npm dan Cargo adalah pilihan sekunder; lihat [panduan instalasi](docs/INSTALL.md) untuk migrasi dari pengelola paket dan pengaturan PATH.
 
 Saat pertama dijalankan, Codewhale langsung membuka composer; tidak ada panduan penyiapan. Respons model memerlukan koneksi ke model yang dihosting atau model lokal: sampai ada yang terhubung, layar awal menampilkan "no model connected". Jalankan `/provider` (atau tekan F3) untuk menambahkan kunci layanan yang dihosting atau memilih runtime lokal. Jika Ollama sudah berjalan dengan model chat, Codewhale beralih ke sana dengan sendirinya. Codewhale juga mendukung npm dan Cargo sebagai jalur pengemasan sekunder, serta Docker, Nix, Scoop, Android/Termux, dan mirror CNB opsional. Instalasi yang sudah ada melalui pengelola paket akan menerima petunjuk migrasi. Lihat [bantuan instalasi dan PATH](docs/INSTALL.md).
 
@@ -88,7 +88,7 @@ Baca [urutan otorisasi](docs/AUTHORIZATION_ORDER.md) untuk susunan kebijakan yan
 
 ## Bergabung dengan komunitas
 
-**Laporan bug, ide fitur, dan pull request selalu diterima**, baik Anda telah memakai Codewhale selama berbulan-bulan maupun baru mencobanya. Jika penyedia belum tersedia, alur kerja terasa janggal, atau UI terminal menghambat Anda, [buat issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) atau [kirim pull request](CONTRIBUTING.md) agar kita dapat memperbaikinya bersama. Kontribusi pertama sangat disambut, dan kontributor tetap menerima kredit untuk pekerjaan yang digabungkan.
+**Laporan bug, ide fitur, dan pull request selalu diterima**, baik Anda telah memakai Codewhale selama berbulan-bulan maupun baru mencobanya. Jika penyedia belum tersedia, alur kerja terasa janggal, atau UI terminal menghambat Anda, [buat issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) atau [kirim pull request](CONTRIBUTING.md) agar kita dapat memperbaikinya bersama. Kontribusi pertama sangat disambut, dan kontributor tetap menerima kredit untuk pekerjaan yang digabungkan.
 
 Bergabunglah di [Discord](https://discord.gg/37gfS3ksug), atau tambahkan Hunter di WeChat (`hunterbown`) dan mintalah untuk bergabung dengan grup Whale Brothers.
 

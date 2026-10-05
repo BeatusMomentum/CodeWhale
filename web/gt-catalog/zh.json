@@ -540,7 +540,7 @@
         "title": "在 Docker 中运行",
         "blocks": [
           {
-            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/hmbown/codewhale:latest",
+            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/codewhale-hq/codewhale:latest",
             "lang": "终端"
           },
           {
@@ -772,7 +772,7 @@
         "title": "批量运行任务",
         "blocks": [
           {
-            "p": "如果你手上是一串彼此独立的任务，而不是一套计划，就把它们写成任务文件，作为一次 Fleet 运行来执行。每个任务写明目标、角色和允许写入的路径。完整的 `tasks.json` 示例见[教程](https://github.com/Hmbown/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md)。"
+            "p": "如果你手上是一串彼此独立的任务，而不是一套计划，就把它们写成任务文件，作为一次 Fleet 运行来执行。每个任务写明目标、角色和允许写入的路径。完整的 `tasks.json` 示例见[教程](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md)。"
           },
           {
             "code": "codewhale fleet init\ncodewhale fleet run tasks.json --max-workers 4\ncodewhale fleet status\ncodewhale fleet logs <worker-id>\ncodewhale fleet resume <run-id>\ncodewhale fleet stop --all",
@@ -1119,7 +1119,7 @@
             ]
           },
           {
-            "p": "[docs/RUNTIME_API.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md) 列出了所有路由、请求体和事件。"
+            "p": "[docs/RUNTIME_API.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/RUNTIME_API.md) 列出了所有路由、请求体和事件。"
           }
         ]
       },

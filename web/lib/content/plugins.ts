@@ -119,8 +119,8 @@ export const PLUGINS_COPY = {
     },
   ],
   catalogNote: {
-    en: "Catalog source: github.com/Hmbown/codewhale-plugin-marketplace. A local catalog named codewhale takes precedence over the bundled snapshot.",
-    zh: "目录来源：github.com/Hmbown/codewhale-plugin-marketplace。名为 codewhale 的本地目录优先于内置快照。",
+    en: "Catalog source: github.com/codewhale-hq/codewhale-plugin-marketplace. A local catalog named codewhale takes precedence over the bundled snapshot.",
+    zh: "目录来源：github.com/codewhale-hq/codewhale-plugin-marketplace。名为 codewhale 的本地目录优先于内置快照。",
   },
 
   sourcesLabel: { en: "Install sources", zh: "安装来源" },

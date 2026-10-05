@@ -29,7 +29,7 @@ function resolveRepo() {
     process.env.CODEWHALE_GITHUB_REPO ||
     process.env.DEEPSEEK_TUI_GITHUB_REPO ||
     process.env.DEEPSEEK_GITHUB_REPO ||
-    "Hmbown/CodeWhale"
+    "codewhale-hq/CodeWhale"
   );
 }
 

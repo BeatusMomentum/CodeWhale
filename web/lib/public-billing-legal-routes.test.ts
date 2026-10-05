@@ -42,7 +42,7 @@ describe("public legal routes and retired pricing", () => {
 
   it("pins the single publication authority and fails on vendored metadata drift", () => {
     const pin = JSON.parse(readFileSync(new URL("vendor/legal-documents/PIN.json", webRoot), "utf8"));
-    expect(pin.sourceRepository).toBe("Hmbown/codewhale-platform");
+    expect(pin.sourceRepository).toBe("codewhale-hq/codewhale-platform");
     expect(pin.sourceCommit).toBe("4cd9450aec07ed81d6c56b5ce741424fec533d6b");
     expect(pin.files.map((row: { path: string }) => row.path).sort()).toEqual(["legal-content.tsx", "legal-documents.d.ts", "legal-documents.js"]);
     expect(pin.files.find((row: { path: string }) => row.path === "legal-content.tsx")).toEqual({

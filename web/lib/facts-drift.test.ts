@@ -14,7 +14,7 @@ const VALID_GENERATED_FACTS =
 
 function installGitHubFixture(
   toolCountSource: string | null,
-  releaseHtmlUrl = "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+  releaseHtmlUrl = "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.0",
   sourceOverrides: Record<string, string> = {},
 ): void {
   vi.stubGlobal(
@@ -135,13 +135,13 @@ describe("deriveFactsFromRemote", () => {
   it("stores a canonical release URL when GitHub answers with the repo's other casing", async () => {
     installGitHubFixture(
       VALID_GENERATED_FACTS,
-      "https://github.com/Hmbown/Codewhale/releases/tag/v0.9.0",
+      "https://github.com/codewhale-hq/Codewhale/releases/tag/v0.9.0",
     );
 
     const facts = await deriveFactsFromRemote();
 
     expect(facts?.latestPublishedRelease?.url).toBe(
-      "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+      "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.0",
     );
     expect(isRepoFacts(facts)).toBe(true);
   });
@@ -151,7 +151,7 @@ describe("runFactsDrift", () => {
   it("writes a KV snapshot that getFacts() accepts", async () => {
     installGitHubFixture(
       VALID_GENERATED_FACTS,
-      "https://github.com/Hmbown/Codewhale/releases/tag/v0.9.0",
+      "https://github.com/codewhale-hq/Codewhale/releases/tag/v0.9.0",
     );
     const store = new Map<string, string>();
     const kv = {

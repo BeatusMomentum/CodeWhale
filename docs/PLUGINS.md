@@ -67,7 +67,7 @@ what it can see.
 | `chrome-devtools` MCP (`/mcp recommendations`) | A Chrome it drives, which can include signed-in pages | DevTools-level inspection and performance work |
 | Playwright MCP (`/mcp recommendations`) | A fresh, isolated profile with `--isolated` | Scripted flows and testing without your identity |
 | Computer Use `browser_*` tools (bundled, off until reviewed) | One it launches, in a profile of its own | Browser steps inside a wider desktop task |
-| Chromewhale (developer preview, `Hmbown/codewhale-plugin-marketplace`) | Yours, already open, in your own Chrome profile; load unpacked | Reading or acting on the tab you are looking at, one granted site at a time |
+| Chromewhale (developer preview, `codewhale-hq/codewhale-plugin-marketplace`) | Yours, already open, in your own Chrome profile; load unpacked | Reading or acting on the tab you are looking at, one granted site at a time |
 
 None of these is offered to you proactively. Add the one that fits the job.
 

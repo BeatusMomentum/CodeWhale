@@ -549,18 +549,18 @@ done
     // English and Chinese editions — same guarantee, one source.
     expect(footerProjectLinks("en", getChrome("en")).at(-1)).toEqual({
       label: "MIT license",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footerProjectLinks("zh", getChrome("zh")).at(-1)).toEqual({
       label: "MIT 许可证",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footer).toContain("href={REPO_RELEASES_URL}");
     expect(text("web/lib/i18n/links.ts")).toContain(
       'export const REPO_RELEASES_URL = `${REPO_URL}/releases`',
     );
     expect(text("web/lib/i18n/links.ts")).toContain(
-      'export const REPO_URL = "https://github.com/Hmbown/CodeWhale"',
+      'export const REPO_URL = "https://github.com/codewhale-hq/CodeWhale"',
     );
     expect(footer).toContain("GITEE_ENABLED &&");
   });

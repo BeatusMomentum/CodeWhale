@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
@@ -9,7 +9,7 @@ Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projeni
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ Yalnızca `codewhale` yazdığınızda "command not found" hatası alıyorsanız
 
 Yükleyici, yayımlanmış en son sürümü seçer. [Değişiklik günlüğü](CHANGELOG.md), bir sonraki sürümün henüz yayımlanmamış adayını da açıklar; bu değişiklikler, sürüm kullanıma sunulana kadar yayımlanmış indirmelere dahil edilmez.
 
-Windows’ta [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) üzerinden uygun yükleyiciyi veya arşivi indirin. Mevcut doğrudan kurulumu güncellemek için `codewhale update`, yalnızca kontrol etmek için `codewhale update --check` çalıştırın. Güncelleyici çalıştırılabilir dosyanın yolunu gösterir ve daha yeni derlemeleri korur. npm ve Cargo ikincil paketleme seçenekleridir. Paket yöneticisinden geçiş ve PATH ayarları için [kurulum kılavuzuna](docs/INSTALL.md) bakın.
+Windows’ta [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest) üzerinden uygun yükleyiciyi veya arşivi indirin. Mevcut doğrudan kurulumu güncellemek için `codewhale update`, yalnızca kontrol etmek için `codewhale update --check` çalıştırın. Güncelleyici çalıştırılabilir dosyanın yolunu gösterir ve daha yeni derlemeleri korur. npm ve Cargo ikincil paketleme seçenekleridir. Paket yöneticisinden geçiş ve PATH ayarları için [kurulum kılavuzuna](docs/INSTALL.md) bakın.
 
 İlk çalıştırma doğrudan mesaj yazma alanını açar; sizi bir kurulum adımından geçirmez. Model yanıtları için barındırılan ya da yerel bir modele bağlantı gerekir: bağlanana kadar açılış ekranında "no model connected" yazar. Barındırılan bir anahtar eklemek veya yerel bir çalışma ortamı seçmek için `/provider` komutunu çalıştırın (ya da F3’e basın). Ollama zaten bir sohbet modeliyle çalışıyorsa Codewhale kendiliğinden ona geçer. Codewhale, ikincil paketleme seçenekleri olarak npm ve Cargo’nun yanı sıra Docker, Nix, Scoop, Android/Termux ve isteğe bağlı CNB aynasını da destekler. Paket yöneticisiyle yönetilen mevcut kurulumlar için geçiş talimatları sağlanır. [Kurulum ve PATH yardımına](docs/INSTALL.md) bakın.
 
@@ -88,7 +88,7 @@ Politikaların kesin sıralaması için [yetkilendirme sırasını](docs/AUTHORI
 
 ## Topluluğa katılın
 
-**Hata bildirimleri, özellik fikirleri ve pull request’ler memnuniyetle karşılanır**; Codewhale’i aylardır kullanıyor olmanız ya da ilk kez denemeniz fark etmez. Bir sağlayıcı eksikse, bir iş akışı kullanışsızsa veya terminal arayüzü işinizi zorlaştırıyorsa birlikte iyileştirebilmemiz için [bir issue açın](https://github.com/Hmbown/CodeWhale/issues/new/choose) veya [bir pull request gönderin](CONTRIBUTING.md). İlk katkılar memnuniyetle karşılanır ve katkıda bulunanların projeye alınan çalışmaları üzerindeki emeği kayda geçer.
+**Hata bildirimleri, özellik fikirleri ve pull request’ler memnuniyetle karşılanır**; Codewhale’i aylardır kullanıyor olmanız ya da ilk kez denemeniz fark etmez. Bir sağlayıcı eksikse, bir iş akışı kullanışsızsa veya terminal arayüzü işinizi zorlaştırıyorsa birlikte iyileştirebilmemiz için [bir issue açın](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) veya [bir pull request gönderin](CONTRIBUTING.md). İlk katkılar memnuniyetle karşılanır ve katkıda bulunanların projeye alınan çalışmaları üzerindeki emeği kayda geçer.
 
 [Discord’a](https://discord.gg/37gfS3ksug) katılın veya WeChat’te Hunter’ı (`hunterbown`) ekleyip Whale Brothers grubuna katılmak istediğinizi belirtin.
 

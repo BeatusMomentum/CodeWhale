@@ -33,14 +33,14 @@ installs a `codewhale-tui` command. GitHub Releases retain byte-identical
    # https://github.com/microsoft/winget-pkgs#validation
    ```
 4. Submit to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) via
-   `wingetcreate` or a manual PR that adds `manifests/h/Hmbown/CodeWhale/X.Y.Z/`:
+   `wingetcreate` or a manual PR that adds `manifests/h/codewhale-hq/CodeWhale/X.Y.Z/`:
    ```bash
    wingetcreate update Hmbown.CodeWhale --version X.Y.Z --urls \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/CodeWhaleSetup.exe \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64-portable.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64-portable.zip
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/CodeWhaleSetup.exe \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64-portable.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64-portable.zip
    ```
    The generated PR must pass the winget-pkgs validation workflow before merge.
 

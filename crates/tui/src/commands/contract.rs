@@ -7043,7 +7043,7 @@ mod tests {
         let mut app = control_test_app(&tmpdir);
         init_control_git_repo(
             tmpdir.path(),
-            &format!("https://hunter:{secret}@github.com/Hmbown/CodeWhale.git"),
+            &format!("https://hunter:{secret}@github.com/codewhale-hq/CodeWhale.git"),
             "main",
         );
 
@@ -7052,7 +7052,7 @@ mod tests {
             let mut parts = bundle.parts();
             let facet = parts.control.as_deref_mut().expect("control slot");
             let target = facet.resolve_hosted_work_target().expect("target");
-            assert_eq!(target.repo, "Hmbown/CodeWhale");
+            assert_eq!(target.repo, "codewhale-hq/CodeWhale");
             assert_eq!(target.branch, "main");
             assert_eq!(
                 target.url,

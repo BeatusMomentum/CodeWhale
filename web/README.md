@@ -1,6 +1,6 @@
 # codewhale-web
 
-Documentation and community site for [Codewhale](https://github.com/Hmbown/CodeWhale) — lives at **codewhale.net**.
+Documentation and community site for [Codewhale](https://github.com/codewhale-hq/CodeWhale) — lives at **codewhale.net**.
 
 Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-flash` to summarise recent repo activity, and stored in Workers KV.
 
@@ -19,7 +19,7 @@ Env (mirrors `.env.example`):
 | --------------------------- | ---------------------------------------------------------------- | -------------------- |
 | `DEEPSEEK_API_KEY`          | DeepSeek platform key (`sk-...`)                                 | only for the `/api/cron` tasks (summarization + community agent) |
 | `GITHUB_TOKEN`              | Fine-grained PAT, public-repo read scope                         | optional (raises rate limit 60 → 5000 req/h) |
-| `GITHUB_REPO`               | Defaults to `Hmbown/CodeWhale`                                   | optional             |
+| `GITHUB_REPO`               | Defaults to `codewhale-hq/CodeWhale`                                   | optional             |
 | `CRON_SECRET`               | Shared secret for manual `/api/cron` invocation                  | optional (Cloudflare cron triggers don't need it) |
 | `DEEPSEEK_MODEL`            | Defaults to `deepseek-flash`                                     | optional             |
 | `DEEPSEEK_BASE_URL`         | Defaults to `https://api.deepseek.com`                           | optional             |
@@ -39,7 +39,7 @@ record the exact 40-character `origin/main` SHA and trigger that ref:
 ```bash
 git fetch origin main
 git rev-parse origin/main
-gh workflow run web.yml --repo Hmbown/CodeWhale --ref main
+gh workflow run web.yml --repo codewhale-hq/CodeWhale --ref main
 ```
 
 Every green push to `main` also emits a `Deployment approval needed` workflow

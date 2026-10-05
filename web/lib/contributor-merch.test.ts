@@ -30,7 +30,7 @@ describe("contributor identity context", () => {
     expect(validateContributorIdentity({ github, contribution: "" })).toBeNull();
   });
   it("accepts a contribution URL without requiring a GitHub identity or a merged-PR threshold", () => {
-    expect(validateContributorIdentity({ github: "", contribution: "https://github.com/Hmbown/CodeWhale/issues/1" })).toBeNull();
+    expect(validateContributorIdentity({ github: "", contribution: "https://github.com/codewhale-hq/CodeWhale/issues/1" })).toBeNull();
     expect(validateContributorIdentity({ github: "", contribution: "https://example.org/documentation-improvement" })).toBeNull();
   });
   it("requires one identity reference", () => {

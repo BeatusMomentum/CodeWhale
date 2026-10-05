@@ -540,7 +540,7 @@
         "title": "Run in Docker",
         "blocks": [
           {
-            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/hmbown/codewhale:latest",
+            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/codewhale-hq/codewhale:latest",
             "lang": "Terminal"
           },
           {
@@ -772,7 +772,7 @@
         "title": "Run a batch of tasks",
         "blocks": [
           {
-            "p": "When you have a list of separate tasks rather than one plan, write them as a task file and run them as a Fleet run. Each task names its goal, its role, and the paths it may write. [The tutorial](https://github.com/Hmbown/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md) has a complete `tasks.json`."
+            "p": "When you have a list of separate tasks rather than one plan, write them as a task file and run them as a Fleet run. Each task names its goal, its role, and the paths it may write. [The tutorial](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md) has a complete `tasks.json`."
           },
           {
             "code": "codewhale fleet init\ncodewhale fleet run tasks.json --max-workers 4\ncodewhale fleet status\ncodewhale fleet logs <worker-id>\ncodewhale fleet resume <run-id>\ncodewhale fleet stop --all",
@@ -1119,7 +1119,7 @@
             ]
           },
           {
-            "p": "[docs/RUNTIME_API.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md) lists every route, request body, and event."
+            "p": "[docs/RUNTIME_API.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/RUNTIME_API.md) lists every route, request body, and event."
           }
         ]
       },

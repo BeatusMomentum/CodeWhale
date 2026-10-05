@@ -17721,7 +17721,7 @@ fn update_notice_block_is_persistent_and_actionable() {
     );
     assert!(block.contains("v0.8.47"), "shows latest version: {block:?}");
     assert!(
-        block.contains("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.47"),
+        block.contains("https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.47"),
         "includes release-notes link: {block:?}"
     );
     assert!(

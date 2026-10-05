@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale ist ein Open-Source-Agent, der dein Projekt liest, Dateien bearbeitet, Befehle ausführt und seine Arbeit mit einem gehosteten oder lokalen Modell deiner Wahl prüft. Starte mit einer Aufgabe im Terminal. Teile eine größere Aufgabe auf Agenten mit verschiedenen Modellen und Rollen auf.
@@ -9,7 +9,7 @@ Codewhale ist ein Open-Source-Agent, der dein Projekt liest, Dateien bearbeitet,
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ Meldet ein einfaches `codewhale` "command not found", ist `~/.local/bin` noch ni
 
 Das Installationsprogramm wählt die neueste veröffentlichte Version aus. Das [Änderungsprotokoll](CHANGELOG.md) beschreibt auch den noch unveröffentlichten Kandidaten für die nächste Version; diese Änderungen sind erst in den veröffentlichten Downloads enthalten, wenn die Version verfügbar ist.
 
-Unter Windows lade das passende Installationsprogramm oder Archiv von [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) herunter. Bestehende direkte Installationen aktualisierst du mit `codewhale update`; `codewhale update --check` prüft nur. Der Updater zeigt den Pfad der ausführbaren Datei und behält neuere Builds bei. npm und Cargo sind nachrangige Paketoptionen. Hinweise zur Migration aus einer Paketverwaltung und zu PATH stehen in der [Installationsanleitung](docs/INSTALL.md).
+Unter Windows lade das passende Installationsprogramm oder Archiv von [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest) herunter. Bestehende direkte Installationen aktualisierst du mit `codewhale update`; `codewhale update --check` prüft nur. Der Updater zeigt den Pfad der ausführbaren Datei und behält neuere Builds bei. npm und Cargo sind nachrangige Paketoptionen. Hinweise zur Migration aus einer Paketverwaltung und zu PATH stehen in der [Installationsanleitung](docs/INSTALL.md).
 
 Der erste Start öffnet direkt den Editor für Nachrichten; es gibt keinen Einrichtungsassistenten. Antworten erfordern ein verbundenes gehostetes oder lokales Modell: Solange keines verbunden ist, zeigt der Startbildschirm "no model connected". Führe `/provider` aus (oder drücke F3), um einen Schlüssel für einen gehosteten Anbieter hinzuzufügen oder eine lokale Laufzeit zu wählen. Läuft Ollama bereits mit einem Chat-Modell, wechselt Codewhale von selbst dorthin. Codewhale unterstützt außerdem npm und Cargo als nachrangige Paketoptionen sowie Docker, Nix, Scoop, Android/Termux und einen optionalen CNB-Spiegel. Bestehende Installationen über Paketverwaltungen erhalten Migrationshinweise. Siehe die [Hilfe zu Installation und PATH](docs/INSTALL.md).
 
@@ -88,7 +88,7 @@ Lies die [Autorisierungsreihenfolge](docs/AUTHORIZATION_ORDER.md) für die genau
 
 ## Der Community beitreten
 
-**Fehlerberichte, Funktionsideen und Pull Requests sind willkommen**, egal ob du Codewhale seit Monaten nutzt oder zum ersten Mal ausprobierst. Wenn ein Anbieter fehlt, ein Workflow umständlich ist oder dir die Terminaloberfläche im Weg steht, [eröffne ein Issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) oder [sende einen Pull Request](CONTRIBUTING.md), damit wir es gemeinsam verbessern können. Erste Beiträge sind willkommen, und Mitwirkende behalten die Anerkennung für ihre übernommenen Arbeiten.
+**Fehlerberichte, Funktionsideen und Pull Requests sind willkommen**, egal ob du Codewhale seit Monaten nutzt oder zum ersten Mal ausprobierst. Wenn ein Anbieter fehlt, ein Workflow umständlich ist oder dir die Terminaloberfläche im Weg steht, [eröffne ein Issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) oder [sende einen Pull Request](CONTRIBUTING.md), damit wir es gemeinsam verbessern können. Erste Beiträge sind willkommen, und Mitwirkende behalten die Anerkennung für ihre übernommenen Arbeiten.
 
 Tritt unserem [Discord](https://discord.gg/37gfS3ksug) bei oder füge Hunter auf WeChat (`hunterbown`) hinzu und bitte um Aufnahme in die Whale-Brothers-Gruppe.
 

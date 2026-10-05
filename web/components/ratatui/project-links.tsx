@@ -2,7 +2,7 @@ import { Icon } from "@/components/icon";
 import type { RatatuiCopy } from "@/lib/content/ratatui";
 import "./project-links.css";
 
-const REPOSITORY = "https://github.com/Hmbown/codewhale-ratatui";
+const REPOSITORY = "https://github.com/codewhale-hq/codewhale-ratatui";
 
 /** Library provenance, rendered once per page instead of once per selection. */
 export function RatatuiProjectLinks({ revision, copy }: { revision: string; copy: RatatuiCopy }) {

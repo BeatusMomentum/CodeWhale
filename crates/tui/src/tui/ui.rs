@@ -1411,7 +1411,7 @@ impl UpdateNotice {
         };
         format!(
             "Update available: v{current} -> v{latest}\n\
-             Release notes: https://github.com/Hmbown/CodeWhale/releases/tag/v{latest}\n\
+             Release notes: https://github.com/codewhale-hq/CodeWhale/releases/tag/v{latest}\n\
              {action}",
             current = self.current,
             latest = self.latest

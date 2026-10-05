@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
@@ -9,7 +9,7 @@ Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 安裝程式會選擇最新的已發布版本。[更新日誌](CHANGELOG.md)也描述了下一版本尚未發布的候選建置；只有在該版本正式發布後，已發布的下載檔才會包含這些變更。
 
-Windows 請從 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) 下載對應的安裝程式或封存檔。已有的直接安裝使用 `codewhale update`；若只想檢查，使用 `codewhale update --check`。更新器會顯示執行檔路徑，並保留較新的建置版本。npm 和 Cargo 是次要套件安裝方式；套件管理器安裝的遷移與 PATH 設定請參閱[安裝指南](docs/INSTALL.md)。
+Windows 請從 [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest) 下載對應的安裝程式或封存檔。已有的直接安裝使用 `codewhale update`；若只想檢查，使用 `codewhale update --check`。更新器會顯示執行檔路徑，並保留較新的建置版本。npm 和 Cargo 是次要套件安裝方式；套件管理器安裝的遷移與 PATH 設定請參閱[安裝指南](docs/INSTALL.md)。
 
 第一次執行會直接開啟輸入框，不會引導你完成設定流程。要取得模型回覆，必須連線至託管模型或本機模型：在連線之前，啟動畫面會顯示 "no model connected"。執行 `/provider`（或按 F3）即可新增託管服務金鑰或選擇本機執行環境。如果 Ollama 已在執行且帶有聊天模型，Codewhale 會自動切換到它。Codewhale 也支援 npm 和 Cargo 作為次要套件安裝方式，以及 Docker、Nix、Scoop、Android/Termux 與選用的 CNB 鏡像。對於既有的套件管理器安裝，系統會提供遷移說明。請參閱[安裝與 PATH 說明](docs/INSTALL.md)。
 
@@ -88,7 +88,7 @@ Codewhale 在你的電腦上執行，且只擁有你授予的存取權限。核�
 
 ## 加入社群
 
-**歡迎回報錯誤、提出功能建議及提交 pull request**，無論你已使用 Codewhale 數月，還是第一次嘗試。如果缺少某個供應商、工作流程操作不便，或終端機介面妨礙了你，請[提出 issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) 或[提交 pull request](CONTRIBUTING.md)，一起改善。我們歡迎首次貢獻，貢獻者也會保留已合併工作的署名。
+**歡迎回報錯誤、提出功能建議及提交 pull request**，無論你已使用 Codewhale 數月，還是第一次嘗試。如果缺少某個供應商、工作流程操作不便，或終端機介面妨礙了你，請[提出 issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) 或[提交 pull request](CONTRIBUTING.md)，一起改善。我們歡迎首次貢獻，貢獻者也會保留已合併工作的署名。
 
 加入 [Discord](https://discord.gg/37gfS3ksug)，或在微信加入 Hunter（`hunterbown`）並申請加入 Whale Brothers 群組。
 

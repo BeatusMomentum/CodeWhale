@@ -107,11 +107,11 @@ function unsupportedBuildHint() {
     "",
     "Or build from a checkout:",
     "",
-    "  git clone https://github.com/Hmbown/CodeWhale.git",
+    "  git clone https://github.com/codewhale-hq/CodeWhale.git",
     "  cd CodeWhale",
     "  cargo install --path crates/cli --locked   # single binary",
     "",
-    "See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md",
+    "See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md",
     "for cross-compilation, mirror, Linux ARM64, FreeBSD, and winget specifics.",
   ].join("\n");
 }
@@ -135,7 +135,7 @@ function ensureTrailingSlash(baseUrl) {
   return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
 }
 
-function githubReleaseBaseUrl(version, repo = "Hmbown/CodeWhale") {
+function githubReleaseBaseUrl(version, repo = "codewhale-hq/CodeWhale") {
   return `https://github.com/${repo}/releases/download/v${version}/`;
 }
 
@@ -174,7 +174,7 @@ function isCnbSupportedTarget(
   return platform === "linux" && arch === "x64";
 }
 
-function releaseBaseUrl(version, repo = "Hmbown/CodeWhale") {
+function releaseBaseUrl(version, repo = "codewhale-hq/CodeWhale") {
   // CODEWHALE_RELEASE_BASE_URL is the canonical override.
   // DEEPSEEK_TUI_RELEASE_BASE_URL / DEEPSEEK_RELEASE_BASE_URL are legacy aliases.
   const override = explicitReleaseBase();
@@ -206,7 +206,7 @@ function shouldRaceFirstPartyMirrors(
   );
 }
 
-function firstPartyReleaseSources(version, repo = "Hmbown/CodeWhale") {
+function firstPartyReleaseSources(version, repo = "codewhale-hq/CodeWhale") {
   return [
     {
       id: "github",
@@ -236,11 +236,11 @@ function assertCnbMirrorSupportedPlatform(
   );
 }
 
-function releaseAssetUrl(baseName, version, repo = "Hmbown/CodeWhale") {
+function releaseAssetUrl(baseName, version, repo = "codewhale-hq/CodeWhale") {
   return releaseAssetUrlFromBase(baseName, releaseBaseUrl(version, repo));
 }
 
-function checksumManifestUrl(version, repo = "Hmbown/CodeWhale") {
+function checksumManifestUrl(version, repo = "codewhale-hq/CodeWhale") {
   return releaseAssetUrl(CHECKSUM_MANIFEST, version, repo);
 }
 

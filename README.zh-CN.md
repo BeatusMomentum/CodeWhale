@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale 是一款开源智能体，可使用你选择的托管模型或本地模型读取项目、编辑文件、运行命令并检查自己的工作。从终端中的一项任务开始。对于较大的工作，可以将其中的部分任务交给使用不同模型、承担不同角色的智能体。
@@ -9,7 +9,7 @@ Codewhale 是一款开源智能体，可使用你选择的托管模型或本地�
 
 [English](README.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 安装器会选择最新的已发布版本。[更新日志](CHANGELOG.md)也描述了下一版本尚未发布的候选构建；只有在该版本正式发布后，已发布的下载包才会包含这些变更。
 
-Windows 请使用 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest)
+Windows 请使用 [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest)
 中的安装器或压缩包。已有的直接安装使用 `codewhale update`；它会显示当前可执行文件路径，
 并保留比已发布版本更新的构建。npm 和 Cargo 是次要打包选项。
 迁移与 PATH 排查见[安装指南](docs/zh_hans/INSTALL.md)。
@@ -91,7 +91,7 @@ Codewhale 在你的机器上运行，并仅拥有你授予的访问权限。审�
 
 ## 加入社区
 
-**欢迎提交错误报告、功能建议和 pull request**，无论你已使用 Codewhale 数月，还是刚刚开始尝试。如果缺少某个提供商、工作流体验不佳，或终端界面妨碍了你，请[提交 issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) 或[提交 pull request](CONTRIBUTING.md)，一起改进。我们欢迎首次贡献，贡献者也会保留已合入工作的署名。
+**欢迎提交错误报告、功能建议和 pull request**，无论你已使用 Codewhale 数月，还是刚刚开始尝试。如果缺少某个提供商、工作流体验不佳，或终端界面妨碍了你，请[提交 issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) 或[提交 pull request](CONTRIBUTING.md)，一起改进。我们欢迎首次贡献，贡献者也会保留已合入工作的署名。
 
 加入 [Discord](https://discord.gg/37gfS3ksug)，或在微信添加 Hunter（`hunterbown`）并申请加入 Whale Brothers 群。
 

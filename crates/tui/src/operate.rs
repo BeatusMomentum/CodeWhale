@@ -2130,11 +2130,11 @@ auth_mode = "none"
     #[test]
     fn calls_landed_checker_flags() {
         assert_eq!(
-            check_auto_merge_args("Hmbown/CodeWhale", "1234", "keel"),
+            check_auto_merge_args("codewhale-hq/CodeWhale", "1234", "keel"),
             vec![
                 "scripts/check-auto-merge.py",
                 "--repo",
-                "Hmbown/CodeWhale",
+                "codewhale-hq/CodeWhale",
                 "--pr",
                 "1234",
                 "--agent",
@@ -2142,14 +2142,14 @@ auth_mode = "none"
             ]
         );
         assert_eq!(
-            auto_merge_pr_args("Hmbown/CodeWhale", "1234", "keel")[0],
+            auto_merge_pr_args("codewhale-hq/CodeWhale", "1234", "keel")[0],
             "scripts/auto-merge-pr.py"
         );
         let deny = evaluate_auto_merge(
             AutoMergeRequest {
                 pr: "12",
                 role: "keel",
-                repo: "Hmbown/CodeWhale",
+                repo: "codewhale-hq/CodeWhale",
             },
             None,
         );
@@ -2163,7 +2163,7 @@ auth_mode = "none"
         let ok = |repo, pr, role| {
             validate_auto_merge_request(&AutoMergeRequest { pr, role, repo }).is_ok()
         };
-        assert!(ok("Hmbown/CodeWhale", "1234", "keel"));
+        assert!(ok("codewhale-hq/CodeWhale", "1234", "keel"));
         assert!(ok("a-b/c.d_e-f", "1", "scout_2"));
         for (repo, pr, role) in [
             ("Hmbown", "1", "keel"),
@@ -2218,7 +2218,7 @@ auth_mode = "none"
                 AutoMergeRequest {
                     pr: "42",
                     role: "keel",
-                    repo: "Hmbown/CodeWhale",
+                    repo: "codewhale-hq/CodeWhale",
                 },
                 Some(&checker),
             ),

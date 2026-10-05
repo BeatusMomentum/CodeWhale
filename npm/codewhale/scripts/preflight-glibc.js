@@ -75,13 +75,13 @@ function buildFromSourceHint() {
     "",
     "Or build from a checkout:",
     "",
-    "  git clone https://github.com/Hmbown/CodeWhale.git",
+    "  git clone https://github.com/codewhale-hq/CodeWhale.git",
     "  cd CodeWhale",
     "  cargo install --path crates/cli --locked",
     "  bin=$(dirname \"$(command -v codewhale)\")",
     "  ln -sf \"$bin/codewhale\" \"$bin/codew\"",
     "",
-    "See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md",
+    "See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md",
   ].join("\n");
 }
 

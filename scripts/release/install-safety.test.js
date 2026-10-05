@@ -80,7 +80,7 @@ for (const kind of ["website", "archive"]) {
     if (kind === "website") {
       const downloads = fs.readFileSync(f.env.INSTALL_TEST_DOWNLOADS, "utf8").trim().split("\n");
       assert.equal(downloads.length, 3);
-      assert.ok(downloads.every(url => url.startsWith("https://github.com/Hmbown/CodeWhale/releases/download/v0.9.11/")));
+      assert.ok(downloads.every(url => url.startsWith("https://github.com/codewhale-hq/CodeWhale/releases/download/v0.9.11/")));
     }
     f.untouched();
   });

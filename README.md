@@ -12,7 +12,7 @@ agents with different models and roles.
 
 [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -42,7 +42,7 @@ also describes the next release's unreleased candidate; those changes are not
 included in published downloads until the release is available.
 
 Windows: download the matching installer or archive from
-[GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest).
+[GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest).
 For an existing direct install, run `codewhale update` (or `codewhale update --check`
 to inspect it). The updater prints the executable path and keeps newer builds.
 
@@ -150,7 +150,7 @@ stack and [configuration](docs/CONFIGURATION.md) for local settings.
 **Bug reports, feature ideas, and pull requests are welcome**, whether you have
 used Codewhale for months or are trying it for the first time. If a provider is
 missing, a workflow is awkward, or the terminal UI gets in your way,
-[open an issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) or
+[open an issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) or
 [send a pull request](CONTRIBUTING.md) so we can improve it together. We welcome
 first contributions, and contributors keep credit for the work that lands.
 

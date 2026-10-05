@@ -44,7 +44,7 @@ edition = "2024"
 # get a clear "package requires rustc 1.89+" error.
 rust-version = "1.89"
 license = "MIT"
-repository = "https://github.com/Hmbown/CodeWhale"
+repository = "https://github.com/codewhale-hq/CodeWhale"
 
 # Record the policy CI already applies via `RUSTFLAGS: -Dwarnings`.
 # Member crates opt in with `[lints] workspace = true`. This does not add

@@ -184,7 +184,7 @@ if [[ -z "${compare_line}" ]]; then
   echo "::error::CHANGELOG.md must include a compare link for ${workspace_version}." >&2
   fail=1
 elif [[ "${require_dated_release}" == "1" ]] &&
-  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/Hmbown/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
+  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/codewhale-hq/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
   echo "::error::Publication requires the ${workspace_version} compare link to end at v${workspace_version}." >&2
   fail=1
 fi

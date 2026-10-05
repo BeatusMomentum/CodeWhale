@@ -397,5 +397,5 @@ Bundle patch 的语义已对照 DSH
 ## 社区背景
 
 本指南回应了 [giancarlocp 在讨论 #5827 中提出的插件编写指南与 OpenCode
-转换需求](https://github.com/Hmbown/Codewhale/discussions/5827)。
-简体中文版本遵循 [SparkofSpike 在 issue #5482 中提出的中文文档工作方向](https://github.com/Hmbown/Codewhale/issues/5482)。
+转换需求](https://github.com/codewhale-hq/Codewhale/discussions/5827)。
+简体中文版本遵循 [SparkofSpike 在 issue #5482 中提出的中文文档工作方向](https://github.com/codewhale-hq/Codewhale/issues/5482)。

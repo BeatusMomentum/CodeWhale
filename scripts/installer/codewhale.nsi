@@ -1,6 +1,6 @@
 ; codewhale.nsi — NSIS installer for CodeWhale (Windows)
 ;
-; Requirements (see https://github.com/Hmbown/CodeWhale/issues/1983):
+; Requirements (see https://github.com/codewhale-hq/CodeWhale/issues/1983):
 ;   - Install codewhale.exe and codew.exe side-by-side (single binary, no codewhale-tui.exe)
 ;   - Default to %LOCALAPPDATA%\Programs\CodeWhale\bin
 ;   - Add install dir to current-user PATH
@@ -31,7 +31,7 @@
 
 !define PRODUCT_NAME "CodeWhale"
 !define PRODUCT_PUBLISHER "Hmbown"
-!define PRODUCT_WEB_SITE "https://github.com/Hmbown/CodeWhale"
+!define PRODUCT_WEB_SITE "https://github.com/codewhale-hq/CodeWhale"
 
 Name "${PRODUCT_NAME} ${VERSION}"
 OutFile "CodeWhaleSetup.exe"

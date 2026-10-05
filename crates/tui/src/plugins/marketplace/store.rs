@@ -348,7 +348,7 @@ mod tests {
             };
             assert!(
                 spec.starts_with(
-                    "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/"
+                    "https://codeload.github.com/codewhale-hq/codewhale-plugin-marketplace/"
                 )
             );
             assert!(spec.contains("#path="));

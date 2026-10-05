@@ -120,7 +120,7 @@ export function deriveLatestPublishedRelease() {
       typeof release.publishedAt !== "string" ||
       !Number.isFinite(Date.parse(release.publishedAt)) ||
       typeof release.url !== "string" ||
-      release.url !== `https://github.com/Hmbown/CodeWhale/releases/tag/${release.tag}`
+      release.url !== `https://github.com/codewhale-hq/CodeWhale/releases/tag/${release.tag}`
     ) {
       return null;
     }

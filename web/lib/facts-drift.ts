@@ -22,8 +22,8 @@ import type {
 import { FACTS as BUILD_FACTS } from "./facts.generated";
 import { isRepoFacts } from "./facts";
 
-const RAW_ROOT = "https://raw.githubusercontent.com/Hmbown/CodeWhale";
-const RELEASE_TAG_ROOT = "https://github.com/Hmbown/CodeWhale/releases/tag";
+const RAW_ROOT = "https://raw.githubusercontent.com/codewhale-hq/CodeWhale";
+const RELEASE_TAG_ROOT = "https://github.com/codewhale-hq/CodeWhale/releases/tag";
 const KV_KEY = "facts:current";
 const LOG_KEY = "facts:drift-log";
 
@@ -63,7 +63,7 @@ async function fetchSourceMarker(ghToken?: string): Promise<SourceMarker | null>
   if (ghToken) headers.Authorization = `Bearer ${ghToken}`;
   try {
     const response = await fetchBoundedText(
-      "https://api.github.com/repos/Hmbown/CodeWhale/commits/main",
+      "https://api.github.com/repos/codewhale-hq/CodeWhale/commits/main",
       { headers },
     );
     if (!response.ok) return null;
@@ -116,7 +116,7 @@ async function fetchLatestPublishedRelease(
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetchBoundedText("https://api.github.com/repos/Hmbown/CodeWhale/releases/latest", { headers });
+    const r = await fetchBoundedText("https://api.github.com/repos/codewhale-hq/CodeWhale/releases/latest", { headers });
     if (!r.ok) return null;
     const j = JSON.parse(r.text) as {
       tag_name?: string;
@@ -135,7 +135,7 @@ async function fetchLatestPublishedRelease(
       version: j.tag_name.slice(1),
       publishedAt: j.published_at,
       // Built from the tag, not `html_url`: GitHub answers with the repo's
-      // canonical casing (`Hmbown/Codewhale`), which the exact-URL check in
+      // canonical casing (`codewhale-hq/Codewhale`), which the exact-URL check in
       // isRepoFacts rejects, invalidating the whole KV snapshot.
       url: `${RELEASE_TAG_ROOT}/${j.tag_name}`,
     };

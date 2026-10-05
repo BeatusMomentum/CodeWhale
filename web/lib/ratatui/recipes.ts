@@ -1,6 +1,6 @@
 import recipes from "./recipes.generated.json";
 
-const REPOSITORY = "https://github.com/Hmbown/codewhale-ratatui";
+const REPOSITORY = "https://github.com/codewhale-hq/codewhale-ratatui";
 
 /** Exact public functions exported from the library's compiled recipes example. */
 export function getRecipe(id?: string): { code: string; line: number } | null {

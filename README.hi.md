@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale एक ओपन सोर्स एजेंट है जो आपकी पसंद के होस्ट किए गए या लोकल मॉडल से आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की जाँच करता है। टर्मिनल में एक काम से शुरुआत करें। बड़े काम के हिस्से अलग-अलग मॉडल और भूमिकाओं वाले एजेंटों को सौंपें।
@@ -9,7 +9,7 @@ Codewhale एक ओपन सोर्स एजेंट है जो आप�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 इंस्टॉलर सबसे नई प्रकाशित रिलीज़ चुनता है। [बदलावों की सूची](CHANGELOG.md) में अगली रिलीज़ के अभी तक अप्रकाशित कैंडिडेट का भी विवरण है; रिलीज़ उपलब्ध होने तक ये बदलाव प्रकाशित डाउनलोड में शामिल नहीं होते।
 
-Windows पर [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) से उपयुक्त इंस्टॉलर या आर्काइव डाउनलोड करें। मौजूदा सीधे इंस्टॉलेशन को अपडेट करने के लिए `codewhale update` चलाएँ; केवल जाँच के लिए `codewhale update --check` इस्तेमाल करें। अपडेटर executable का पथ दिखाता है और नए बिल्ड सुरक्षित रखता है। npm और Cargo वैकल्पिक पैकेजिंग तरीके हैं। पैकेज मैनेजर वाले इंस्टॉलेशन से माइग्रेशन और PATH के लिए [इंस्टॉलेशन गाइड](docs/INSTALL.md) देखें।
+Windows पर [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest) से उपयुक्त इंस्टॉलर या आर्काइव डाउनलोड करें। मौजूदा सीधे इंस्टॉलेशन को अपडेट करने के लिए `codewhale update` चलाएँ; केवल जाँच के लिए `codewhale update --check` इस्तेमाल करें। अपडेटर executable का पथ दिखाता है और नए बिल्ड सुरक्षित रखता है। npm और Cargo वैकल्पिक पैकेजिंग तरीके हैं। पैकेज मैनेजर वाले इंस्टॉलेशन से माइग्रेशन और PATH के लिए [इंस्टॉलेशन गाइड](docs/INSTALL.md) देखें।
 
 पहली बार चलाने पर Codewhale सीधे कंपोज़र खोलता है; यह आपको किसी सेटअप प्रक्रिया से नहीं गुज़ारता। मॉडल से जवाब पाने के लिए किसी होस्ट किए गए या लोकल मॉडल से कनेक्शन ज़रूरी है: जब तक कोई मॉडल जुड़ा नहीं होता, लॉन्च स्क्रीन पर "no model connected" दिखता है। होस्टेड कुंजी जोड़ने या कोई लोकल रनटाइम चुनने के लिए `/provider` चलाएँ (या F3 दबाएँ)। अगर Ollama पहले से किसी चैट मॉडल के साथ चल रहा है, तो Codewhale अपने-आप उस पर चला जाता है। Codewhale अतिरिक्त पैकेजिंग विकल्पों के रूप में npm और Cargo के साथ-साथ Docker, Nix, Scoop, Android/Termux और वैकल्पिक CNB मिरर का भी समर्थन करता है। पैकेज मैनेजर से प्रबंधित मौजूदा इंस्टॉलेशन के लिए माइग्रेशन के निर्देश मिलते हैं। [इंस्टॉलेशन और PATH से जुड़ी मदद](docs/INSTALL.md) देखें।
 
@@ -88,7 +88,7 @@ Codewhale आपकी मशीन पर उतने ही एक्से�
 
 ## समुदाय से जुड़ें
 
-**बग रिपोर्ट, नए फ़ीचर के सुझाव और pull request का स्वागत है**, चाहे आप Codewhale का कई महीनों से इस्तेमाल कर रहे हों या पहली बार आज़मा रहे हों। यदि कोई प्रोवाइडर उपलब्ध नहीं है, कोई वर्कफ़्लो असहज है या टर्मिनल UI आपके काम में बाधा डालता है, तो [issue खोलें](https://github.com/Hmbown/CodeWhale/issues/new/choose) या [pull request भेजें](CONTRIBUTING.md), ताकि हम मिलकर इसे बेहतर बना सकें। पहले योगदान का स्वागत है और स्वीकार किए गए काम का श्रेय योगदानकर्ताओं के पास रहता है।
+**बग रिपोर्ट, नए फ़ीचर के सुझाव और pull request का स्वागत है**, चाहे आप Codewhale का कई महीनों से इस्तेमाल कर रहे हों या पहली बार आज़मा रहे हों। यदि कोई प्रोवाइडर उपलब्ध नहीं है, कोई वर्कफ़्लो असहज है या टर्मिनल UI आपके काम में बाधा डालता है, तो [issue खोलें](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) या [pull request भेजें](CONTRIBUTING.md), ताकि हम मिलकर इसे बेहतर बना सकें। पहले योगदान का स्वागत है और स्वीकार किए गए काम का श्रेय योगदानकर्ताओं के पास रहता है।
 
 [Discord](https://discord.gg/37gfS3ksug) से जुड़ें, या WeChat पर Hunter (`hunterbown`) को जोड़कर Whale Brothers समूह में शामिल होने के लिए कहें।
 

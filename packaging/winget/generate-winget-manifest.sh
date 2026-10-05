@@ -59,14 +59,14 @@ bump_manifest() {
   fi
   # PackageVersion + ReleaseNotes
   sed -i.bak -E "s/^PackageVersion:.*/PackageVersion: ${version}/" "$file"
-  sed -i.bak -E "s|ReleaseNotes:.*|ReleaseNotes: https://github.com/Hmbown/CodeWhale/releases/tag/v${version}|" "$file"
-  sed -i.bak -E "s|ReleaseNotesUrl:.*|ReleaseNotesUrl: https://github.com/Hmbown/CodeWhale/releases/tag/v${version}|" "$file"
+  sed -i.bak -E "s|ReleaseNotes:.*|ReleaseNotes: https://github.com/codewhale-hq/CodeWhale/releases/tag/v${version}|" "$file"
+  sed -i.bak -E "s|ReleaseNotesUrl:.*|ReleaseNotesUrl: https://github.com/codewhale-hq/CodeWhale/releases/tag/v${version}|" "$file"
   # Installer URLs (all five)
-  sed -i.bak -E "s|https://github.com/Hmbown/CodeWhale/releases/download/v[0-9.]+/CodeWhaleSetup.exe|https://github.com/Hmbown/CodeWhale/releases/download/v${version}/CodeWhaleSetup.exe|g" "$file"
-  sed -i.bak -E "s|https://github.com/Hmbown/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-x64\.zip|https://github.com/Hmbown/CodeWhale/releases/download/v${version}/codewhale-windows-x64.zip|g" "$file"
-  sed -i.bak -E "s|https://github.com/Hmbown/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-x64-portable\.zip|https://github.com/Hmbown/CodeWhale/releases/download/v${version}/codewhale-windows-x64-portable.zip|g" "$file"
-  sed -i.bak -E "s|https://github.com/Hmbown/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-arm64\.zip|https://github.com/Hmbown/CodeWhale/releases/download/v${version}/codewhale-windows-arm64.zip|g" "$file"
-  sed -i.bak -E "s|https://github.com/Hmbown/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-arm64-portable\.zip|https://github.com/Hmbown/CodeWhale/releases/download/v${version}/codewhale-windows-arm64-portable.zip|g" "$file"
+  sed -i.bak -E "s|https://github.com/codewhale-hq/CodeWhale/releases/download/v[0-9.]+/CodeWhaleSetup.exe|https://github.com/codewhale-hq/CodeWhale/releases/download/v${version}/CodeWhaleSetup.exe|g" "$file"
+  sed -i.bak -E "s|https://github.com/codewhale-hq/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-x64\.zip|https://github.com/codewhale-hq/CodeWhale/releases/download/v${version}/codewhale-windows-x64.zip|g" "$file"
+  sed -i.bak -E "s|https://github.com/codewhale-hq/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-x64-portable\.zip|https://github.com/codewhale-hq/CodeWhale/releases/download/v${version}/codewhale-windows-x64-portable.zip|g" "$file"
+  sed -i.bak -E "s|https://github.com/codewhale-hq/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-arm64\.zip|https://github.com/codewhale-hq/CodeWhale/releases/download/v${version}/codewhale-windows-arm64.zip|g" "$file"
+  sed -i.bak -E "s|https://github.com/codewhale-hq/CodeWhale/releases/download/v[0-9.]+/codewhale-windows-arm64-portable\.zip|https://github.com/codewhale-hq/CodeWhale/releases/download/v${version}/codewhale-windows-arm64-portable.zip|g" "$file"
   sed -i.bak -E "s/^    ReleaseDate:.*/    ReleaseDate: ${today}/g" "$file"
   rm -f "$file.bak"
 

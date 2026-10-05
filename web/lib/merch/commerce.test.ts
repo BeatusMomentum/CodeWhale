@@ -98,7 +98,7 @@ describe("commerce trust boundaries", () => {
   });
   it("rejects remote/unreviewed postcodes and unapproved contributor print languages", () => {
     expect(() => reviewedRoute(config, validateQuoteInput({ ...input, address: { ...input.address, postalCode: "94199" } }))).toThrow();
-    const c = validateQuoteInput({ ...input, productId: "contributor", contributor: { github: "", contribution: "https://github.com/Hmbown/CodeWhale/pull/123", language: "zh", phraseIndex: 1 } });
+    const c = validateQuoteInput({ ...input, productId: "contributor", contributor: { github: "", contribution: "https://github.com/codewhale-hq/CodeWhale/pull/123", language: "zh", phraseIndex: 1 } });
     expect(() => reviewedRoute(config, c)).toThrow();
     c.contributor!.language = "en";
     expect(reviewedRoute(config, c).designCode).toBe("fixture-en-1");
@@ -235,7 +235,7 @@ describe("manual supplier handoff", () => {
   it("previews frozen SKU/art/address without forwarding contributor identity", async () => {
     const quote = await paid();
     const stored = JSON.parse(db.db.prepare("SELECT quote_json FROM merch_orders WHERE id=?").get(quote.quoteId)?.quote_json as string) as Quote;
-    stored.input.contributor = { github: "private-identity", contribution: "https://github.com/Hmbown/CodeWhale/pull/123", language: "en", phraseIndex: 1 };
+    stored.input.contributor = { github: "private-identity", contribution: "https://github.com/codewhale-hq/CodeWhale/pull/123", language: "en", phraseIndex: 1 };
     const body = JSON.stringify(supplierRequest(stored));
     expect(body).not.toContain("private-identity"); expect(body).not.toContain("github.com");
     expect(body).toContain("fixture-design"); expect(body).toContain("fixture-sku");

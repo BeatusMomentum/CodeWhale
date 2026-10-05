@@ -1,7 +1,7 @@
 //! Self-update for the `codewhale` binary.
 //!
 //! The `update` subcommand fetches the latest release from
-//! `github.com/Hmbown/CodeWhale/releases/latest`, downloads the
+//! `github.com/codewhale-hq/CodeWhale/releases/latest`, downloads the
 //! platform-correct binary, verifies its SHA256 checksum, and atomically
 //! replaces the currently running binary.
 
@@ -28,9 +28,9 @@ use std::time::Duration;
 
 mod compiled_host;
 
-const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/Hmbown/CodeWhale/releases/latest";
+const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/codewhale-hq/CodeWhale/releases/latest";
 const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
-    "https://github.com/Hmbown/CodeWhale/releases/download";
+    "https://github.com/codewhale-hq/CodeWhale/releases/download";
 const UPDATE_HTTP_ATTEMPTS: usize = 3;
 const UPDATE_HTTP_RETRY_DELAY_MS: u64 = 100;
 /// Ceiling for one asset download. Generous, because release binaries are tens
@@ -1732,8 +1732,8 @@ fn is_plausible_release_tag(tag: &str) -> bool {
 
 fn release_tag_from_github_release_html(body: &str) -> Option<String> {
     const MARKERS: &[&str] = &[
-        "/Hmbown/CodeWhale/releases/tag/",
-        "/hmbown/CodeWhale/releases/tag/",
+        "/codewhale-hq/CodeWhale/releases/tag/",
+        "/codewhale-hq/CodeWhale/releases/tag/",
         "/releases/tag/",
     ];
     for marker in MARKERS {
@@ -2949,7 +2949,7 @@ mod tests {
         assert!(message.contains("command -v codewhale codew"));
         assert!(message.contains("package manager"));
         assert!(!message.contains("uninstall"));
-        assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
+        assert!(message.contains("https://github.com/codewhale-hq/CodeWhale/releases/latest"));
     }
 
     #[test]
@@ -3581,7 +3581,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
 
     #[test]
     fn github_release_url_parser_extracts_tag() {
-        let url = reqwest::Url::parse("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.61")
+        let url = reqwest::Url::parse("https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.61")
             .unwrap();
 
         assert_eq!(
@@ -3597,13 +3597,13 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(release.tag_name, "v0.8.61");
         assert_eq!(
             release.assets[0].browser_download_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-artifacts-sha256.txt"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v0.8.61/codewhale-artifacts-sha256.txt"
         );
         let dispatcher =
             select_platform_asset(&release, "codewhale-macos-arm64").expect("dispatcher asset");
         assert_eq!(
             dispatcher.browser_download_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-macos-arm64"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v0.8.61/codewhale-macos-arm64"
         );
         assert_eq!(release.assets.len(), 2);
         assert!(select_platform_asset(&release, "codewhale-tui-macos-arm64").is_none());
@@ -3612,7 +3612,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     #[test]
     fn latest_stable_redirect_fallback_reads_tag_url() {
         let (url, request_rx, handle) = serve_http_once("200 OK", "text/html", b"<html></html>");
-        let tag_url = url.replace("/release", "/Hmbown/CodeWhale/releases/tag/v9.9.9");
+        let tag_url = url.replace("/release", "/codewhale-hq/CodeWhale/releases/tag/v9.9.9");
 
         let tag = fetch_latest_stable_tag_from_redirect_url(&tag_url, None)
             .expect("tag should parse from final URL");
@@ -3620,7 +3620,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(tag, "v9.9.9");
         let request = request_rx.recv().expect("captured request");
         assert!(
-            request.starts_with("GET /Hmbown/CodeWhale/releases/tag/v9.9.9 "),
+            request.starts_with("GET /codewhale-hq/CodeWhale/releases/tag/v9.9.9 "),
             "got {request:?}"
         );
         handle.join().expect("test server thread");
@@ -3629,8 +3629,8 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     #[test]
     fn github_release_html_parser_skips_empty_first_marker() {
         let body = r#"
-            <a href="/Hmbown/CodeWhale/releases/tag/?expanded=true">generic</a>
-            <a href="/Hmbown/CodeWhale/releases/tag/v9.9.9">latest</a>
+            <a href="/codewhale-hq/CodeWhale/releases/tag/?expanded=true">generic</a>
+            <a href="/codewhale-hq/CodeWhale/releases/tag/v9.9.9">latest</a>
         "#;
 
         assert_eq!(
@@ -3809,13 +3809,13 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
                     Asset {
                         name: "codewhale-linux-x64".to_string(),
                         browser_download_url: format!(
-                            "https://github.com/Hmbown/CodeWhale/releases/download/{tag_name}/codewhale-linux-x64"
+                            "https://github.com/codewhale-hq/CodeWhale/releases/download/{tag_name}/codewhale-linux-x64"
                         ),
                     },
                     Asset {
                         name: CHECKSUM_MANIFEST_ASSET.to_string(),
                         browser_download_url: format!(
-                            "https://github.com/Hmbown/CodeWhale/releases/download/{tag_name}/{CHECKSUM_MANIFEST_ASSET}"
+                            "https://github.com/codewhale-hq/CodeWhale/releases/download/{tag_name}/{CHECKSUM_MANIFEST_ASSET}"
                         ),
                     },
                 ],
@@ -3850,7 +3850,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(*requested.lock().unwrap(), ["GitHub Releases"]);
         assert_eq!(
             plan.binary_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v9.9.9/codewhale-linux-x64"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v9.9.9/codewhale-linux-x64"
         );
     }
 
@@ -3985,7 +3985,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
 
         assert_eq!(
             candidate.manifest_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.9.9/codewhale-artifacts-sha256.txt"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v0.9.9/codewhale-artifacts-sha256.txt"
         );
         assert_eq!(
             candidate.binary_url,
@@ -4500,8 +4500,8 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     fn update_hosts_are_an_allow_list_over_https() {
         let strict = UpdateTransportPolicy::strict();
         for allowed in [
-            "https://github.com/Hmbown/CodeWhale/releases/latest",
-            "https://api.github.com/repos/Hmbown/CodeWhale/releases/latest",
+            "https://github.com/codewhale-hq/CodeWhale/releases/latest",
+            "https://api.github.com/repos/codewhale-hq/CodeWhale/releases/latest",
             "https://release-assets.githubusercontent.com/x",
             "https://objects.githubusercontent.com/x",
             "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v1/a",
@@ -4509,7 +4509,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             strict.check_url(&url(allowed)).expect(allowed);
         }
         for refused in [
-            "http://github.com/Hmbown/CodeWhale",
+            "http://github.com/codewhale-hq/CodeWhale",
             "https://github.com.evil.example/a",
             "https://evilgithub.com/a",
             "https://notcnb.cool/a",
@@ -4690,7 +4690,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     fn release_tags_taken_from_a_page_must_look_like_tags() {
         let page = |tag: &str| {
             url(&format!(
-                "https://github.com/Hmbown/CodeWhale/releases/tag/{tag}"
+                "https://github.com/codewhale-hq/CodeWhale/releases/tag/{tag}"
             ))
         };
         assert_eq!(

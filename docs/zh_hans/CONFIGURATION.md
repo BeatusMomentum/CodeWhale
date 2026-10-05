@@ -1549,7 +1549,7 @@ quiet = false
 
 #### macOS：为什么横幅显示 “Script Editor”
 
-在自身不提供通知转义的 macOS 终端上——Apple Terminal、VS Code 和 JetBrains 内嵌终端、没有 `LC_TERMINAL` 的普通 tmux——`method = "auto"` 会回退到 `osascript` 的 `display notification`。该命令是代表*已打包的*宿主进程发出通知，而 `/usr/bin/osascript` 没有打包，所以 macOS 把横幅归因于 `com.apple.ScriptEditor2`。这种归属提供了 Script Editor 的图标，并拥有“系统设置 → 通知”里的条目（提醒样式、预览、勿扰）。`display notification` 没有图标参数，所以无法从通知代码里修复；这需要 Codewhale 发布真正的 `.app` 包。已在 [#4834](https://github.com/Hmbown/CodeWhale/issues/4834) 中跟踪。在此期间，iTerm2、WezTerm、Ghostty 和 kitty 会被优先匹配，使用它们自己的通知协议，而 `method = "osc9"` / `"bel"` / `"off"` 可以显式退出 `osascript` 路径。
+在自身不提供通知转义的 macOS 终端上——Apple Terminal、VS Code 和 JetBrains 内嵌终端、没有 `LC_TERMINAL` 的普通 tmux——`method = "auto"` 会回退到 `osascript` 的 `display notification`。该命令是代表*已打包的*宿主进程发出通知，而 `/usr/bin/osascript` 没有打包，所以 macOS 把横幅归因于 `com.apple.ScriptEditor2`。这种归属提供了 Script Editor 的图标，并拥有“系统设置 → 通知”里的条目（提醒样式、预览、勿扰）。`display notification` 没有图标参数，所以无法从通知代码里修复；这需要 Codewhale 发布真正的 `.app` 包。已在 [#4834](https://github.com/codewhale-hq/CodeWhale/issues/4834) 中跟踪。在此期间，iTerm2、WezTerm、Ghostty 和 kitty 会被优先匹配，使用它们自己的通知协议，而 `method = "osc9"` / `"bel"` / `"off"` 可以显式退出 `osascript` 路径。
 
 ## 终端中的自动化
 

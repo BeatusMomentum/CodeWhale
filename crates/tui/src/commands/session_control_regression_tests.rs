@@ -438,7 +438,7 @@ fn remote_env_open_encodes_branch_and_never_echoes_credentials() {
     let secret = "top-secret-token";
     init_repo(
         harness.temp.path(),
-        &format!("https://hunter:{secret}@github.com/Hmbown/CodeWhale.git"),
+        &format!("https://hunter:{secret}@github.com/codewhale-hq/CodeWhale.git"),
         "feature/mobile&cloud-{url}",
     );
 
@@ -458,18 +458,18 @@ fn remote_env_open_encodes_branch_and_never_echoes_credentials() {
 fn remote_env_supported_https_ssh_and_cnb_origins_remain_accepted() {
     for (origin, expected) in [
         (
-            "https://github.com/Hmbown/CodeWhale.git",
+            "https://github.com/codewhale-hq/CodeWhale.git",
             "Hmbown%2FCodeWhale",
         ),
         (
-            "https://user:token@github.com/Hmbown/CodeWhale",
+            "https://user:token@github.com/codewhale-hq/CodeWhale",
             "Hmbown%2FCodeWhale",
         ),
         (
-            "ssh://git@github.com/Hmbown/CodeWhale.git",
+            "ssh://git@github.com/codewhale-hq/CodeWhale.git",
             "Hmbown%2FCodeWhale",
         ),
-        ("git@github.com:Hmbown/CodeWhale.git", "Hmbown%2FCodeWhale"),
+        ("git@github.com:codewhale-hq/CodeWhale.git", "Hmbown%2FCodeWhale"),
         ("https://cnb.cool/whale/codewhale.git", "whale%2Fcodewhale"),
         (
             "ssh://git@cnb.cool:2222/whale/codewhale.git",

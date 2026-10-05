@@ -2960,7 +2960,7 @@ Script Editor icon and owns the System Settings → Notifications entry
 (alert style, previews, Do Not Disturb). `display notification` has no
 icon parameter, so this cannot be fixed from the notification code; it
 needs Codewhale to ship a real `.app` bundle. Tracked in
-[#4834](https://github.com/Hmbown/CodeWhale/issues/4834). In the meantime,
+[#4834](https://github.com/codewhale-hq/CodeWhale/issues/4834). In the meantime,
 iTerm2, WezTerm, Ghostty, and kitty are matched first and use their own
 notification protocols, and `method = "osc9"` / `"bel"` / `"off"` opt out
 of the `osascript` path explicitly.

@@ -84,7 +84,7 @@ describe("Ratatui explorer", () => {
       const data = JSON.parse(readFileSync(join(publicRoot, "motion", `${id}.json`), "utf8"));
       expect(data.frames.length).toBeGreaterThan(1);
       expect(data.frameMs).toBeGreaterThanOrEqual(20);
-      expect(data.source).toMatch(/^https:\/\/github\.com\/Hmbown\/codewhale-ratatui\/blob\/[a-f0-9]{40}\//);
+      expect(data.source).toMatch(/^https:\/\/github\.com\/codewhale-hq\/codewhale-ratatui\/blob\/[a-f0-9]{40}\//);
     }
     expect(motionId(catalogue.entries.find((entry) => entry.name === "showcase-work")!, "light-truecolor")).toBe("studio-light");
     expect(catalogue.profiles.map((profile) => profile.id)).toEqual(expect.arrayContaining(["ascii", "no-color", "ansi-16"]));

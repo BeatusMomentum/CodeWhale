@@ -380,7 +380,7 @@ fn client_user_agent(_api_provider: ProviderKind) -> &'static str {
     concat!(
         "Mozilla/5.0 (compatible; codewhale/",
         env!("CARGO_PKG_VERSION"),
-        "; +https://github.com/Hmbown/CodeWhale)"
+        "; +https://github.com/codewhale-hq/CodeWhale)"
     )
 }
 
@@ -2515,7 +2515,7 @@ pub async fn verify_provider_api_key(
         .user_agent(concat!(
             "Mozilla/5.0 (compatible; codewhale/",
             env!("CARGO_PKG_VERSION"),
-            "; +https://github.com/Hmbown/CodeWhale)"
+            "; +https://github.com/codewhale-hq/CodeWhale)"
         ))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))

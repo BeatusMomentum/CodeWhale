@@ -3616,7 +3616,7 @@ fn revoke_owned_login_locked_with(
 /// configured, a malformed generation pointer (a different, already
 /// fail-closed failure), or a generation whose owned file is present.
 ///
-/// [#5032]: https://github.com/Hmbown/CodeWhale/issues/5032
+/// [#5032]: https://github.com/codewhale-hq/CodeWhale/issues/5032
 #[must_use]
 pub fn owned_generation_is_dangling(provider: OAuthProvider, config: &Config) -> bool {
     let Ok(identity) = config.builtin_provider_identity(provider.api()) else {
@@ -3650,7 +3650,7 @@ pub fn owned_generation_is_dangling(provider: OAuthProvider, config: &Config) ->
 /// error as non-fatal — log a warning and continue. Returns `Ok(())` when
 /// the stale pointer was removed (or was already absent).
 ///
-/// [#5032]: https://github.com/Hmbown/CodeWhale/issues/5032
+/// [#5032]: https://github.com/codewhale-hq/CodeWhale/issues/5032
 pub fn clear_dangling_generation(
     provider: OAuthProvider,
     config_path: Option<&Path>,

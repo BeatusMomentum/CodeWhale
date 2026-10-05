@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale وكيل مفتوح المصدر يقرأ مشروعك ويعدّل الملفات ويشغّل الأوامر ويتحقق من عمله باستخدام نموذج مستضاف أو محلي تختاره. ابدأ بمهمة واحدة في الطرفية. وللأعمال الأكبر، وزّع أجزاء العمل على وكلاء بنماذج وأدوار مختلفة.
@@ -9,7 +9,7 @@ Codewhale وكيل مفتوح المصدر يقرأ مشروعك ويعدّل ا
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 يختار المثبّت أحدث إصدار منشور. ويصف [سجل التغييرات](CHANGELOG.md) أيضًا النسخة المرشحة غير المنشورة للإصدار التالي؛ ولا تُضمّن هذه التغييرات في التنزيلات المنشورة حتى يصبح الإصدار متاحًا.
 
-على Windows، نزّل المثبّت أو الأرشيف المناسب من [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). لتحديث تثبيت مباشر موجود، شغّل `codewhale update`، أو `codewhale update --check` للفحص فقط. يعرض المحدّث مسار الملف التنفيذي ويحتفظ بالبنيات الأحدث. npm وCargo خياران ثانويان؛ راجع [دليل التثبيت](docs/INSTALL.md) للانتقال من تثبيت يديره مدير حزم وإعداد PATH.
+على Windows، نزّل المثبّت أو الأرشيف المناسب من [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest). لتحديث تثبيت مباشر موجود، شغّل `codewhale update`، أو `codewhale update --check` للفحص فقط. يعرض المحدّث مسار الملف التنفيذي ويحتفظ بالبنيات الأحدث. npm وCargo خياران ثانويان؛ راجع [دليل التثبيت](docs/INSTALL.md) للانتقال من تثبيت يديره مدير حزم وإعداد PATH.
 
 يفتح التشغيل الأول مباشرةً على محرر الرسائل، ولا يرشدك خلال خطوات إعداد. تتطلب ردود النموذج الاتصال بنموذج مستضاف أو محلي: وإلى أن يتم ذلك، تعرض شاشة البدء "no model connected". شغّل `/provider` (أو اضغط F3) لإضافة مفتاح لخدمة مستضافة أو اختيار بيئة تشغيل محلية. وإذا كان Ollama يعمل بالفعل مع نموذج محادثة، ينتقل Codewhale إليه تلقائيًا. ويدعم Codewhale أيضًا npm وCargo كخياري تحزيم ثانويين، إلى جانب Docker وNix وScoop وAndroid/Termux ومرآة CNB اختيارية. تتوفر تعليمات انتقال للتثبيتات الحالية التي يديرها مدير حزم. راجع [المساعدة بشأن التثبيت وPATH](docs/INSTALL.md).
 
@@ -88,7 +88,7 @@ codewhale exec "fix the failing tests and explain what changed"
 
 ## انضم إلى المجتمع
 
-**نرحب بتقارير الأخطاء وأفكار الميزات وطلبات السحب**، سواء كنت تستخدم Codewhale منذ أشهر أو تجربه للمرة الأولى. إذا كان أحد الموفّرين غير متاح، أو كان مسار العمل غير مريح، أو كانت واجهة الطرفية تعيقك، [فافتح issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) أو [أرسل pull request](CONTRIBUTING.md) لنحسّنه معًا. نرحب بالمساهمات الأولى، ويظل كل مساهم منسوبًا إلى العمل الذي يُدمج في المشروع.
+**نرحب بتقارير الأخطاء وأفكار الميزات وطلبات السحب**، سواء كنت تستخدم Codewhale منذ أشهر أو تجربه للمرة الأولى. إذا كان أحد الموفّرين غير متاح، أو كان مسار العمل غير مريح، أو كانت واجهة الطرفية تعيقك، [فافتح issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) أو [أرسل pull request](CONTRIBUTING.md) لنحسّنه معًا. نرحب بالمساهمات الأولى، ويظل كل مساهم منسوبًا إلى العمل الذي يُدمج في المشروع.
 
 انضم إلى [Discord](https://discord.gg/37gfS3ksug)، أو أضف Hunter على WeChat (`hunterbown`) واطلب الانضمام إلى مجموعة Whale Brothers.
 

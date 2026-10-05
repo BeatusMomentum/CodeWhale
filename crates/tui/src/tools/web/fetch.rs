@@ -27,7 +27,7 @@ const MAX_REDIRECTS: usize = 5;
 const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (compatible; codewhale/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/Hmbown/CodeWhale)"
+    "; +https://github.com/codewhale-hq/CodeWhale)"
 );
 
 #[derive(Debug, Clone)]

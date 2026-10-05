@@ -470,6 +470,6 @@ deliberately bounded converter.
 ## Community context
 
 This guide responds to [giancarlocp's request for plugin authoring guidance
-and OpenCode conversion in discussion #5827](https://github.com/Hmbown/Codewhale/discussions/5827).
+and OpenCode conversion in discussion #5827](https://github.com/codewhale-hq/Codewhale/discussions/5827).
 The Chinese companion follows the documentation work requested by
-[SparkofSpike in issue #5482](https://github.com/Hmbown/Codewhale/issues/5482).
+[SparkofSpike in issue #5482](https://github.com/codewhale-hq/Codewhale/issues/5482).

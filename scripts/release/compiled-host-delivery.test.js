@@ -53,7 +53,7 @@ test('collector retains same tested bytes, rejects mixed source and has no impli
 });
 test('CI collector accepts only green exact official workflow and same contained image/log', t => {
   const dir = temp(t), output = path.join(dir, 'proof'), image = Buffer.from('native-tested'), log = Buffer.from('actual-native-log');
-  let run = { workflow_id: 42, path: '.github/workflows/ci.yml', head_sha: source, status: 'completed', conclusion: 'success', repository: { full_name: 'Hmbown/CodeWhale' } };
+  let run = { workflow_id: 42, path: '.github/workflows/ci.yml', head_sha: source, status: 'completed', conclusion: 'success', repository: { full_name: 'codewhale-hq/CodeWhale' } };
   let requestedArtifact, nativePassed = hosts.nativeMinimum('linux-x64');
   const exec = (_binary, args) => {
     if (args[0] === 'run') {
@@ -67,7 +67,7 @@ test('CI collector accepts only green exact official workflow and same contained
     if (args[1].includes('/artifacts?')) return JSON.stringify([{ artifacts: [{ name: 'native-compiled-host-Linux-X64', expired: false }] }]);
     return JSON.stringify(run);
   };
-  const request = { repo: 'Hmbown/CodeWhale', runId: '123', sourceSha: source, target: 'linux-x64', output };
+  const request = { repo: 'codewhale-hq/CodeWhale', runId: '123', sourceSha: source, target: 'linux-x64', output };
   assert.equal(fetchProof(request, exec).image, path.join(output, 'codewhale-extension-host'));
   assert.equal(requestedArtifact, 'native-compiled-host-Linux-X64');
   fs.rmSync(output, { recursive: true }); nativePassed = 1;

@@ -8,7 +8,7 @@ import { getRatatuiCopy } from "@/lib/content/ratatui";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { readCatalogue } from "@/lib/ratatui/catalogue";
 
-const REPOSITORY = "https://github.com/Hmbown/codewhale-ratatui";
+const REPOSITORY = "https://github.com/codewhale-hq/codewhale-ratatui";
 
 export const revalidate = 3600;
 

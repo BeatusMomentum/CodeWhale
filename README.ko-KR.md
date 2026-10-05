@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale은 사용자가 선택한 호스팅 모델이나 로컬 모델로 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하며, 작업 결과를 확인하는 오픈 소스 에이전트입니다. 터미널에서 하나의 작업으로 시작하세요. 더 큰 작업은 서로 다른 모델과 역할을 가진 에이전트에게 나누어 맡길 수 있습니다.
@@ -9,7 +9,7 @@ Codewhale은 사용자가 선택한 호스팅 모델이나 로컬 모델로 프�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 설치 도구는 공개된 최신 릴리스를 선택합니다. [변경 이력](CHANGELOG.md)에는 다음 릴리스의 미공개 후보 버전도 설명되어 있지만, 해당 릴리스가 공개되기 전에는 그 변경 사항이 공개 다운로드에 포함되지 않습니다.
 
-Windows에서는 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest)에서 맞는 설치 프로그램이나 아카이브를 받으세요. 기존 직접 설치는 `codewhale update`로 업데이트하고, 확인만 하려면 `codewhale update --check`를 사용하세요. 업데이트 도구는 실행 파일 경로를 표시하며 더 최신인 빌드는 유지합니다. npm과 Cargo는 보조 패키지 설치 방법입니다. 패키지 관리자 설치에서 이전하거나 PATH를 설정하려면 [설치 안내서](docs/INSTALL.md)를 참조하세요.
+Windows에서는 [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest)에서 맞는 설치 프로그램이나 아카이브를 받으세요. 기존 직접 설치는 `codewhale update`로 업데이트하고, 확인만 하려면 `codewhale update --check`를 사용하세요. 업데이트 도구는 실행 파일 경로를 표시하며 더 최신인 빌드는 유지합니다. npm과 Cargo는 보조 패키지 설치 방법입니다. 패키지 관리자 설치에서 이전하거나 PATH를 설정하려면 [설치 안내서](docs/INSTALL.md)를 참조하세요.
 
 처음 실행하면 바로 입력창(컴포저)이 열리며, 별도의 설정 안내는 없습니다. 모델의 응답을 받으려면 호스팅 모델이나 로컬 모델에 연결해야 합니다. 연결되기 전까지 시작 화면에는 "no model connected"가 표시됩니다. `/provider`를 실행하거나 F3을 눌러 호스팅 키를 추가하거나 로컬 런타임을 선택하세요. Ollama가 이미 채팅 모델과 함께 실행 중이면 Codewhale이 자동으로 그쪽으로 전환합니다. Codewhale은 보조 패키지 설치 경로로 npm과 Cargo를 지원하며, Docker, Nix, Scoop, Android/Termux와 선택적으로 사용할 수 있는 CNB 미러도 지원합니다. 패키지 관리자로 설치한 기존 버전에는 이전 안내가 제공됩니다. [설치 및 PATH 도움말](docs/INSTALL.md)을 참조하세요.
 
@@ -88,7 +88,7 @@ Codewhale은 사용자가 허용한 접근 권한으로 사용자의 컴퓨터�
 
 ## 커뮤니티 참여
 
-**버그 보고, 기능 제안, pull request를 환영합니다.** Codewhale을 몇 달간 사용했든 처음 사용해 보든 누구나 참여할 수 있습니다. 필요한 공급자가 없거나 워크플로가 불편하거나 터미널 UI가 작업을 방해한다면 [issue를 등록](https://github.com/Hmbown/CodeWhale/issues/new/choose)하거나 [pull request를 보내](CONTRIBUTING.md) 함께 개선해 주세요. 첫 기여도 환영하며, 반영된 작업에는 기여자의 이름을 남깁니다.
+**버그 보고, 기능 제안, pull request를 환영합니다.** Codewhale을 몇 달간 사용했든 처음 사용해 보든 누구나 참여할 수 있습니다. 필요한 공급자가 없거나 워크플로가 불편하거나 터미널 UI가 작업을 방해한다면 [issue를 등록](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)하거나 [pull request를 보내](CONTRIBUTING.md) 함께 개선해 주세요. 첫 기여도 환영하며, 반영된 작업에는 기여자의 이름을 남깁니다.
 
 [Discord](https://discord.gg/37gfS3ksug)에 참여하거나 WeChat에서 Hunter(`hunterbown`)를 추가한 뒤 Whale Brothers 그룹 참여를 요청하세요.
 

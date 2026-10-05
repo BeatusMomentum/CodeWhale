@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh sửa tệp, chạy lệnh và kiểm tra công việc của mình bằng mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ mà bạn chọn. Hãy bắt đầu với một tác vụ trong terminal. Với công việc lớn hơn, bạn có thể giao từng phần cho các tác nhân dùng mô hình và đảm nhiệm vai trò khác nhau.
@@ -9,7 +9,7 @@ Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh s�
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ Nếu chạy `codewhale` trực tiếp mà báo "command not found", nghĩa là 
 
 Trình cài đặt chọn bản phát hành mới nhất đã được công bố. [Nhật ký thay đổi](CHANGELOG.md) cũng mô tả bản ứng viên chưa công bố của lần phát hành tiếp theo; những thay đổi đó chỉ có trong các bản tải xuống công khai khi bản phát hành tương ứng được công bố.
 
-Trên Windows, tải bộ cài hoặc gói lưu trữ phù hợp từ [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Với bản cài trực tiếp đã có, chạy `codewhale update`; dùng `codewhale update --check` nếu chỉ muốn kiểm tra. Trình cập nhật hiển thị đường dẫn tệp thực thi và giữ lại các bản dựng mới hơn. npm và Cargo là lựa chọn phụ; xem [hướng dẫn cài đặt](docs/INSTALL.md) để chuyển từ trình quản lý gói và thiết lập PATH.
+Trên Windows, tải bộ cài hoặc gói lưu trữ phù hợp từ [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest). Với bản cài trực tiếp đã có, chạy `codewhale update`; dùng `codewhale update --check` nếu chỉ muốn kiểm tra. Trình cập nhật hiển thị đường dẫn tệp thực thi và giữ lại các bản dựng mới hơn. npm và Cargo là lựa chọn phụ; xem [hướng dẫn cài đặt](docs/INSTALL.md) để chuyển từ trình quản lý gói và thiết lập PATH.
 
 Lần chạy đầu tiên mở thẳng vào ô soạn tin; không có bước hướng dẫn thiết lập. Để nhận phản hồi từ mô hình, bạn cần kết nối với mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ: cho đến khi kết nối, màn hình khởi động hiển thị "no model connected". Chạy `/provider` (hoặc nhấn F3) để thêm khóa dịch vụ lưu trữ hoặc chọn runtime cục bộ. Nếu Ollama đang chạy sẵn với một mô hình trò chuyện, Codewhale sẽ tự chuyển sang đó. Codewhale cũng hỗ trợ npm và Cargo như các hình thức đóng gói thứ cấp, cùng với Docker, Nix, Scoop, Android/Termux và bản sao CNB tùy chọn. Các bản cài đặt hiện có qua trình quản lý gói sẽ được hướng dẫn chuyển đổi. Xem [trợ giúp cài đặt và PATH](docs/INSTALL.md).
 
@@ -88,7 +88,7 @@ Codewhale chạy trên máy của bạn với quyền truy cập do bạn cấp.
 
 ## Tham gia cộng đồng
 
-**Chúng tôi chào đón báo cáo lỗi, ý tưởng tính năng và pull request**, dù bạn đã dùng Codewhale nhiều tháng hay mới thử lần đầu. Nếu thiếu một nhà cung cấp, quy trình còn bất tiện hoặc giao diện terminal cản trở công việc, hãy [mở issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) hoặc [gửi pull request](CONTRIBUTING.md) để cùng cải thiện. Chúng tôi chào đón những đóng góp đầu tiên và luôn ghi nhận người đóng góp cho phần việc đã được hợp nhất.
+**Chúng tôi chào đón báo cáo lỗi, ý tưởng tính năng và pull request**, dù bạn đã dùng Codewhale nhiều tháng hay mới thử lần đầu. Nếu thiếu một nhà cung cấp, quy trình còn bất tiện hoặc giao diện terminal cản trở công việc, hãy [mở issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) hoặc [gửi pull request](CONTRIBUTING.md) để cùng cải thiện. Chúng tôi chào đón những đóng góp đầu tiên và luôn ghi nhận người đóng góp cho phần việc đã được hợp nhất.
 
 Tham gia [Discord](https://discord.gg/37gfS3ksug), hoặc thêm Hunter trên WeChat (`hunterbown`) và đề nghị tham gia nhóm Whale Brothers.
 

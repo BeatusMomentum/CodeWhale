@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:efa9c4d27420 -->
+<!-- source: README.md sha256:66d4f603e764 -->
 # Codewhale
 
 Codewhale és un agent de codi obert que llegeix el teu projecte, edita fitxers, executa ordres i comprova la seva feina amb un model allotjat o local que tu tries. Comença amb una tasca al terminal. Per a una feina més gran, assigna parts de la feina a agents amb models i rols diferents.
@@ -9,7 +9,7 @@ Codewhale és un agent de codi obert que llegeix el teu projecte, edita fitxers,
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
@@ -27,7 +27,7 @@ Si en executar només `codewhale` apareix "command not found", `~/.local/bin` en
 
 L’instal·lador selecciona l’última versió publicada. El [registre de canvis](CHANGELOG.md) també descriu la versió candidata, encara no publicada, de la pròxima versió; aquests canvis no s’inclouen en les descàrregues publicades fins que la versió està disponible.
 
-A Windows, descarrega l’instal·lador o l’arxiu corresponent de [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Per actualitzar una instal·lació directa existent, executa `codewhale update`, o `codewhale update --check` només per comprovar-la. L’actualitzador mostra el camí de l’executable i conserva les compilacions més noves. npm i Cargo són opcions secundàries; consulta la [guia d’instal·lació](docs/INSTALL.md) per migrar una instal·lació gestionada per paquets i configurar PATH.
+A Windows, descarrega l’instal·lador o l’arxiu corresponent de [GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest). Per actualitzar una instal·lació directa existent, executa `codewhale update`, o `codewhale update --check` només per comprovar-la. L’actualitzador mostra el camí de l’executable i conserva les compilacions més noves. npm i Cargo són opcions secundàries; consulta la [guia d’instal·lació](docs/INSTALL.md) per migrar una instal·lació gestionada per paquets i configurar PATH.
 
 La primera execució obre directament el compositor; no et guia per cap configuració. Les respostes del model requereixen un model allotjat o local connectat: fins que n’hi hagi un, la pantalla d’inici indica "no model connected". Executa `/provider` (o prem F3) per afegir una clau allotjada o triar un entorn local. Si Ollama ja s’està executant amb un model de xat, Codewhale hi canvia automàticament. Codewhale també admet npm i Cargo com a opcions secundàries de distribució, a més de Docker, Nix, Scoop, Android/Termux i un mirall CNB opcional. Les instal·lacions existents gestionades per paquets reben instruccions de migració. Consulta l’[ajuda d’instal·lació i PATH](docs/INSTALL.md).
 
@@ -88,7 +88,7 @@ Llegeix l’[ordre d’autorització](docs/AUTHORIZATION_ORDER.md) per conèixer
 
 ## Uneix-te a la comunitat
 
-**Els informes d’errors, les idees de funcionalitats i les pull requests són benvinguts**, tant si fa mesos que fas servir Codewhale com si el proves per primera vegada. Si falta un proveïdor, un flux de treball és incòmode o la interfície del terminal et dificulta la feina, [obre una incidència](https://github.com/Hmbown/CodeWhale/issues/new/choose) o [envia una pull request](CONTRIBUTING.md) perquè el puguem millorar plegats. Les primeres contribucions són benvingudes i qui hi contribueix conserva el reconeixement per la feina incorporada.
+**Els informes d’errors, les idees de funcionalitats i les pull requests són benvinguts**, tant si fa mesos que fas servir Codewhale com si el proves per primera vegada. Si falta un proveïdor, un flux de treball és incòmode o la interfície del terminal et dificulta la feina, [obre una incidència](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) o [envia una pull request](CONTRIBUTING.md) perquè el puguem millorar plegats. Les primeres contribucions són benvingudes i qui hi contribueix conserva el reconeixement per la feina incorporada.
 
 Uneix-te al [Discord](https://discord.gg/37gfS3ksug), o afegeix Hunter a WeChat (`hunterbown`) i demana entrar al grup Whale Brothers.
 

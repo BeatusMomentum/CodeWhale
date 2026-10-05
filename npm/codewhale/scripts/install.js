@@ -124,7 +124,7 @@ function resolveRepo(env = process.env) {
     env.CODEWHALE_GITHUB_REPO ||
     env.DEEPSEEK_TUI_GITHUB_REPO ||
     env.DEEPSEEK_GITHUB_REPO ||
-    "Hmbown/CodeWhale"
+    "codewhale-hq/CodeWhale"
   );
 }
 
@@ -268,7 +268,7 @@ function installFailureHint(error) {
     "    CODEWHALE_RELEASE_BASE_URL=https://<mirror>/<release-asset-directory>/",
     "  or CODEWHALE_USE_CNB_MIRROR=1 on Linux x64.",
     "  The directory must contain codewhale-artifacts-sha256.txt and the platform binaries.",
-    "  See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md#npm-binary-download-times-out",
+    "  See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md#npm-binary-download-times-out",
   ].join("\n");
 }
 
@@ -1382,7 +1382,7 @@ async function raceFirstPartyManifests(sources, options) {
 
 async function selectReleaseSource(options) {
   const version = options.version;
-  const repo = options.repo || "Hmbown/CodeWhale";
+  const repo = options.repo || "codewhale-hq/CodeWhale";
   const env = options.env || process.env;
   const platform =
     options.platform === undefined || options.platform === null

@@ -13,7 +13,7 @@ The command is `codewhale`. `codew` is a shorter alias for the same program.
 
 This guide was written by installing **v0.10.0** (released 2026-09-22) on a
 fresh **Ubuntu 24.04 x86_64** machine, on every path described here. Every
-command shown was run and its output checked (see the [install receipts](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)). Steps that
+command shown was run and its output checked (see the [install receipts](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)). Steps that
 could not be run on that machine are marked **(untested on this VM: reason)**.
 macOS, Windows and Android are out of scope, apart from a few notes. A second
 pass re-ran the installer, manual-download, archive and npm paths, the no-key
@@ -148,7 +148,7 @@ Expected output:
 
 ```
 Installing Codewhale for linux-x64
-Release assets: https://github.com/Hmbown/CodeWhale/releases/latest/download
+Release assets: https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 Install dir: /home/you/.local/bin
 Checksums verified
 Installed checksummed release commands:
@@ -244,7 +244,7 @@ codewhale doctor        # diagnostics; see the note in §8 about what it does NO
 ## 3. Manual download from GitHub Releases
 
 Use this when you want to see and verify every byte yourself. Releases:
-<https://github.com/Hmbown/CodeWhale/releases>. Each platform has **bare
+<https://github.com/codewhale-hq/CodeWhale/releases>. Each platform has **bare
 binaries** (`codewhale-linux-x64`, `codew-linux-x64`, …) and an **archive**
 (`codewhale-linux-x64.tar.gz`) that holds the same two binaries plus an
 `install.sh`.
@@ -253,7 +253,7 @@ binaries** (`codewhale-linux-x64`, `codew-linux-x64`, …) and an **archive**
 
 ```bash
 mkdir -p ~/codewhale-dl && cd ~/codewhale-dl
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64"          # use linux-arm64 on ARM
 curl -fsSLO "$base/codew-linux-x64"
 curl -fsSLO "$base/codewhale-artifacts-sha256.txt"
@@ -287,7 +287,7 @@ the manifest from the same tag.
 
 ```bash
 cd "$(mktemp -d)"
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64.tar.gz"
 curl -fsSLO "$base/codewhale-bundles-sha256.txt"     # note: *bundles*, not *artifacts*
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
@@ -428,7 +428,7 @@ Tested result: **works**, with current stable Rust (1.98.1).
 ### 5b. From a git checkout
 
 ```bash
-git clone --depth 1 --branch v0.10.0 https://github.com/Hmbown/CodeWhale.git
+git clone --depth 1 --branch v0.10.0 https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 cargo install --path crates/cli --locked      # installs ~/.cargo/bin/codewhale
 ```
@@ -511,8 +511,8 @@ execution tool use it when it is on PATH.
 # flakes are still experimental; the tested setup enabled them once:
 mkdir -p ~/.config/nix
 echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
-nix run github:Hmbown/CodeWhale -- --version
-# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:Hmbown/CodeWhale -- --version
+nix run github:codewhale-hq/CodeWhale -- --version
+# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:codewhale-hq/CodeWhale -- --version
 ```
 
 Nix 2.35 installed fine; single-user mode needs `/nix` created by root once.
@@ -784,7 +784,7 @@ following `exec --continue` fails with `No saved sessions found for workspace`.
 
 Everything I checked worked in Ghostty with its default config
 (`TERM=xterm-ghostty`, `COLORTERM=truecolor`). Screenshots are kept with the
-[install receipts](https://github.com/Hmbown/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots).
+[install receipts](https://github.com/codewhale-hq/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots).
 
 | Check | Result |
 |---|---|
@@ -921,7 +921,7 @@ this page. They were **not re-run** for the v0.10.0 install test above
 (out of scope: Windows, macOS, Android/Termux, FreeBSD, mainland-China
 mirrors), apart from the macOS paths noted in [macOS notes](#macos-notes).
 Known contradictions with the published v0.10.0 assets, found by inspecting
-them ([details](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md), D15 and D16):
+them ([details](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md), D15 and D16):
 
 * The winget manifest in `packaging/winget/` is still at 0.9.6.
 * v0.10.0 publishes both `codewhale-windows-x64.zip` (with an `install.bat`
@@ -931,7 +931,7 @@ them ([details](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b
 
 ### Supported platforms and assets
 
-The [latest stable release](https://github.com/Hmbown/CodeWhale/releases/latest)
+The [latest stable release](https://github.com/codewhale-hq/CodeWhale/releases/latest)
 publishes Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, and Android arm64
 assets. Artifact presence is distinct from platform qualification.
 The table below describes the current source tree's platform and secondary
@@ -1075,8 +1075,8 @@ defaults to `~/.local`, while Termux users normally expect commands under
 
 ```bash
 cd "$HOME"
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
 
 tar xzf codewhale-android-arm64.tar.gz
@@ -1269,7 +1269,7 @@ users should install through npm running under native ARM64 Node.js or download
 ARM64 binaries.
 
 **Download** `CodeWhaleSetup.exe` from the
-[Releases page](https://github.com/Hmbown/CodeWhale/releases/latest).
+[Releases page](https://github.com/codewhale-hq/CodeWhale/releases/latest).
 
 **Install** by double-clicking the setup executable. The installer:
 
@@ -1430,7 +1430,7 @@ that session and run `cargo build` from the project root.
 **Build**
 
 ```bash
-git clone https://github.com/Hmbown/CodeWhale.git
+git clone https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 set CARGO_HTTP_CHECK_REVOKE=false   # may be needed behind some Chinese ISPs
 cargo build --release
@@ -1615,6 +1615,6 @@ Use one of these paths:
    assets. See [Section 4](#5-cargo-and-building-from-source).
 
 4. Download both matching `codewhale` and `codew`
-   binaries from the [Releases page](https://github.com/Hmbown/CodeWhale/releases),
+   binaries from the [Releases page](https://github.com/codewhale-hq/CodeWhale/releases),
    place them in a directory on `PATH`, and make them executable. See
    [Section 6](#3-manual-download-from-github-releases).

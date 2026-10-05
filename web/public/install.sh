@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="Hmbown/CodeWhale"
+repo="codewhale-hq/CodeWhale"
 version="${CODEWHALE_VERSION:-latest}"
 release_base="${CODEWHALE_RELEASE_BASE_URL:-${DEEPSEEK_TUI_RELEASE_BASE_URL:-}}"
 
@@ -190,13 +190,13 @@ detect_platform() {
   arch="$(uname -m)"
 
   if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ]; then
-    fail "Android/Termux needs the Android arm64 preview archive, not a Linux binary. See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md"
+    fail "Android/Termux needs the Android arm64 preview archive, not a Linux binary. See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md"
   fi
 
   case "$os" in
     Darwin) platform="macos" ;;
     Linux) platform="linux" ;;
-    *) fail "unsupported OS: $os. Use the matching asset at https://github.com/Hmbown/CodeWhale/releases/latest; npm and Cargo are secondary options." ;;
+    *) fail "unsupported OS: $os. Use the matching asset at https://github.com/codewhale-hq/CodeWhale/releases/latest; npm and Cargo are secondary options." ;;
   esac
 
   case "$arch" in
@@ -460,7 +460,7 @@ if [ "$path_selected" -eq 0 ]; then
       ;;
   esac
   say "Verify: command -v codewhale codew"
-  say "PATH help: https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md#put-it-on-your-path"
+  say "PATH help: https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md#put-it-on-your-path"
 fi
 if ! command -v node >/dev/null 2>&1; then
   say "Computer Use is included and needs Node.js 20 or newer on PATH."

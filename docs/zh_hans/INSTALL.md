@@ -7,7 +7,7 @@ Codewhale 是一个在终端里运行的开源编码智能体（coding agent）�
 
 命令是 `codewhale`。`codew` 是同一个程序的较短别名。
 
-本指南是在一台全新的 **Ubuntu 24.04 x86_64** 机器上安装 **v0.10.0**（2026-09-22 发布）时写成的，这里描述的每条路径都实际走过。文中每条命令都运行过，输出也核对过（见[安装回执](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)）。在那台机器上无法运行的步骤标注为 **（该虚拟机上未测试：原因）**。macOS、Windows 和 Android 不在测试范围内，只有少量说明。第二轮在 **macOS 26.1（Apple silicon）** 上重新运行了安装器、手动下载、压缩包和 npm 路径、无密钥检查以及 zsh 补全，见 [macOS 说明](#macos-说明)。需要调用模型的步骤没有在 macOS 上重跑。
+本指南是在一台全新的 **Ubuntu 24.04 x86_64** 机器上安装 **v0.10.0**（2026-09-22 发布）时写成的，这里描述的每条路径都实际走过。文中每条命令都运行过，输出也核对过（见[安装回执](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)）。在那台机器上无法运行的步骤标注为 **（该虚拟机上未测试：原因）**。macOS、Windows 和 Android 不在测试范围内，只有少量说明。第二轮在 **macOS 26.1（Apple silicon）** 上重新运行了安装器、手动下载、压缩包和 npm 路径、无密钥检查以及 zsh 补全，见 [macOS 说明](#macos-说明)。需要调用模型的步骤没有在 macOS 上重跑。
 
 使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如 2026-09-28 之前的 v0.10.1 源码候选版）。候选版在其标签、校验和与发布资源齐备之前，都不能安装。
 
@@ -108,7 +108,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 ```
 Installing Codewhale for linux-x64
-Release assets: https://github.com/Hmbown/CodeWhale/releases/latest/download
+Release assets: https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 Install dir: /home/you/.local/bin
 Checksums verified
 Installed checksummed release commands:
@@ -183,13 +183,13 @@ codewhale doctor        # diagnostics; see the note in §8 about what it does NO
 
 ## 3. 从 GitHub Releases 手动下载
 
-当你想亲自查看并校验每一个字节时使用。发布页：<https://github.com/Hmbown/CodeWhale/releases>。每个平台都有**裸二进制**（`codewhale-linux-x64`、`codew-linux-x64` 等）和一个**压缩包**（`codewhale-linux-x64.tar.gz`），压缩包里是同样的两个二进制外加一个 `install.sh`。
+当你想亲自查看并校验每一个字节时使用。发布页：<https://github.com/codewhale-hq/CodeWhale/releases>。每个平台都有**裸二进制**（`codewhale-linux-x64`、`codew-linux-x64` 等）和一个**压缩包**（`codewhale-linux-x64.tar.gz`），压缩包里是同样的两个二进制外加一个 `install.sh`。
 
 ### 3a. 裸二进制
 
 ```bash
 mkdir -p ~/codewhale-dl && cd ~/codewhale-dl
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64"          # use linux-arm64 on ARM
 curl -fsSLO "$base/codew-linux-x64"
 curl -fsSLO "$base/codewhale-artifacts-sha256.txt"
@@ -217,7 +217,7 @@ install -m 755 codew-linux-x64     ~/.local/bin/codew
 
 ```bash
 cd "$(mktemp -d)"
-base=https://github.com/Hmbown/CodeWhale/releases/latest/download
+base=https://github.com/codewhale-hq/CodeWhale/releases/latest/download
 curl -fsSLO "$base/codewhale-linux-x64.tar.gz"
 curl -fsSLO "$base/codewhale-bundles-sha256.txt"     # note: *bundles*, not *artifacts*
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
@@ -322,7 +322,7 @@ codewhale --version
 ### 5b. 从 git 检出构建
 
 ```bash
-git clone --depth 1 --branch v0.10.0 https://github.com/Hmbown/CodeWhale.git
+git clone --depth 1 --branch v0.10.0 https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 cargo install --path crates/cli --locked      # installs ~/.cargo/bin/codewhale
 ```
@@ -376,8 +376,8 @@ Run `brew trust --formula hmbown/deepseek-tui/codewhale` or `brew trust hmbown/d
 # flakes are still experimental; the tested setup enabled them once:
 mkdir -p ~/.config/nix
 echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
-nix run github:Hmbown/CodeWhale -- --version
-# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:Hmbown/CodeWhale -- --version
+nix run github:codewhale-hq/CodeWhale -- --version
+# one-off alternative (untested on this VM): nix --extra-experimental-features 'nix-command flakes' run github:codewhale-hq/CodeWhale -- --version
 ```
 
 （注释含义：flakes 仍是实验特性，测试环境一次性启用了它；一次性替代写法在该虚拟机上未测试。）
@@ -596,7 +596,7 @@ codewhale exec --resume <id> "…"
 
 ### Ghostty（已测试：Linux/X11 上的 Ghostty 1.3.1）
 
-我检查的所有项目在 Ghostty 默认配置下（`TERM=xterm-ghostty`、`COLORTERM=truecolor`）都能正常工作。截图与[安装回执](https://github.com/Hmbown/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots)保存在一起。
+我检查的所有项目在 Ghostty 默认配置下（`TERM=xterm-ghostty`、`COLORTERM=truecolor`）都能正常工作。截图与[安装回执](https://github.com/codewhale-hq/Codewhale/tree/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/screenshots)保存在一起。
 
 | 检查项 | 结果 |
 |---|---|
@@ -704,7 +704,7 @@ v0.10.0 的已知 bug。bash 和 fish 没问题。
 
 ## 附录：其他平台（本版未重测）
 
-下面各节原样沿用自本页的上一版。它们**没有**在上文的 v0.10.0 安装测试中重新运行（不在范围内：Windows、macOS、Android/Termux、FreeBSD、中国大陆镜像），仅 [macOS 说明](#macos-说明)中提到的 macOS 路径除外。通过检查已发布的 v0.10.0 资源，发现下列内容与之矛盾（[详情](https://github.com/Hmbown/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md)，D15 和 D16）：
+下面各节原样沿用自本页的上一版。它们**没有**在上文的 v0.10.0 安装测试中重新运行（不在范围内：Windows、macOS、Android/Termux、FreeBSD、中国大陆镜像），仅 [macOS 说明](#macos-说明)中提到的 macOS 路径除外。通过检查已发布的 v0.10.0 资源，发现下列内容与之矛盾（[详情](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/DOC_DEFECTS.md)，D15 和 D16）：
 
 * `packaging/winget/` 里的 winget 清单仍停留在 0.9.6。
 * v0.10.0 同时发布了 `codewhale-windows-x64.zip`（附带一个把文件复制到 `%USERPROFILE%\bin` 的 `install.bat`）和 `codewhale-windows-x64-portable.zip`；下面各节只提到了前者。
@@ -712,7 +712,7 @@ v0.10.0 的已知 bug。bash 和 fish 没问题。
 
 ### 支持平台与发布资源
 
-[最新稳定版](https://github.com/Hmbown/CodeWhale/releases/latest)发布了 Linux x64/arm64、macOS x64/arm64、Windows x64/arm64 和 Android arm64 的资源。资源存在不等于平台已通过验收。下表描述的是当前源码树的平台与次要打包支持；`latest` 安装仍然选择已发布的版本。Android/Termux 为预览状态，等待真机 QA。Linux ARM64 自 v0.8.8 起可用。Linux RISC-V 预编译暂时暂停，因为锁定的 `rquickjs-sys` 依赖没有提供 `riscv64gc-unknown-linux-gnu` 绑定。
+[最新稳定版](https://github.com/codewhale-hq/CodeWhale/releases/latest)发布了 Linux x64/arm64、macOS x64/arm64、Windows x64/arm64 和 Android arm64 的资源。资源存在不等于平台已通过验收。下表描述的是当前源码树的平台与次要打包支持；`latest` 安装仍然选择已发布的版本。Android/Termux 为预览状态，等待真机 QA。Linux ARM64 自 v0.8.8 起可用。Linux RISC-V 预编译暂时暂停，因为锁定的 `rquickjs-sys` 依赖没有提供 `riscv64gc-unknown-linux-gnu` 绑定。
 
 | 平台 | 架构 | GitHub 发布资源 | npm install | `cargo install` |
 | ------------ | ------------ | ----------------------------------------------------- | :---------: | :-------------: |
@@ -803,8 +803,8 @@ pkg install -y ca-certificates curl tar gzip coreutils
 
 ```bash
 cd "$HOME"
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
-curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
+curl -L -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
 sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
 
 tar xzf codewhale-android-arm64.tar.gz
@@ -941,7 +941,7 @@ codewhale --version
 
 NSIS 安装器目前包含 Windows x64 二进制。Windows ARM64 用户应通过在原生 ARM64 Node.js 下运行的 npm 安装，或从同一个发布下载 `codewhale-windows-arm64.zip`；这两条路径使用的都是原生 ARM64 二进制。
 
-从[发布页](https://github.com/Hmbown/CodeWhale/releases/latest)**下载** `CodeWhaleSetup.exe`。
+从[发布页](https://github.com/codewhale-hq/CodeWhale/releases/latest)**下载** `CodeWhaleSetup.exe`。
 
 双击安装程序即可**安装**。安装器会：
 
@@ -1064,7 +1064,7 @@ $env:PATH     = "$msvc\bin\Hostx64\x64;$env:PATH"
 **构建**
 
 ```bash
-git clone https://github.com/Hmbown/CodeWhale.git
+git clone https://github.com/codewhale-hq/CodeWhale.git
 cd CodeWhale
 set CARGO_HTTP_CHECK_REVOKE=false   # may be needed behind some Chinese ISPs
 cargo build --release
@@ -1189,4 +1189,4 @@ target/debug/build/libsqlite3-sys-*/build-script-build
 
 3. 通过 Cargo 安装，它在本地构建，不下载 GitHub 发布资源。见[第 5 节](#5-cargo-与从源码构建)。
 
-4. 从[发布页](https://github.com/Hmbown/CodeWhale/releases)下载匹配的 `codewhale` 和 `codew` 两个二进制，放到 `PATH` 上的某个目录并赋予可执行权限。见[第 3 节](#3-从-github-releases-手动下载)。
+4. 从[发布页](https://github.com/codewhale-hq/CodeWhale/releases)下载匹配的 `codewhale` 和 `codew` 两个二进制，放到 `PATH` 上的某个目录并赋予可执行权限。见[第 3 节](#3-从-github-releases-手动下载)。

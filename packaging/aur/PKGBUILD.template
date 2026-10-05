@@ -17,9 +17,9 @@ conflicts=('codewhale' 'codewhale-tui' 'deepseek' 'deepseek-tui' 'deepseek-tui-b
 replaces=('deepseek-tui-bin')
 options=('!strip')
 
-_release_url="https://github.com/Hmbown/CodeWhale/releases/download/v${pkgver}"
+_release_url="https://github.com/codewhale-hq/CodeWhale/releases/download/v${pkgver}"
 
-source=("LICENSE-${pkgver}::https://raw.githubusercontent.com/Hmbown/CodeWhale/v${pkgver}/LICENSE")
+source=("LICENSE-${pkgver}::https://raw.githubusercontent.com/codewhale-hq/CodeWhale/v${pkgver}/LICENSE")
 sha256sums=('@LICENSE_SHA256@')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::${_release_url}/codewhale-linux-x64.tar.gz")
 sha256sums_x86_64=('@X86_64_SHA256@')

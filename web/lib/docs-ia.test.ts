@@ -255,11 +255,11 @@ describe("navigation parity and accessibility", () => {
       ).toEqual(reference);
       const project = footerProjectLinks(locale, getChrome(locale));
       expect(project.map((l) => l.href), `${locale} footer project routes`).toEqual([
-        "https://github.com/Hmbown/CodeWhale",
-        "https://github.com/Hmbown/CodeWhale/issues",
+        "https://github.com/codewhale-hq/CodeWhale",
+        "https://github.com/codewhale-hq/CodeWhale/issues",
         "https://discord.gg/37gfS3ksug",
         `/${locale}/contribute`,
-        "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+        "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
       ]);
       const legal = footerLegalLinks(locale, getChrome(locale));
       expect(legal.map((l) => l.href), `${locale} footer legal`).toEqual([
@@ -355,7 +355,7 @@ describe("navigation parity and accessibility", () => {
     const license = footerProjectLinks("en", getChrome("en")).at(-1);
     expect(license).toEqual({
       label: "MIT license",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     // zh gets the footer legal labels from its dictionary, not English.
     expect(footerLegalLinks("zh", getChrome("zh")).map((l) => l.label)).toEqual([
