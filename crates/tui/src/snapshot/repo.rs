@@ -19,6 +19,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use wait_timeout::ChildExt as _;
+
 use crate::dependencies::ExternalTool;
 
 use super::paths::{ensure_snapshot_dir, snapshot_git_dir};
@@ -476,13 +478,11 @@ impl SnapshotRepo {
         // and stores metadata in `.git`. We then continue to use
         // explicit `--git-dir` / `--work-tree` flags for every other
         // command so behaviour is invariant of cwd.
-        let init = crate::dependencies::Git::command()
-            .ok_or_else(|| io_other("git not found on PATH"))?
-            .arg("init")
-            .arg("--quiet")
-            .arg(parent)
-            .output()
-            .map_err(|e| io_other(format!("failed to spawn git init: {e}")))?;
+        let mut git =
+            crate::dependencies::Git::command().ok_or_else(|| io_other("git not found on PATH"))?;
+        let init = git.arg("init").arg("--quiet").arg(parent);
+        let init = run_bounded_git(init, "init")
+            .map_err(|e| io_other(format!("failed to run git init: {e}")))?;
         if !init.status.success() {
             return Err(io_other(format!(
                 "git init failed: {}",
@@ -1863,16 +1863,17 @@ impl SnapshotRepo {
     /// age instead of stamping "now".
     fn commit_tree_preserving_date(&self, args: &[&str], timestamp: i64) -> io::Result<String> {
         let date = format!("{timestamp} +0000");
-        let out = crate::dependencies::Git::command()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?
+        let mut command = crate::dependencies::Git::command()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?;
+        command
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
             .arg(&self.work_tree)
             .env("GIT_AUTHOR_DATE", &date)
             .env("GIT_COMMITTER_DATE", &date)
-            .args(args)
-            .output()?;
+            .args(args);
+        let out = run_bounded_git(&mut command, args.first().copied().unwrap_or("git"))?;
         if !out.status.success() {
             return Err(io_other(format!(
                 "commit-tree failed: {}",
@@ -2188,15 +2189,157 @@ fn cleanup_stale_pack_temps_in(
     Ok(removed)
 }
 
+// Generous budget: `git add -A` on a large workspace is legitimately slow,
+// but a wedged git (stalled NFS/FUSE, hung hook) must not block the turn
+// pipeline forever — every caller treats a snapshot error as
+// snapshot-disabled-with-warning and proceeds without the git data. Tests
+// use a tighter budget so a regression that deadlocks a child on its own
+// output fails in seconds instead of hanging for the full window.
+#[cfg(not(test))]
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Grace granted to the pipe readers after git has exited. A clean git
+/// closes its own write ends, so EOF is already waiting; only a grandchild
+/// that inherited the pipes (a post-checkout hook, a `git gc` pack worker)
+/// can hold them past exit, and it must not hold the turn pipeline either.
+const GIT_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Run a pre-configured git command under [`GIT_COMMAND_TIMEOUT`] with both
+/// pipes drained while the child runs (the same concurrent drain
+/// `Command::output` performs). Every git invocation in this module goes
+/// through here, so a wedged git — stalled NFS/FUSE, hung hook — degrades
+/// the snapshot with an error instead of hanging the turn pipeline.
+/// (`delta.rs`'s read-view git commands are not routed here yet; that is a
+/// known follow-up.)
+///
+/// The timeout path kills the child and reaps it on a detached thread: on a
+/// hard-wedged mount git can sit in uninterruptible kernel I/O where even
+/// SIGKILL is deferred, and a blocking `wait()` would hang the pipeline
+/// exactly like the wedged git would. Killing without git's own cleanup can
+/// leave a fresh `index.lock` behind; later snapshots then fail fast on the
+/// lock with an error naming it.
+fn run_bounded_git(cmd: &mut std::process::Command, subcommand: &str) -> io::Result<Output> {
+    run_bounded_git_with_timeout(cmd, subcommand, GIT_COMMAND_TIMEOUT)
+}
+
+fn run_bounded_git_with_timeout(
+    cmd: &mut std::process::Command,
+    subcommand: &str,
+    timeout: Duration,
+) -> io::Result<Output> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Drain both pipes while waiting: the restore path's `ls-tree -r` and
+    // the diff commands emit output that grows with workspace size, and a
+    // child blocked on a full pipe buffer never exits — it would turn every
+    // such call into a guaranteed timeout. Readers stream into shared
+    // buffers, and the completion channel lets the collect below bound how
+    // long a grandchild-held pipe may hold the call after git has exited.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let buf = std::sync::Arc::clone(&stdout_buf);
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(mut reader) = stdout_pipe {
+                read_pipe_to_buffer(&mut reader, &buf);
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    {
+        let buf = std::sync::Arc::clone(&stderr_buf);
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(mut reader) = stderr_pipe {
+                read_pipe_to_buffer(&mut reader, &buf);
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    drop(done_tx);
+
+    let Some(status) = child.wait_timeout(timeout)? else {
+        let _ = child.kill();
+        // Reap off the pipeline thread (see the doc comment): the kernel may
+        // not deliver the kill until an uninterruptible syscall returns.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("git {subcommand} timed out after {}s", timeout.as_secs()),
+        ));
+    };
+    // Wait for the readers up to the grace, then return what was captured. A
+    // clean git already closed its write ends, so both readers deliver
+    // immediately; the grace only covers a pipe still held open by an
+    // inherited copy (a daemonizing hook). On expiry the captured output is
+    // returned with a note on stderr instead of silently truncating; the
+    // reader itself ends whenever whatever holds the pipe exits, holding
+    // only a pipe read — never the turn pipeline.
+    let mut partial = false;
+    let mut drained = 0;
+    while drained < 2 {
+        match done_rx.recv_timeout(GIT_PIPE_DRAIN_GRACE) {
+            Ok(()) => drained += 1,
+            Err(_) => {
+                partial = true;
+                break;
+            }
+        }
+    }
+    let stdout = stdout_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+    let mut stderr = stderr_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+    if partial {
+        if !stderr.is_empty() && stderr.last() != Some(&b'\n') {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(
+            b"[codewhale] git output pipes did not close after git exited \
+              (kept open by a hook or subprocess?); captured output may be partial\n",
+        );
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read a child's pipe to end into a shared buffer, tolerating interruption.
+fn read_pipe_to_buffer(reader: &mut impl io::Read, buf: &std::sync::Mutex<Vec<u8>>) {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => {
+                if let Ok(mut buf) = buf.lock() {
+                    buf.extend_from_slice(&chunk[..read]);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
 fn run_git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> io::Result<Output> {
-    crate::dependencies::Git::command()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?
-        .arg("--git-dir")
+    let mut cmd = crate::dependencies::Git::command()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?;
+    cmd.arg("--git-dir")
         .arg(git_dir)
         .arg("--work-tree")
         .arg(work_tree)
-        .args(args)
-        .output()
+        .args(args);
+    run_bounded_git(&mut cmd, args.first().copied().unwrap_or("git"))
 }
 
 fn git_diff_matches(output: Output) -> io::Result<bool> {
@@ -4534,5 +4677,86 @@ mod tests {
         assert_eq!(list[0].session_id.as_deref(), Some("sess-a"));
         assert_eq!(list[1].session_id, None);
         assert_eq!(list[1].label, "pre-turn:1");
+    }
+
+    #[test]
+    fn run_git_drains_output_larger_than_the_pipe_buffer() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        // ~5000 paths is well past the 64 KiB OS pipe buffer: output of this
+        // size is only reachable when the pipes are drained while the child
+        // runs. A bounded read that only starts after the child exits would
+        // deadlock the child on its own output and die at the command
+        // timeout instead of returning the tree listing.
+        for i in 0..5000 {
+            std::fs::write(repo.work_tree().join(format!("file_{i:05}.txt")), b"x").unwrap();
+        }
+        let id = repo.snapshot("large-output").expect("snapshot");
+        let paths = repo
+            .tree_paths(id.as_str())
+            .expect("tree_paths must drain output instead of timing out");
+        assert!(
+            paths.len() >= 5000,
+            "expected every file in the tree listing, got {}",
+            paths.len()
+        );
+    }
+}
+
+/// The bounded-git tests drive the core with real children, so they need a
+/// POSIX shell; the timeout pin also depends on wall-clock behavior.
+#[cfg(all(test, unix))]
+mod bounded_git_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_git_times_out_a_wedged_child_and_reports_timed_out() {
+        // A child that never exits stands in for a wedged git (stalled
+        // mount, hung hook): the call must come back with a TimedOut error
+        // promptly instead of blocking the turn pipeline forever.
+        let started = std::time::Instant::now();
+        let mut wedged = std::process::Command::new("sh");
+        wedged.arg("-c").arg("sleep 30");
+        let err = run_bounded_git_with_timeout(&mut wedged, "sleep", Duration::from_millis(250))
+            .expect_err("a wedged child must hit the bound");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("timed out after"),
+            "the error must report the bound; got {err}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the bound must be enforced promptly; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_git_returns_promptly_when_a_grandchild_holds_the_pipes() {
+        // The direct child (sh) exits after the echo; the backgrounded
+        // sleep inherits both pipes and holds them for 30s. The call must
+        // still return promptly with the output captured before the grace,
+        // annotated on stderr — not wait out the grandchild.
+        let started = std::time::Instant::now();
+        let mut sh = std::process::Command::new("sh");
+        sh.arg("-c").arg("echo bounded-git-grandchild; sleep 30 &");
+        let output = run_bounded_git(&mut sh, "sh").expect("sh must succeed");
+        let elapsed = started.elapsed();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("bounded-git-grandchild"),
+            "output captured before the grace must survive: {:?}",
+            output.stdout
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("git output pipes did not close after git exited"),
+            "the partial-output note must explain the early return: {:?}",
+            output.stderr
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "a pipe-holding grandchild must not hold the call past the grace; took {elapsed:?}"
+        );
     }
 }
