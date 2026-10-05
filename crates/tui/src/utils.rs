@@ -473,6 +473,8 @@ pub fn write_atomic_batch(files: &[(PathBuf, Vec<u8>)]) -> std::io::Result<()> {
 /// `write_atomic_scoped` takes the name literally, while Win32 path APIs drop
 /// trailing dots and spaces and map device names (`CON`); refuse a name that
 /// Windows would rewrite instead of creating a file nothing else can open.
+/// A `:` names an NTFS alternate data stream (`notes:private`, `con:x`), so
+/// the write would land in a hidden stream rather than a file; refuse it too.
 #[cfg(windows)]
 fn windows_atomic_target_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
     let invalid = || {
@@ -485,6 +487,9 @@ fn windows_atomic_target_name(path: &Path) -> std::io::Result<std::ffi::OsString
         )
     };
     let name = path.file_name().ok_or_else(invalid)?;
+    if name.to_string_lossy().contains(':') {
+        return Err(invalid());
+    }
     // Path normalization alone can leave a reserved DOS basename unchanged.
     // Reject them explicitly, including extensions and the documented
     // superscript port digits, before the native rename can create one.
@@ -1330,6 +1335,10 @@ mod atomic_write_tests {
             "LPT¹",
             "LPT².log",
             "LPT³",
+            "notes:private",
+            "config.json:stream",
+            "con:stream",
+            "file::$DATA",
         ] {
             assert!(
                 write_atomic(&workspace.path().join(name), b"x").is_err(),
