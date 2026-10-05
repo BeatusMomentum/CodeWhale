@@ -1958,7 +1958,7 @@ mod tests {
         for i in 0..total {
             let external = format!("shell:cap_{i}");
             let intent =
-                OperationIntent::new(&external, "ls", false, "exec_shell", &format!("c{i}"));
+                OperationIntent::new(&external, "ls", false, "exec_shell", format!("c{i}"));
             ids.push(
                 runtime
                     .register_operation("session", intent)

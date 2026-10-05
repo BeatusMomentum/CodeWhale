@@ -469,7 +469,10 @@ fn remote_env_supported_https_ssh_and_cnb_origins_remain_accepted() {
             "ssh://git@github.com/codewhale-hq/CodeWhale.git",
             "codewhale-hq%2FCodeWhale",
         ),
-        ("git@github.com:codewhale-hq/CodeWhale.git", "codewhale-hq%2FCodeWhale"),
+        (
+            "git@github.com:codewhale-hq/CodeWhale.git",
+            "codewhale-hq%2FCodeWhale",
+        ),
         ("https://cnb.cool/whale/codewhale.git", "whale%2Fcodewhale"),
         (
             "ssh://git@cnb.cool:2222/whale/codewhale.git",

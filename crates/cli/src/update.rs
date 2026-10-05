@@ -28,7 +28,8 @@ use std::time::Duration;
 
 mod compiled_host;
 
-const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/codewhale-hq/CodeWhale/releases/latest";
+const GITHUB_LATEST_RELEASE_PAGE_URL: &str =
+    "https://github.com/codewhale-hq/CodeWhale/releases/latest";
 const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
     "https://github.com/codewhale-hq/CodeWhale/releases/download";
 const UPDATE_HTTP_ATTEMPTS: usize = 3;
@@ -3581,8 +3582,9 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
 
     #[test]
     fn github_release_url_parser_extracts_tag() {
-        let url = reqwest::Url::parse("https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.61")
-            .unwrap();
+        let url =
+            reqwest::Url::parse("https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.61")
+                .unwrap();
 
         assert_eq!(
             release_tag_from_github_release_url(&url).as_deref(),

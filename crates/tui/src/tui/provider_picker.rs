@@ -2548,7 +2548,7 @@ impl ProviderPickerView {
         let listed: Vec<String> = models.clone();
         models.retain(|model| {
             let target = wire(model);
-            target == model.trim() || !listed.iter().any(|other| *other == target)
+            target == model.trim() || !listed.contains(&target)
         });
         let preferred_wire = wire(&preferred);
         let selected = models

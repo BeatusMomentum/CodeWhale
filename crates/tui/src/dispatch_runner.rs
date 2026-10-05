@@ -1479,7 +1479,10 @@ mod tests {
     #[test]
     fn forge_slug_parses_https_and_ssh_and_rejects_foreign_hosts() {
         assert_eq!(
-            forge_slug(Forge::Github, "https://github.com/codewhale-hq/CodeWhale.git"),
+            forge_slug(
+                Forge::Github,
+                "https://github.com/codewhale-hq/CodeWhale.git"
+            ),
             Some("codewhale-hq/CodeWhale".to_string())
         );
         assert_eq!(
