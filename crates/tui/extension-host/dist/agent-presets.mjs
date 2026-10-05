@@ -6106,7 +6106,16 @@ var init_skill_filesystem = __esm({
 import { realpathSync } from "node:fs";
 import { posix, win32 } from "node:path";
 function canonicalPath(path, platform = process.platform) {
-  return stripVerbatim(platform === "win32" ? realpathSync.native(path) : realpathSync(path), platform);
+  if (platform !== "win32") return realpathSync(path);
+  try {
+    return stripVerbatim(realpathSync.native(path), platform);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : void 0;
+    if (code === "EPERM" || code === "EACCES") {
+      return stripVerbatim(win32.normalize(path), platform);
+    }
+    throw error;
+  }
 }
 function stripVerbatim(path, platform = process.platform) {
   if (platform !== "win32") return path;
