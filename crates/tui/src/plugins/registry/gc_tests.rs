@@ -125,8 +125,26 @@ fn harden(_: &Path) {}
 
 fn set_age(path: &Path, age: Duration) {
     let then = SystemTime::now() - age;
-    let file = fs::File::open(path).unwrap();
-    file.set_modified(then).unwrap();
+    open_for_times(path).unwrap().set_modified(then).unwrap();
+}
+
+#[cfg(not(windows))]
+fn open_for_times(path: &Path) -> std::io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+/// Windows refuses `SetFileTime` on a read-only handle, and refuses to open a
+/// directory at all without `FILE_FLAG_BACKUP_SEMANTICS`. Both failed every
+/// age-dependent doctor test with "Access is denied" on hosted Windows.
+#[cfg(windows)]
+fn open_for_times(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 fn rfc3339_ago(age: Duration) -> String {
