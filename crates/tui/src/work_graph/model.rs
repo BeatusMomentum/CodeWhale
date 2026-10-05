@@ -39,6 +39,11 @@ pub const ACTIVITY_CAP: usize = 256;
 /// Bounded idempotency-key dedup window kept on the snapshot.
 pub const SEEN_KEYS_CAP: usize = 1024;
 
+/// Ended, non-durable Operation nodes (one per finished shell call) kept on
+/// the snapshot (#6842). They are a derived index — the calls and their output
+/// live in the session transcript — so older ones are evicted, not archived.
+pub const ENDED_OPERATION_CAP: usize = 256;
+
 /// Canonical reasoning-effort tiers recorded as configuration facts. This is
 /// deliberately an enum rather than free-form text so Work Graph activity can
 /// never become a side channel for model reasoning.

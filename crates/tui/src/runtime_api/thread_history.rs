@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
 use codewhale_models::{ContentBlock, Message, Role};
@@ -1323,9 +1323,35 @@ async fn mutate_in_owner(
             selected_entry_id, ..
         } = &request.mutation
         {
-            let fork = journal
-                .fork_from(selected_entry_id.as_deref())
-                .map_err(anyhow::Error::msg)?;
+            let fork = match journal.fork_from(selected_entry_id.as_deref()) {
+                Ok(fork) => fork,
+                Err(error) => {
+                    // An entry a bounded TUI save archived (#6842) is not in
+                    // the document; fail closed and say where it went.
+                    let dir = sessions_dir.clone();
+                    let id = session.metadata.id.clone();
+                    let entry = selected_entry_id.clone();
+                    let archived = history_owner_work(move || {
+                        let Some(entry) = entry else {
+                            return Ok(false);
+                        };
+                        Ok(crate::session_manager::load_journal_archive(&dir, &id)?
+                            .iter()
+                            .any(|archived| archived.id == entry))
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if archived {
+                        bail!(
+                            "{error}: the entry was moved to this session's journal archive to keep \
+                             the saved document bounded; restore it with `/branch {}` first. \
+                             Source retained",
+                            selected_entry_id.as_deref().unwrap_or_default()
+                        );
+                    }
+                    return Err(anyhow::Error::msg(error));
+                }
+            };
             session.metadata.mark_forked_from(&session.metadata.clone());
             session.metadata.spawn_depth = fork.spawn_depth;
             session.leaf_id = fork.leaf_id.clone();

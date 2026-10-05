@@ -1150,6 +1150,14 @@ pub(crate) fn build_session_snapshot(
             format!("automatic session snapshot skipped while Work state is busy: {err}")
         })?,
     };
+    // Drop what a bounded save already archived (#6842) so the live journal
+    // matches the document. No I/O: the ids come from the save path.
+    if let Some(session_id) = app.current_session_id.as_deref() {
+        let archived = crate::session_manager::take_archived_journal_ids(session_id);
+        if let Err(error) = app.session_journal.remove_entries(&archived) {
+            tracing::warn!(%error, "kept archived journal entries in memory");
+        }
+    }
     app.session_journal
         .rebranch_active_messages_stamped(&app.api_messages, &app.api_message_stamps);
     let mut session = crate::session_manager::create_saved_session_journal_only(

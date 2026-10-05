@@ -347,6 +347,13 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             .as_ref()
             .map(|j| j.entries.len())
             .unwrap_or(0);
+        // An entry a bounded save archived (#6842) is restored, with any
+        // ancestors the journal no longer holds, before branching to it.
+        if let Err(e) = manager.restore_archived_journal_chain(&mut session, entry_id) {
+            return Err(format!(
+                "branch failed: could not restore {entry_id} from the session's journal archive: {e}"
+            ));
+        }
         match session.journal_branch_to(entry_id) {
             Ok(()) => {
                 if let Err(e) = manager.save_session(&session) {
@@ -398,7 +405,22 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             if let Ok(mut session) = manager.load_session(&session_id) {
                 session.ensure_journal();
                 if let Some(journal) = session.journal.as_ref() {
-                    let rendered = crate::session_tree::render_tree(journal);
+                    let mut rendered = crate::session_tree::render_tree(journal);
+                    match manager.load_journal_archive(&session_id) {
+                        Ok(archived) if !archived.is_empty() => {
+                            rendered.push_str(&format!(
+                                "{} older off-branch entries are archived in {}/{}.jsonl \
+                                 (not drawn); `/branch <id>` restores one.\n",
+                                archived.len(),
+                                crate::session_manager::JOURNAL_ARCHIVE_DIR,
+                                session_id,
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            rendered.push_str(&format!("journal archive could not be read: {e}\n"))
+                        }
+                    }
                     return Ok(TreeBodyProjection::Journal { rendered });
                 }
             }

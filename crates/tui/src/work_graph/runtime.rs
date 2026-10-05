@@ -196,6 +196,20 @@ impl WorkRuntime {
             title,
             NodeState::Initializing,
         )?;
+        // Registration is where finished shell calls accumulate (#6842):
+        // keep only the newest ended, non-durable operations.
+        if super::reducer::evictable_operations(graph.snapshot()).len()
+            > super::model::ENDED_OPERATION_CAP
+        {
+            apply_change(
+                &mut graph,
+                session_id,
+                &intent.source,
+                WorkGraphChange::PruneEndedOperations {
+                    keep: super::model::ENDED_OPERATION_CAP,
+                },
+            )?;
+        }
         let next = graph.into_snapshot();
         validate_combined(&next, &project_plan(&next), &project_todos(&next))?;
         active.snapshot = Some(next);
@@ -1930,5 +1944,63 @@ mod tests {
         assert_eq!(runtime.publish_pending_sync(), Ok(true));
         assert!(!runtime.has_pending_publish());
         assert!(todos.blocking_lock().snapshot().is_empty());
+    }
+
+    /// #6842: one Operation node per finished shell call grew without bound.
+    #[test]
+    fn ended_shell_operations_are_capped_oldest_first() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let total = super::super::model::ENDED_OPERATION_CAP + 44;
+        let mut ids = Vec::new();
+        for i in 0..total {
+            let external = format!("shell:cap_{i}");
+            let intent =
+                OperationIntent::new(&external, "ls", false, "exec_shell", &format!("c{i}"));
+            ids.push(
+                runtime
+                    .register_operation("session", intent)
+                    .expect("register"),
+            );
+            for (seq, state) in [(1, OwnerState::Running), (2, OwnerState::Completed)] {
+                runtime
+                    .reconcile_operation(
+                        "session",
+                        OperationOwnerSnapshot::new(
+                            &external,
+                            state,
+                            seq,
+                            i as i64 * 10 + seq as i64,
+                        ),
+                    )
+                    .expect("reconcile");
+            }
+        }
+        let graph = runtime
+            .capture(Some("session"))
+            .expect("capture")
+            .expect("graph")
+            .graph;
+        crate::work_graph::validate(&graph).expect("pruned graph validates");
+        let operations = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Operation)
+            .count();
+        // Pruned to the cap at each registration; the last call then ended.
+        assert!(
+            operations <= super::super::model::ENDED_OPERATION_CAP + 1,
+            "{operations}"
+        );
+        assert!(graph.node(&ids[0]).is_none(), "oldest ended call evicted");
+        assert!(graph.node(&ids[total - 1]).is_some(), "newest call kept");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| graph.node(&edge.from).is_some() && graph.node(&edge.to).is_some())
+        );
     }
 }

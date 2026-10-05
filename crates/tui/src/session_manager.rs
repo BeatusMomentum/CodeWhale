@@ -45,6 +45,16 @@ const MAX_EMPTY_SESSION_STUBS: usize = 10;
 /// picker's rename prompt has always enforced.
 pub const MAX_SESSION_TITLE_CHARS: usize = 100;
 pub(crate) const WORK_GRAPH_IMPORT_ARCHIVE_DIR: &str = ".work-graph-import-archive";
+/// Per-session JSONL sidecar holding journal entries a bounded save moved out
+/// of the session document (#6842): `<sessions>/.journal-archive/<id>.jsonl`.
+pub(crate) const JOURNAL_ARCHIVE_DIR: &str = ".journal-archive";
+/// Off-branch entries a session document may carry before an autosave
+/// archives the excess. Together with [`JOURNAL_RETAINED_DEAD_ENTRIES`] this
+/// keeps a compacted journal far below `MAX_CANONICAL_HISTORY_ENTRIES`.
+const JOURNAL_PRUNE_DEAD_THRESHOLD: usize = 4_096;
+/// Recent off-branch entries kept in the document after archiving, so `/tree`
+/// and `/branch` stay cheap for recent history.
+const JOURNAL_RETAINED_DEAD_ENTRIES: usize = 1_024;
 const SESSION_GOALS_DIR: &str = ".goals";
 const CURRENT_SESSION_GOAL_SCHEMA_VERSION: u32 = 2;
 const MAX_SESSION_GOAL_OBJECTIVE_CHARS: usize = 8_192;
@@ -686,6 +696,11 @@ pub struct SessionCostSnapshot {
     pub route_receipts: BTreeSet<String>,
     /// Redacted provider-response identities already included in the live and
     /// durable sub-agent totals. Worker records persist the same fingerprints.
+    ///
+    /// Known limit (#6842): unbounded, ~70 bytes per background call. It is
+    /// the replay-idempotency set for money (late-usage overlay and restored
+    /// dedupe), so it is never capped; `load_session_metadata` grows its read
+    /// to fit a large block instead of falling back to a whole-file read.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub usage_source_fingerprints: BTreeSet<String>,
     #[serde(
@@ -1396,6 +1411,94 @@ fn validate_saved_journal(journal: &SessionJournal) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Archived ids per session that the live app has not yet dropped from its
+/// in-memory journal. A bounded save records them only after its document
+/// write lands; the UI takes them on its next snapshot (no I/O) so RAM
+/// matches disk, and a racing save skips re-appending ids still listed here.
+fn archived_journal_ids()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>> {
+    static IDS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    > = std::sync::OnceLock::new();
+    IDS.get_or_init(Default::default)
+}
+
+/// Take the ids a bounded save archived for `session_id`, for the live
+/// journal to drop. Never touches the disk.
+pub(crate) fn take_archived_journal_ids(session_id: &str) -> std::collections::HashSet<String> {
+    archived_journal_ids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id)
+        .unwrap_or_default()
+}
+
+fn journal_archive_path(sessions_dir: &Path, session_id: &str) -> io::Result<PathBuf> {
+    let id = session_id.trim();
+    let mut components = Path::new(id).components();
+    if id.is_empty()
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session id for journal archive",
+        ));
+    }
+    Ok(sessions_dir
+        .join(JOURNAL_ARCHIVE_DIR)
+        .join(format!("{id}.jsonl")))
+}
+
+/// Every entry archived for `session_id`, oldest first, deduplicated by id
+/// (a save that crashed before its document landed re-archives the same
+/// entries). A torn final line — a crash mid-append, whose entries are still
+/// in the document — is skipped; damage anywhere else is an error.
+pub(crate) fn load_journal_archive(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> io::Result<Vec<SessionEntry>> {
+    use std::io::Read as _;
+    let path = journal_archive_path(sessions_dir, session_id)?;
+    let mut file = match open_private_read_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<SessionEntry>(line) {
+            Ok(entry) => {
+                if seen.insert(entry.id.clone()) {
+                    entries.push(entry);
+                }
+            }
+            Err(error) if index + 1 == lines.len() && !raw.ends_with('\n') => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "skipping torn final journal-archive line"
+                );
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal archive {} line {}: {error}",
+                        path.display(),
+                        index + 1
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn serialize_saved_session(mut session: SavedSession) -> io::Result<String> {
@@ -2497,6 +2600,20 @@ impl SessionManager {
 
     /// Save a session to disk, consuming it.
     pub(crate) fn save_session_owned(&self, session: SavedSession) -> std::io::Result<PathBuf> {
+        self.save_session_inner(session, false)
+    }
+
+    /// The autosave path (#6842): like [`Self::save_session_owned`], but when
+    /// the journal carries more than `JOURNAL_PRUNE_DEAD_THRESHOLD`
+    /// off-branch entries, first append the excess to the session's journal
+    /// archive (fsynced), then write the document without them. If the
+    /// archive cannot be written nothing is pruned. Runs on the persistence
+    /// actor (`tui/persistence_actor.rs` `flush_inner`), never the UI loop.
+    pub(crate) fn save_session_bounded(&self, session: SavedSession) -> std::io::Result<PathBuf> {
+        self.save_session_inner(session, true)
+    }
+
+    fn save_session_inner(&self, session: SavedSession, bound: bool) -> std::io::Result<PathBuf> {
         let session_id = session.metadata.id.clone();
         let path = self.validated_session_path(&session_id)?;
         // Not a `move` closure: `session` is consumed inside, so inference
@@ -2512,6 +2629,11 @@ impl SessionManager {
             self.archive_before_first_graph_write(&session, &path)?;
 
             let mut durable_session = session;
+            let archived = if bound {
+                self.archive_dead_journal_entries(&mut durable_session)
+            } else {
+                Vec::new()
+            };
             self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
             let content = serialize_saved_session(durable_session)?;
@@ -2519,6 +2641,14 @@ impl SessionManager {
             // Atomic write via write_atomic (NamedTempFile + fsync + persist)
             write_atomic(&path, content.as_bytes())?;
             self.stamp_session_boot_owner_for_new_record(&session_id, already_persisted);
+            if !archived.is_empty() {
+                archived_journal_ids()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(session_id.clone())
+                    .or_default()
+                    .extend(archived);
+            }
             Ok(())
         })?
         .ok_or_else(Self::retired_session_write_error)?;
@@ -2665,6 +2795,189 @@ impl SessionManager {
             }
             Ok(())
         });
+    }
+
+    /// Move the journal's excess off-branch entries into the archive sidecar.
+    /// Order is the data-loss guard: plan on the unchanged journal, append and
+    /// fsync the planned entries, and only then remove them from the document
+    /// about to be written. Any failure leaves the journal whole. Returns the
+    /// removed ids.
+    fn archive_dead_journal_entries(&self, session: &mut SavedSession) -> Vec<String> {
+        let session_id = session.metadata.id.clone();
+        let Some(journal) = session.journal.as_mut() else {
+            return Vec::new();
+        };
+        let plan = journal.prune_plan(JOURNAL_PRUNE_DEAD_THRESHOLD, JOURNAL_RETAINED_DEAD_ENTRIES);
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        let ids: std::collections::HashSet<String> = plan.into_iter().collect();
+        // Ids a previous save archived but the live journal still carries
+        // are already durable; append only the rest.
+        let already = archived_journal_ids()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let fresh: Vec<&SessionEntry> = journal
+            .entries
+            .iter()
+            .filter(|entry| ids.contains(&entry.id) && !already.contains(&entry.id))
+            .collect();
+        if let Err(error) = self.append_journal_archive(&session_id, &fresh) {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "journal archive write failed; keeping the full journal"
+            );
+            return Vec::new();
+        }
+        match journal.remove_entries(&ids) {
+            Ok(_) => {
+                session.leaf_id = journal.leaf_id.clone();
+                ids.into_iter().collect()
+            }
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "journal prune refused; keeping the full journal");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Append `entries` to the session's journal archive, one JSON object per
+    /// line, and fsync before returning. The sidecar is owner-only and never
+    /// followed through a link.
+    fn append_journal_archive(
+        &self,
+        session_id: &str,
+        entries: &[&SessionEntry],
+    ) -> io::Result<()> {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let path = journal_archive_path(&self.sessions_dir, session_id)?;
+        let dir = self.sessions_dir.join(JOURNAL_ARCHIVE_DIR);
+        if let Ok(metadata) = fs::symlink_metadata(&dir)
+            && crate::plugins::metadata_is_link_or_reparse(&metadata)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal archive directory is a link",
+            ));
+        }
+        let created_dir = !dir.exists();
+        fs::create_dir_all(&dir)?;
+        let mut buf = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut buf, entry)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            buf.push(b'\n');
+        }
+        let created_file = !path.exists();
+        let mut file = open_private_lock_file(&path)?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        if created_file || created_dir {
+            // Make the new directory entries durable, not only the bytes.
+            fs::File::open(&dir)?.sync_all()?;
+            if created_dir {
+                fs::File::open(&self.sessions_dir)?.sync_all()?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (created_file, created_dir);
+        Ok(())
+    }
+
+    /// Entries archived out of `session_id`'s journal by bounded saves.
+    pub(crate) fn load_journal_archive(&self, session_id: &str) -> io::Result<Vec<SessionEntry>> {
+        load_journal_archive(&self.sessions_dir, self.validated_session_id(session_id)?)
+    }
+
+    /// Bring an archived entry, and every ancestor the journal no longer
+    /// holds, back into `session`'s journal so `/branch` can select it.
+    /// `Ok(false)` when `entry_id` is in neither the journal nor the archive.
+    pub(crate) fn restore_archived_journal_chain(
+        &self,
+        session: &mut SavedSession,
+        entry_id: &str,
+    ) -> io::Result<bool> {
+        session.ensure_journal();
+        let session_id = session.metadata.id.clone();
+        let journal = session.journal.as_mut().expect("journal ensured");
+        if journal.contains(entry_id) {
+            return Ok(true);
+        }
+        let archive = self.load_journal_archive(&session_id)?;
+        let by_id: std::collections::HashMap<&str, &SessionEntry> = archive
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect();
+        let mut chain = Vec::new();
+        let mut cursor = Some(entry_id);
+        while let Some(id) = cursor {
+            if journal.contains(id) {
+                break;
+            }
+            let Some(entry) = by_id.get(id) else {
+                if chain.is_empty() {
+                    return Ok(false);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("archived entry {entry_id} is missing ancestor {id}"),
+                ));
+            };
+            if chain.len() > by_id.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal archive contains a cycle",
+                ));
+            }
+            chain.push((*entry).clone());
+            cursor = entry.parent_id.as_deref();
+        }
+        let restored: Vec<String> = chain.iter().map(|entry| entry.id.clone()).collect();
+        journal.entries.extend(chain.into_iter().rev());
+        validate_saved_journal(journal)?;
+        // The live app must not later drop what was just brought back.
+        if let Some(pending) = archived_journal_ids()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&session_id)
+        {
+            for id in &restored {
+                pending.remove(id);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Remove the session's journal archive with the session itself. A
+    /// linked archive directory is not followed.
+    fn remove_journal_archive(&self, id: &str) -> io::Result<()> {
+        let dir = self.sessions_dir.join(JOURNAL_ARCHIVE_DIR);
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if crate::plugins::metadata_is_link_or_reparse(&metadata) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "journal archive directory is a link; its copies were not removed"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        match fs::remove_file(journal_archive_path(&self.sessions_dir, id)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Preserve the exact pre-import session once, before the first graph-
@@ -3472,9 +3785,25 @@ impl SessionManager {
             return Ok(metadata);
         }
 
-        // Metadata wasn't extractable from the prefix (truncated mid-block,
-        // unusual key ordering, etc.). Read the rest and try again with the
-        // full buffer before giving up.
+        // Metadata wasn't extractable from the prefix: usually a `metadata`
+        // block longer than 64 KB (a long-lived session's usage fingerprints,
+        // #6842), rarely unusual key ordering. Grow the read geometrically
+        // until the block closes, so the cost tracks the metadata's size
+        // rather than the transcript's; only past `GROWN_PREFIX_LIMIT` (or
+        // for a document that really lacks the block) read everything.
+        const GROWN_PREFIX_LIMIT: usize = 16 * 1024 * 1024;
+        let mut limit = PREFIX_BYTES;
+        while buf.len() == limit && limit < GROWN_PREFIX_LIMIT {
+            let next = (limit * 2).min(GROWN_PREFIX_LIMIT);
+            file.by_ref()
+                .take((next - limit) as u64)
+                .read_to_end(&mut buf)?;
+            limit = next;
+            if let Some(mut metadata) = extract_top_level_metadata(&buf) {
+                apply_legacy_title_recovery(&mut metadata, &buf);
+                return Ok(metadata);
+            }
+        }
         let mut rest = Vec::new();
         file.read_to_end(&mut rest)?;
         buf.extend_from_slice(&rest);
@@ -3648,6 +3977,7 @@ impl SessionManager {
             }
         }
         self.remove_import_archive_copy(&path)?;
+        self.remove_journal_archive(id)?;
         self.clear_session_boot_owner(id);
         let session_dir = self.sessions_dir.join(id.trim());
         if session_dir.exists() {
@@ -4985,5 +5315,239 @@ mod canonical_journal_admission_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod journal_bound_tests {
+    //! #6842: bounded autosaves archive superseded journal entries before
+    //! dropping them from the session document.
+    use super::*;
+    use std::collections::HashSet;
+
+    fn text(text: &str) -> Message {
+        Message {
+            role: codewhale_models::Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// A session whose journal holds `rounds` superseded copies of a
+    /// 10-message tail, as repeated compaction leaves it.
+    fn compacted_session(id: &str, workspace: &Path, rounds: usize) -> SavedSession {
+        let mut session = create_saved_session_with_id_and_mode(
+            id.into(),
+            &[text("start")],
+            "test-model",
+            workspace,
+            0,
+            None,
+            None,
+        );
+        let journal = session.journal.as_mut().unwrap();
+        for round in 0..rounds {
+            let tail: Vec<Message> = (0..10)
+                .map(|i| text(&format!("round {round} message {i}")))
+                .collect();
+            journal.rebranch_active_messages(&tail);
+        }
+        session.leaf_id = journal.leaf_id.clone();
+        session.messages = journal.to_messages();
+        session.metadata.message_count = session.messages.len();
+        session
+    }
+
+    fn all_ids(entries: &[SessionEntry]) -> HashSet<String> {
+        entries.iter().map(|e| e.id.clone()).collect()
+    }
+
+    #[test]
+    fn bounded_save_archives_then_prunes_and_live_journal_follows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(tmp.path().join("sessions")).unwrap();
+        let session = compacted_session("bounded-a", tmp.path(), 460);
+        let original = session.journal.clone().unwrap();
+        let active = original.to_messages();
+
+        manager.save_session_bounded(session).unwrap();
+
+        let saved = manager.load_session("bounded-a").unwrap();
+        let journal = saved.journal.as_ref().unwrap();
+        assert!(
+            journal.len() <= 10 + JOURNAL_RETAINED_DEAD_ENTRIES,
+            "{}",
+            journal.len()
+        );
+        assert_eq!(journal.to_messages(), active);
+        assert_eq!(saved.leaf_id, original.leaf_id);
+        let archive = manager.load_journal_archive("bounded-a").unwrap();
+        // Nothing lost: document + archive is exactly the original journal.
+        let mut union = all_ids(&journal.entries);
+        union.extend(all_ids(&archive));
+        assert_eq!(union, all_ids(&original.entries));
+        assert_eq!(archive.len() + journal.len(), original.len());
+
+        // The live journal drops exactly what the save archived.
+        let mut live = original.clone();
+        let archived = take_archived_journal_ids("bounded-a");
+        assert_eq!(archived, all_ids(&archive));
+        live.remove_entries(&archived).unwrap();
+        assert_eq!(all_ids(&live.entries), all_ids(&journal.entries));
+        assert!(take_archived_journal_ids("bounded-a").is_empty());
+
+        // A plain save never prunes.
+        let small = compacted_session("bounded-plain", tmp.path(), 460);
+        let len = small.journal.as_ref().unwrap().len();
+        manager.save_session(&small).unwrap();
+        let reloaded = manager.load_session("bounded-plain").unwrap();
+        assert_eq!(reloaded.journal.unwrap().len(), len);
+    }
+
+    #[test]
+    fn archive_failure_prunes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions.clone()).unwrap();
+        // A regular file where the archive directory belongs.
+        fs::write(sessions.join(JOURNAL_ARCHIVE_DIR), b"not a dir").unwrap();
+        let session = compacted_session("bounded-b", tmp.path(), 460);
+        let len = session.journal.as_ref().unwrap().len();
+        manager.save_session_bounded(session).unwrap();
+        let saved = manager.load_session("bounded-b").unwrap();
+        assert_eq!(saved.journal.unwrap().len(), len);
+        assert!(take_archived_journal_ids("bounded-b").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_written_then_document_write_fails_loses_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions.clone()).unwrap();
+        let session = compacted_session("bounded-c", tmp.path(), 460);
+        let original = session.journal.clone().unwrap();
+        manager.save_session(&session).unwrap();
+        fs::create_dir_all(sessions.join(JOURNAL_ARCHIVE_DIR)).unwrap();
+        // The archive can be appended, but the document's temp file cannot
+        // be created: the crash window between the two writes.
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = manager.save_session_bounded(session.clone());
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "document write must fail in this setup");
+        let on_disk = manager.load_session("bounded-c").unwrap();
+        assert_eq!(on_disk.journal.as_ref().unwrap(), &original);
+        assert!(
+            !manager
+                .load_journal_archive("bounded-c")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(take_archived_journal_ids("bounded-c").is_empty());
+
+        // Retrying archives the same entries again; the reader dedupes and
+        // the union is still the whole journal.
+        manager.save_session_bounded(session).unwrap();
+        let saved = manager.load_session("bounded-c").unwrap();
+        let archive = manager.load_journal_archive("bounded-c").unwrap();
+        let mut union = all_ids(&saved.journal.unwrap().entries);
+        union.extend(all_ids(&archive));
+        assert_eq!(union, all_ids(&original.entries));
+        let _ = take_archived_journal_ids("bounded-c");
+    }
+
+    #[test]
+    fn branch_to_an_archived_entry_restores_its_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(tmp.path().join("sessions")).unwrap();
+        let session = compacted_session("bounded-d", tmp.path(), 460);
+        let original = session.journal.clone().unwrap();
+        manager.save_session_bounded(session).unwrap();
+        let archived = take_archived_journal_ids("bounded-d");
+        // The deepest archived entry of the oldest round.
+        let target = original
+            .entries
+            .iter()
+            .filter(|e| archived.contains(&e.id))
+            .find(|e| {
+                e.kind
+                    .as_message()
+                    .is_some_and(|m| m.content == text("round 0 message 9").content)
+            })
+            .unwrap()
+            .id
+            .clone();
+
+        let mut session = manager.load_session("bounded-d").unwrap();
+        assert!(session.journal_branch_to(&target).is_err());
+        assert!(
+            manager
+                .restore_archived_journal_chain(&mut session, &target)
+                .unwrap()
+        );
+        session.journal_branch_to(&target).unwrap();
+        manager.save_session(&session).unwrap();
+        let reloaded = manager.load_session("bounded-d").unwrap();
+        assert_eq!(reloaded.leaf_id.as_deref(), Some(target.as_str()));
+        // Each round replaced the whole tail, so round 0 is its own root chain.
+        let expected: Vec<Message> = (0..10)
+            .map(|i| text(&format!("round 0 message {i}")))
+            .collect();
+        assert_eq!(reloaded.messages, expected);
+
+        let mut missing = manager.load_session("bounded-d").unwrap();
+        assert!(
+            !manager
+                .restore_archived_journal_chain(&mut missing, "no-such-entry")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_journal_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions.clone()).unwrap();
+        manager
+            .save_session_bounded(compacted_session("bounded-e", tmp.path(), 460))
+            .unwrap();
+        let _ = take_archived_journal_ids("bounded-e");
+        let path = journal_archive_path(&sessions, "bounded-e").unwrap();
+        assert!(path.exists());
+        manager.delete_session("bounded-e").unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn metadata_larger_than_the_prefix_is_read_without_the_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(tmp.path().join("sessions")).unwrap();
+        let mut session = compacted_session("bounded-f", tmp.path(), 10);
+        for i in 0..9_000 {
+            session.metadata.cost.usage_source_fingerprints.insert(
+                crate::cost_status::usage_source_fingerprint(&format!("call-{i}")),
+            );
+        }
+        let path = manager.save_session(&session).unwrap();
+        // Replace the transcript with 1 MB of non-JSON: listing must still
+        // find the >64 KB metadata block (the grown read stops once it
+        // closes; this checks correctness, not how many bytes were read).
+        let bytes = fs::read(&path).unwrap();
+        let start = find_json_key(&bytes, b"\"metadata\"").unwrap();
+        let open = json_value_start(&bytes, start, 10, b'{').unwrap();
+        let end = json_object_end(&bytes, open).unwrap();
+        assert!(
+            end > 64 * 1024,
+            "metadata must exceed the old prefix: {end}"
+        );
+        let mut damaged = bytes[..end].to_vec();
+        damaged.extend(std::iter::repeat_n(b'x', 1 << 20));
+        fs::write(&path, &damaged).unwrap();
+        let metadata = SessionManager::load_session_metadata(&path).unwrap();
+        assert_eq!(metadata.id, "bounded-f");
+        assert_eq!(metadata.cost.usage_source_fingerprints.len(), 9_000);
     }
 }
