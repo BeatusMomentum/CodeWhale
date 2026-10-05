@@ -311,15 +311,23 @@ fn doctor(
         Err(error) => return CommandResult::error(error),
     };
     let options = gc::GcOptions::default();
+    // Path identity is resolved off this thread. Reloading the session
+    // registry stays here: that is session state, not the directory walk.
+    let report = gc::run(
+        state_path,
+        live,
+        options,
+        fix.then_some(gc::GcTier::Explicit),
+    );
     if !fix {
-        return match gc::dry_run(&state_path, &live, &options) {
+        return match report {
             Ok(report) => CommandResult::message(render::render_gc_report(&report, false)),
             Err(error) => {
                 CommandResult::error(format!("Plugin doctor could not read state: {error}"))
             }
         };
     }
-    match gc::apply(&state_path, &live, &options, gc::GcTier::Explicit) {
+    match report {
         Ok(report) => {
             let message = render::render_gc_report(&report, true);
             // Rediscover so the session stops listing what was just retired.

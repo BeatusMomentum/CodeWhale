@@ -200,7 +200,7 @@ fn real_dir(path: &Path) -> bool {
 
 /// `<home>/plugins/state.json` is the only layout this module cleans around.
 /// Any other state path still gets record pruning, but no directory is touched.
-fn layout(state_path: &Path) -> Option<Layout> {
+fn layout(state_path: &Path, resolved: &dyn Fn(&Path) -> Option<PathBuf>) -> Option<Layout> {
     if state_path.file_name()? != "state.json" {
         return None;
     }
@@ -208,7 +208,7 @@ fn layout(state_path: &Path) -> Option<Layout> {
     if plugins_dir.file_name()? != "plugins" {
         return None;
     }
-    let home = plugins_dir.parent()?.canonicalize().ok()?;
+    let home = plugins_dir.parent().and_then(resolved)?;
     let plugins_dir = home.join("plugins");
     Some(Layout {
         snapshots: snapshots_dir(&home),
@@ -223,12 +223,16 @@ fn modified(path: &Path) -> SystemTime {
         .unwrap_or_else(|_| SystemTime::now())
 }
 
-fn observe(state_path: &Path, bundles: &[EmbeddedBundle]) -> Observed {
+fn observe(
+    state_path: &Path,
+    bundles: &[EmbeddedBundle],
+    resolved: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Observed {
     let mut obs = Observed {
         state_exists: path_entry_exists(state_path).unwrap_or(false),
         ..Observed::default()
     };
-    let Some(layout) = layout(state_path) else {
+    let Some(layout) = layout(state_path, resolved) else {
         obs.notes.push(format!(
             "{} is not <home>/plugins/state.json; only records were examined, no directory is touched",
             state_path.display()
@@ -242,7 +246,7 @@ fn observe(state_path: &Path, bundles: &[EmbeddedBundle]) -> Observed {
             if !real_dir(&dir) {
                 continue;
             }
-            if let Ok(root) = dir.join(bundle.name).canonicalize() {
+            if let Some(root) = resolved(&dir.join(bundle.name)) {
                 obs.currents.insert(
                     bundle.name.to_string(),
                     CurrentBuiltin {
@@ -260,7 +264,7 @@ fn observe(state_path: &Path, bundles: &[EmbeddedBundle]) -> Observed {
         }
         if let Ok(entries) = fs::read_dir(&layout.snapshots) {
             for entry in entries.flatten() {
-                observe_snapshot_entry(&layout, bundles, &mut obs, &entry);
+                observe_snapshot_entry(&layout, bundles, &mut obs, &entry, resolved);
             }
         }
     } else if fs::symlink_metadata(&layout.snapshots).is_ok() {
@@ -303,10 +307,7 @@ fn observe(state_path: &Path, bundles: &[EmbeddedBundle]) -> Observed {
             for entry in entries {
                 let path = entry.ok()?.path();
                 if real_dir(&path) {
-                    hashes.insert(plugin_root_hash(
-                        PluginScope::User,
-                        &path.canonicalize().ok()?,
-                    ));
+                    hashes.insert(plugin_root_hash(PluginScope::User, &resolved(&path)?));
                 }
             }
             Some(hashes)
@@ -321,6 +322,7 @@ fn observe_snapshot_entry(
     bundles: &[EmbeddedBundle],
     obs: &mut Observed,
     entry: &fs::DirEntry,
+    resolved: &dyn Fn(&Path) -> Option<PathBuf>,
 ) {
     let path = entry.path();
     let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -348,10 +350,7 @@ fn observe_snapshot_entry(
         ));
         return;
     }
-    let id = path
-        .join(bundle_name)
-        .canonicalize()
-        .ok()
+    let id = resolved(&path.join(bundle_name))
         .map(|root| plugin_id(PluginScope::Builtin, bundle_name, &root).0);
     let is_current = obs
         .currents
@@ -784,7 +783,9 @@ fn dry_run_with(
     scan: &ProcessScan,
 ) -> Result<GcReport, String> {
     let state = load_state(state_path)?;
-    let obs = observe(state_path, bundles);
+    let resolved = resolved_paths(state_path, bundles);
+    let lookup = |path: &Path| resolved.get(path).cloned();
+    let obs = observe(state_path, bundles, &lookup);
     let in_use = |path: &Path| scan.uses(path);
     let all = plan(&state, &obs, live, opts, GcTier::Explicit, &in_use);
     let safe = plan(&state, &obs, live, opts, GcTier::Safe, &in_use);
@@ -832,7 +833,9 @@ fn apply_with(
 ) -> Result<GcReport, String> {
     // A malformed or future-schema state file aborts here, before any change.
     let state = load_state(state_path)?;
-    let obs = observe(state_path, bundles);
+    let resolved = resolved_paths(state_path, bundles);
+    let lookup = |path: &Path| resolved.get(path).cloned();
+    let obs = observe(state_path, bundles, &lookup);
     let in_use = |path: &Path| scan.uses(path);
     let mut chosen = plan(&state, &obs, live, opts, tier, &in_use);
     let mut report = report_header(&state, &obs, &chosen);
@@ -955,7 +958,12 @@ impl PluginRegistry {
             return;
         }
         let live = self.plugins.keys().map(|id| id.0.clone()).collect();
-        match apply(state_path, &live, &GcOptions::default(), GcTier::Safe) {
+        match run(
+            state_path.to_path_buf(),
+            live,
+            GcOptions::default(),
+            Some(GcTier::Safe),
+        ) {
             Ok(report) if !report.is_clean() => tracing::info!(
                 target: "plugins",
                 items = report.items.len(),
@@ -972,6 +980,135 @@ impl PluginRegistry {
         }
     }
 }
+
+/// The command and the startup pass. `tier` is `None` for the read-only
+/// report; startup applies [`GcTier::Safe`] and `--fix` applies
+/// [`GcTier::Explicit`]. Path identity is resolved inside the walk, off the
+/// caller's thread.
+pub(crate) fn run(
+    state_path: PathBuf,
+    live: BTreeSet<String>,
+    opts: GcOptions,
+    tier: Option<GcTier>,
+) -> Result<GcReport, String> {
+    let bundles = embedded_bundles();
+    let scan = ProcessScan::default();
+    match tier {
+        Some(tier) => apply_with(&state_path, &live, &opts, tier, &bundles, &scan),
+        None => dry_run_with(&state_path, &live, &opts, &bundles, &scan),
+    }
+}
+
+/// Resolve the paths the walk identifies records by.
+///
+/// One blocking task resolves the home, lists that resolved home, and
+/// resolves what the listing found. Listing the link and walking the target
+/// would see none of the same snapshots, and the doctor would then refuse to
+/// clean. A directory created after this returns is absent from the map, and
+/// the walk keeps its record rather than retiring it for a hash it could not
+/// compute.
+fn resolved_paths(state_path: &Path, bundles: &[EmbeddedBundle]) -> BTreeMap<PathBuf, PathBuf> {
+    let bundles = bundles.to_vec();
+    let state_path = state_path.to_path_buf();
+    // `spawn_blocking` needs a runtime, and startup and the tests have none.
+    // Enter one first, then spawn. The brace stays on the `spawn_blocking`
+    // line: that is the scope the ratchet treats as off the runtime.
+    let run = async move {
+        match tokio::task::spawn_blocking(move || {
+            let mut resolved = BTreeMap::new();
+            let Some(plugins_dir) = state_path.parent() else {
+                return resolved;
+            };
+            if plugins_dir.file_name().is_none_or(|name| name != "plugins") {
+                return resolved;
+            }
+            let Some(link) = plugins_dir.parent() else {
+                return resolved;
+            };
+            let Ok(home) = link.canonicalize() else {
+                return resolved;
+            };
+            // Both keys: the walk asks with the path it was given, and the
+            // listing below uses the resolved one. They differ when the home
+            // is a link.
+            resolved.insert(link.to_path_buf(), home.clone());
+            resolved.insert(home.clone(), home.clone());
+            let mut paths = Vec::new();
+            collect_children(&home, &bundles, &mut paths);
+            for path in paths {
+                if let Ok(real) = path.canonicalize() {
+                    resolved.insert(path, real);
+                }
+            }
+            resolved
+        })
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        }
+    };
+    // Already on a worker: leave it before waiting on another runtime.
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| POOL.block_on(run)),
+        Err(_) => POOL.block_on(run),
+    }
+}
+
+/// Snapshot and user-plugin directories under an already-resolved home.
+fn collect_children(home: &Path, bundles: &[EmbeddedBundle], paths: &mut Vec<PathBuf>) {
+    let snapshots = snapshots_dir(home);
+    if real_dir(&snapshots) {
+        for bundle in bundles {
+            let dir = snapshots.join(bundle.snapshot_dir_name());
+            if real_dir(&dir) {
+                paths.push(dir.join(bundle.name));
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&snapshots) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if LEFTOVER_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                {
+                    continue;
+                }
+                let Some((bundle_name, _)) = parse_snapshot_dir_name(&name, bundles) else {
+                    continue;
+                };
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !metadata_is_link_or_reparse(&metadata) && metadata.is_dir() {
+                    paths.push(path.join(bundle_name));
+                }
+            }
+        }
+    }
+    let plugins_dir = home.join("plugins");
+    if real_dir(&plugins_dir)
+        && let Ok(entries) = fs::read_dir(&plugins_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if real_dir(&path) {
+                paths.push(path);
+            }
+        }
+    }
+}
+
+static POOL: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .thread_name("plugin-doctor")
+        .build()
+        .expect("plugin doctor path resolver")
+});
 
 /// Human-readable size for reports.
 pub(crate) fn format_bytes(bytes: u64) -> String {
