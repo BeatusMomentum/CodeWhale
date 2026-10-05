@@ -12659,6 +12659,24 @@ fn annotate_child_model_error_adds_actionable_hint() {
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
     );
+
+    // A spent-balance quota refusal names the route too: the operator must
+    // know which account is exhausted. A short-lived rate limit passes
+    // through: retry, not a route change, is the recovery.
+    let quota = annotate_child_model_error(
+        "[quota_exhausted] Provider plan quota exhausted: You have run out of credits.",
+        "kimi-k2",
+        provider,
+        &inherit,
+    );
+    assert!(
+        quota.contains("child-agent model config"),
+        "exhausted balance gets the hint: {quota}"
+    );
+    assert!(quota.contains("kimi-k2"), "names the model: {quota}");
+    let limited =
+        annotate_child_model_error("Rate limited: slow down", "kimi-k2", provider, &inherit);
+    assert_eq!(limited, "Rate limited: slow down");
 }
 
 #[test]

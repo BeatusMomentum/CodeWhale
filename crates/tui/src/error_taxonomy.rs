@@ -531,6 +531,14 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
     ErrorCategory::Internal
 }
 
+/// True when `message` reports an exhausted balance rather than a
+/// short-lived limit: quota, usage limit, or a prepaid gateway's HTTP 402
+/// ("Insufficient funds"). The operator resolves it by topping up or switching
+/// route, so resending the same request cannot help.
+pub fn is_spent_balance_message(message: &str) -> bool {
+    is_spent_balance_text(&message.to_lowercase())
+}
+
 /// True when `lower` (already lowercased) reports an exhausted balance rather
 /// than a short-lived limit: quota, usage limit, or a prepaid gateway's HTTP
 /// 402 ("Insufficient funds"). The operator resolves it by topping up or
