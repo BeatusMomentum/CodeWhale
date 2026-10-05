@@ -471,6 +471,45 @@ pub(crate) fn resolve_guarded_read_path(
     Ok(path)
 }
 
+/// Workspace-escape fallback for the read-only image tools (`read`,
+/// `read_media`): admit `raw` only when it is exactly an image the user
+/// attached in this session's prompts. See
+/// [`crate::image_attach::resolve_user_attached_image`] for the admission
+/// rule; the credential and deny-list guards still apply here. `Ok(None)`
+/// means "not admitted" and the caller keeps its original refusal.
+///
+/// Known limit: a path the user mentioned only in prose, never attached, is
+/// not admitted; `/trust add` remains the way to open a directory.
+pub(crate) async fn user_attached_image_read_path(
+    context: &ToolContext,
+    raw: &str,
+    tool: &str,
+) -> Result<Option<PathBuf>, ToolError> {
+    let Some(snapshot) = context.session_objects.as_ref() else {
+        return Ok(None);
+    };
+    let references = crate::image_attach::user_attached_image_references(&snapshot.messages);
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let raw_owned = raw.to_string();
+    let admitted = tokio::task::spawn_blocking(move || {
+        crate::image_attach::resolve_user_attached_image(&references, &raw_owned)
+    })
+    .await
+    .map_err(|error| ToolError::execution_failed(format!("Failed to resolve {raw}: {error}")))?;
+    let Some(path) = admitted else {
+        return Ok(None);
+    };
+    if is_codewhale_credential_path(&path) {
+        return Err(ToolError::permission_denied(format!(
+            "{tool} cannot expose Codewhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection"
+        )));
+    }
+    enforce_read_denylist(&path, tool)?;
+    Ok(Some(path))
+}
+
 /// Refuse a read the sandbox read deny-list blocks (S1).
 ///
 /// `read_file`, `read`, and `read_media` all run *in-process*: they call
@@ -912,7 +951,15 @@ impl ReadFileTool {
         // raw spelling still matches by its target; the resolved check after
         // `resolve_path` stays as defense in depth for callers whose process
         // cwd is not the workspace.
-        let file_path = resolve_guarded_read_path(context, path_str, "read")?;
+        let file_path = match resolve_guarded_read_path(context, path_str, "read") {
+            Ok(path) => path,
+            Err(error @ ToolError::PathEscape { .. }) => {
+                user_attached_image_read_path(context, path_str, "read")
+                    .await?
+                    .ok_or(error)?
+            }
+            Err(error) => return Err(error),
+        };
         check_file_operation_cancelled(context)?;
         let bytes = load_contract_source(&file_path, false, context)
             .await?
@@ -928,7 +975,15 @@ impl ReadFileTool {
         let size_bytes = bytes.len();
         check_file_operation_cancelled(context)?;
         if let Some(mime_type) = primitive_image_mime(&bytes) {
-            let prepared = crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type);
+            // Decoding and any downscale are CPU-bound; keep them off the
+            // runtime worker (#6149).
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type)
+            })
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("Failed to prepare image: {error}"))
+            })?;
             context.note_file_read(&file_path);
             return Ok(RichToolResult::with_content_blocks(
                 ToolResult::success(prepared.note).with_metadata(json!({

@@ -11492,21 +11492,35 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
 
 #[must_use]
 pub fn active_provider_has_env_api_key(config: &Config) -> bool {
-    let Ok(identity) = config.active_provider_identity() else {
-        return false;
-    };
+    active_provider_env_api_key_source(config).is_some()
+}
+
+/// Where the active provider's environment key comes from, in the resolver's
+/// env precedence (`credential_resolve` steps 2-4): `--api-key`, the route's
+/// `api_key_env` variable, or the provider's own ambient variable. Returns the
+/// place's name only; any value read to test presence is dropped here.
+#[must_use]
+pub(crate) fn active_provider_env_api_key_source(config: &Config) -> Option<String> {
+    let identity = config.active_provider_identity().ok()?;
     let provider = identity.provider;
     if provider == ProviderKind::OpenaiCodex && !config.provider_uses_custom_endpoint(&identity) {
-        return false;
+        return None;
     }
     if auth_mode_disables_api_key(config.auth_mode_for_provider(&identity).as_deref()) {
-        return false;
+        return None;
     }
-    (!provider_uses_oauth_credentials(config, &identity)
-        && explicit_cli_api_key_override().is_some())
-        || provider_config_env_api_key(config, &identity).is_some()
-        || (!config.should_skip_secret_store_for_provider(&identity)
-            && provider_env_api_key(provider).is_some())
+    if !provider_uses_oauth_credentials(config, &identity)
+        && explicit_cli_api_key_override().is_some()
+    {
+        return Some("--api-key".to_string());
+    }
+    if provider_config_env_api_key(config, &identity).is_some() {
+        return bound_provider_api_key_env_name(config, &identity);
+    }
+    if config.should_skip_secret_store_for_provider(&identity) {
+        return None;
+    }
+    provider_env_api_key_named(provider).map(|(name, _)| name.to_string())
 }
 
 #[must_use]
@@ -12259,8 +12273,10 @@ fn provider_config_table_name(identity: &ProviderIdentity) -> Result<String> {
     Ok(format!("providers.{}", provider_config_key(identity)?))
 }
 
-fn provider_env_api_key(provider: ProviderKind) -> Option<String> {
-    provider_env_api_key_named(provider).map(|(_, value)| value)
+/// Name of the ambient provider variable that currently holds a non-empty key
+/// for `provider`. Presence only: the value is dropped here.
+pub(crate) fn provider_env_api_key_var(provider: ProviderKind) -> Option<&'static str> {
+    provider_env_api_key_named(provider).map(|(name, _)| name)
 }
 
 /// The provider's ambient env key and the variable that supplied it,

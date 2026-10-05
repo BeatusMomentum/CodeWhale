@@ -33523,3 +33523,22 @@ fn engine_retry_receipt_projection_keeps_quiet_history_without_internal_status_r
     ));
     assert_eq!(app.history.len(), before + 1);
 }
+
+#[test]
+fn a_foreground_shell_wait_is_one_tool_card_not_also_a_background_job() {
+    use super::task_projection::project_shell_jobs;
+    use crate::tools::shell::ShellStatus;
+    let mut app = create_test_app();
+    app.current_session_id = Some("fg".into());
+    let mut foreground = shell_job("shell_fg", "ls | head -40", ShellStatus::Running, None);
+    foreground.background = false;
+    foreground.finished_at = None;
+    let mut entries = Vec::new();
+    project_shell_jobs(&mut app, &mut entries, std::slice::from_ref(&foreground));
+    assert!(entries.is_empty(), "{entries:?}");
+
+    // Ctrl+B detaches it into /jobs: now it is exactly one background job.
+    foreground.background = true;
+    project_shell_jobs(&mut app, &mut entries, &[foreground]);
+    assert_eq!(entries.len(), 1);
+}

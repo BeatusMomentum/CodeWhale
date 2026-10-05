@@ -98,5 +98,3 @@ pub(super) const TOOL_SUMMARY_CARD_LINES: usize = 6;
 
 pub(super) const TOOL_DONE_SYMBOL: &str = crate::tui::glyphs::DONE;
 pub(super) const TOOL_FAILED_SYMBOL: &str = crate::tui::glyphs::FAILED;
-/// Compact Ctrl+B affordance for foreground shell waits in the live transcript.
-pub(super) const FOREGROUND_SHELL_WAIT_HINT: &str = "Ctrl+B → /jobs";

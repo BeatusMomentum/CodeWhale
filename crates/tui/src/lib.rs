@@ -4761,14 +4761,42 @@ async fn run_doctor(
             .bold()
     );
     println!("{}", "==================".truecolor(sky_r, sky_g, sky_b));
-    // Verdict first (U7): the answer and the next step, before the detail.
+    // The answer comes before the detail (U7). A requested live probe runs
+    // first so that answer can include it; the probe line is the only thing
+    // printed while that check is in flight.
     let (verdict_state, _) = doctor_setup_state(config, workspace);
     let identity = config.active_provider_identity().ok();
+    let api_target = doctor_api_target(config);
+    let live_api_requested = identity.as_ref().is_some_and(|identity| {
+        doctor_should_probe_api(identity.provider, &api_target.base_url, probes)
+    });
+    // The opt-in live check runs once, before the verdict, so the verdict,
+    // the credential lines and API Connectivity all report the same result.
+    let live_probe = if doctor_should_probe_auth(config) && live_api_requested {
+        println!("{} Testing connection...", "·".dimmed());
+        // Resolve a credential through the diagnostic-only store first, then
+        // probe with an in-memory clone. Constructing the normal client from
+        // the original config could otherwise trigger its legacy secret-store
+        // migration while a user merely asks doctor to test connectivity.
+        Some(match config.with_read_only_api_key_for_diagnostic() {
+            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
+            Err(error) => Err(error),
+        })
+    } else {
+        None
+    };
+    // Presence and variable name only; the value is never held here.
+    let env_key_source = crate::config::active_provider_env_api_key_source(config);
     let verdict = doctor_verdict(
         &verdict_state,
         identity
             .as_ref()
             .map_or("unavailable", |identity| identity.key.as_str()),
+        &DoctorVerdictFacts {
+            onboarded: crate::tui::onboarding::is_onboarded(),
+            env_key_source: env_key_source.clone(),
+            live_probe: live_probe.as_ref().map(Result::is_ok),
+        },
     );
     println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
     println!();
@@ -4942,10 +4970,19 @@ async fn run_doctor(
                     == crate::config::ConfigApiKeyValueKind::Literal
             })
         });
-        let env_source_declared = provider_config
+        let declared_env = provider_config
             .and_then(|entry| entry.api_key_env.as_deref())
-            .is_some_and(|name| !name.trim().is_empty());
-        let icon = if config_declared || env_source_declared {
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let env_source_declared = declared_env.is_some();
+        // Presence only: name the variable that holds a key, never its value.
+        let env_set = declared_env
+            .filter(|name| {
+                std::env::var_os(name)
+                    .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+            })
+            .or_else(|| crate::config::provider_env_api_key_var(provider));
+        let icon = if config_declared || env_source_declared || env_set.is_some() {
             "·".truecolor(aqua_r, aqua_g, aqua_b)
         } else {
             "·".dimmed()
@@ -4953,10 +4990,10 @@ async fn run_doctor(
         println!(
             "  {} {slot}: env_source={}, config_source={}",
             icon,
-            if env_source_declared {
-                "declared (value not inspected)"
-            } else {
-                "not inspected"
+            match env_set {
+                Some(var) => doctor_env_key_label(var),
+                None if env_source_declared => "declared (value not inspected)".to_string(),
+                None => "not inspected".to_string(),
             },
             if config_declared {
                 "declared (value not inspected)"
@@ -5001,19 +5038,36 @@ async fn run_doctor(
         ApiKeySource::LocalRuntime => "local runtime; credentials not required",
         ApiKeySource::Unknown => "unknown; credential environment and stores not inspected",
     };
-    println!(
-        "  {} active provider credential source: {source_label}",
-        "·".dimmed()
-    );
+    match env_key_source.as_deref() {
+        Some(source) => println!(
+            "  {} active provider credential source: {}",
+            "·".dimmed(),
+            doctor_env_key_label(source)
+        ),
+        None => println!(
+            "  {} active provider credential source: {source_label}",
+            "·".dimmed()
+        ),
+    }
     println!(
         "  · active provider credential availability: {}",
         credential.availability.label()
     );
+    match &live_probe {
+        Some(Ok(())) => println!(
+            "  {} active provider credential: accepted by the live API check",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        Some(Err(_)) => println!(
+            "  {} active provider credential: live API check failed (see API Connectivity)",
+            "✗".truecolor(red_r, red_g, red_b)
+        ),
+        None => {}
+    }
 
     // API connectivity test
     println!();
     println!("{}", "API Connectivity:".bold());
-    let api_target = doctor_api_target(config);
     // Configured-vs-active honesty (DGF-01): doctor describes the route a
     // session launched NOW would resolve. It cannot see inside an already
     // running session, which keeps the route it resolved at its own launch.
@@ -5069,50 +5123,41 @@ async fn run_doctor(
             alias.alias, alias.retirement_date, alias.replacement
         );
     }
-    let live_api_requested = identity.as_ref().is_some_and(|identity| {
-        doctor_should_probe_api(identity.provider, &api_target.base_url, probes)
-    });
     let endpoint_is_local = identity.as_ref().is_some_and(|identity| {
         crate::config::provider_route_is_keyless_self_hosted(
             identity.provider,
             &api_target.base_url,
         ) || crate::config::base_url_uses_local_host(&api_target.base_url)
     });
-    if doctor_should_probe_auth(config) && live_api_requested {
-        print!("  {} Testing connection...", "·".dimmed());
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-
-        // Resolve a credential through the diagnostic-only store first, then
-        // probe with an in-memory clone. Constructing the normal client from
-        // the original config could otherwise trigger its legacy secret-store
-        // migration while a user merely asks doctor to test connectivity.
-        let connectivity_result = match config.with_read_only_api_key_for_diagnostic() {
-            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
-            Err(error) => Err(error),
-        };
+    if let Some(connectivity_result) = &live_probe {
         match connectivity_result {
             Ok(()) => {
                 println!(
-                    "\r  {} API connection successful",
+                    "  {} API connection successful",
                     "✓".truecolor(aqua_r, aqua_g, aqua_b)
                 );
             }
             Err(e) => {
                 let error_msg = e.to_string();
                 println!(
-                    "\r  {} API connection failed",
+                    "  {} API connection failed",
                     "✗".truecolor(red_r, red_g, red_b)
                 );
                 let names_status =
                     |status| crate::mcp::oauth::text_names_http_status(&error_msg, status);
+                let provider = identity
+                    .as_ref()
+                    .map(|identity| identity.provider)
+                    .unwrap_or(crate::config::ProviderKind::Deepseek);
                 if names_status("401") || error_msg.contains("Unauthorized") {
                     println!(
-                        "    Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
+                        "    Invalid API key. Check `codewhale auth status`, {}, or config.toml",
+                        doctor_provider_key_place(provider)
                     );
                 } else if names_status("403") || error_msg.contains("Forbidden") {
                     println!(
-                        "    API key lacks permissions. Verify key is active at platform.deepseek.com"
+                        "    API key lacks permissions. Verify the {} key is active.",
+                        provider.provider().display_name()
                     );
                 } else if error_msg.contains("timeout") || error_msg.contains("Timeout") {
                     for line in doctor_timeout_recovery_lines(config) {
@@ -5859,29 +5904,97 @@ async fn run_doctor(
     println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
 }
 
+/// Human-facing facts the verdict uses beyond the setup-state record. None of
+/// these change structural Setup/Fleet readiness (the JSON contract): a set
+/// environment variable is reported, never certified, until a live probe.
+#[derive(Debug, Clone, Default)]
+struct DoctorVerdictFacts {
+    /// The TUI's own first-run receipt (`.onboarded`). TUI onboarding finishes
+    /// after its key gate but never fills the `/setup` wizard's language and
+    /// constitution steps, so `first_run_ready()` alone misreads it.
+    onboarded: bool,
+    /// Name of the env place holding the active provider's key, from
+    /// `config::active_provider_env_api_key_source`; never the value.
+    env_key_source: Option<String>,
+    /// Outcome of the opt-in live API check; `None` when it did not run.
+    live_probe: Option<bool>,
+}
+
+/// `set via <VAR> (value not shown; not checked offline)`.
+fn doctor_env_key_label(source: &str) -> String {
+    format!("set via {source} (value not shown; not checked offline)")
+}
+
+/// Where a rejected key might live, named without reading it. A route that
+/// binds `api_key_env` is named by that variable; otherwise the provider's
+/// first ambient variable.
+fn doctor_provider_key_place(provider: crate::config::ProviderKind) -> String {
+    provider
+        .provider()
+        .env_vars()
+        .first()
+        .copied()
+        .unwrap_or("the provider environment variable")
+        .to_string()
+}
+
 /// Doctor's one-line answer: ready, or the single next step (U7). Readiness
-/// is the setup lane's own verdict; doctor never reads the environment or the
-/// secret store to decide it, so a key saved outside setup shows as an
-/// unverified route (`credential: availability=not_probed`), not a missing one.
-fn doctor_verdict(state: &codewhale_config::SetupState, provider: &str) -> String {
+/// starts from the setup lane's record. Offline doctor never reads the secret
+/// store, so a stored key is "not checked", not missing; "Not ready" is kept
+/// for a missing route, a key nothing can account for, or a failed probe.
+fn doctor_verdict(
+    state: &codewhale_config::SetupState,
+    provider: &str,
+    facts: &DoctorVerdictFacts,
+) -> String {
     use codewhale_config::StepStatus;
+    const PROBE_HINT: &str = "run `codewhale doctor --probe-api` to verify";
+    match facts.live_probe {
+        Some(false) => {
+            return format!(
+                "Not ready: the live {provider} API check failed → see API Connectivity below; `codewhale auth set --provider {provider}` replaces a rejected key."
+            );
+        }
+        Some(true) => return format!("Ready: the live {provider} API check passed."),
+        None => {}
+    }
+    let env_ready = facts.env_key_source.as_deref().map(|source| {
+        format!("Ready: {provider} key is set via {source} (not checked offline; {PROBE_HINT}).")
+    });
     // NeedsAction means a named route exists but its key is missing, unchecked
     // or failed. Configured routes can be used without a prior probe.
     // `first_run_ready` accepts NeedsAction (a failed key still reaches the
     // wizard's ready screen), so check the provider first.
     match state.status(codewhale_config::SetupStep::ProviderModel) {
-        StepStatus::Configured | StepStatus::Verified => {
-            if state.first_run_ready() {
-                "Ready: setup is complete.".to_string()
-            } else {
-                "Not ready: first-run setup is unfinished → run `codewhale setup`.".to_string()
-            }
+        StepStatus::Verified if state.first_run_ready() || facts.onboarded => {
+            "Ready: setup is complete.".to_string()
         }
-        StepStatus::NeedsAction => format!(
-            "Not ready: the {provider} route has no verified key → save one with /provider in Codewhale or `codewhale auth set --provider {provider}`; `codewhale doctor --probe-api` checks a key already saved."
-        ),
-        _ => "Not ready: no model provider set up → run /provider in Codewhale, or `codewhale setup`."
-            .to_string(),
+        StepStatus::Configured | StepStatus::Verified
+            if state.first_run_ready() || facts.onboarded =>
+        {
+            format!("Ready: setup is complete (saved key not checked offline; {PROBE_HINT}).")
+        }
+        StepStatus::Configured | StepStatus::Verified => env_ready.unwrap_or_else(|| {
+            "Not ready: first-run setup is unfinished → run `codewhale setup`.".to_string()
+        }),
+        StepStatus::NeedsAction => env_ready.unwrap_or_else(|| {
+            // A derived NeedsAction only means offline doctor cannot see the
+            // stored key; onboarding already gated on one. A NeedsAction the
+            // setup lane persisted is a real missing or failed key.
+            if state.inherited && facts.onboarded {
+                format!(
+                    "Ready: onboarding is complete (saved {provider} key not checked offline; {PROBE_HINT})."
+                )
+            } else {
+                format!(
+                    "Not ready: the {provider} route has no verified key → save one with /provider in Codewhale or `codewhale auth set --provider {provider}`; `codewhale doctor --probe-api` checks a key already saved."
+                )
+            }
+        }),
+        _ => env_ready.unwrap_or_else(|| {
+            "Not ready: no model provider set up → run /provider in Codewhale, or `codewhale setup`."
+                .to_string()
+        }),
     }
 }
 
@@ -5889,7 +6002,11 @@ fn doctor_verdict(state: &codewhale_config::SetupState, provider: &str) -> Strin
 mod doctor_verdict_tests {
     #[test]
     fn a_fresh_home_is_not_ready_and_names_the_provider_step() {
-        let verdict = super::doctor_verdict(&codewhale_config::SetupState::default(), "deepseek");
+        let verdict = super::doctor_verdict(
+            &codewhale_config::SetupState::default(),
+            "deepseek",
+            &super::DoctorVerdictFacts::default(),
+        );
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(verdict.contains("/provider"), "{verdict}");
     }
@@ -5905,7 +6022,8 @@ mod doctor_verdict_tests {
             SetupStep::ProviderModel,
             StepEntry::new(StepStatus::NeedsAction, true, "inherited"),
         );
-        let verdict = super::doctor_verdict(&state, "deepseek");
+        let verdict =
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default());
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(!verdict.contains("no model provider"), "{verdict}");
         assert!(
@@ -5932,7 +6050,8 @@ mod doctor_verdict_tests {
         state.runtime_posture_source = RuntimePostureSource::Confirmed;
         state.constitution_choice = ConstitutionChoice::Bundled;
         assert!(state.first_run_ready(), "fixture must be wizard-ready");
-        let verdict = super::doctor_verdict(&state, "deepseek");
+        let verdict =
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default());
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(verdict.contains("/provider"), "{verdict}");
 
@@ -5941,8 +6060,137 @@ mod doctor_verdict_tests {
             StepEntry::new(StepStatus::Verified, true, "0.10.1"),
         );
         assert_eq!(
-            super::doctor_verdict(&state, "deepseek"),
+            super::doctor_verdict(&state, "deepseek", &super::DoctorVerdictFacts::default()),
             "Ready: setup is complete."
+        );
+    }
+
+    fn facts(
+        onboarded: bool,
+        env_key_source: Option<&str>,
+        live_probe: Option<bool>,
+    ) -> super::DoctorVerdictFacts {
+        super::DoctorVerdictFacts {
+            onboarded,
+            env_key_source: env_key_source.map(str::to_string),
+            live_probe,
+        }
+    }
+
+    #[test]
+    fn completed_tui_onboarding_is_not_unfinished_setup() {
+        // TUI onboarding records the route step only; never the wizard's
+        // language/constitution steps.
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Configured, true, "0.10.1"),
+        );
+        assert!(!state.first_run_ready(), "fixture is not wizard-ready");
+        let verdict = super::doctor_verdict(&state, "openai", &facts(true, None, None));
+        assert!(verdict.starts_with("Ready: setup is complete"), "{verdict}");
+        assert!(verdict.contains("--probe-api"), "{verdict}");
+        assert!(!verdict.contains("unfinished"), "{verdict}");
+
+        // Without the receipt (or a key) the wizard's verdict stands.
+        let verdict = super::doctor_verdict(&state, "openai", &facts(false, None, None));
+        assert!(
+            verdict.contains("first-run setup is unfinished"),
+            "{verdict}"
+        );
+    }
+
+    #[test]
+    fn onboarded_home_without_a_record_is_ready_but_a_recorded_failure_is_not() {
+        use codewhale_config::{InheritedConfigFacts, SetupState};
+        let derived = SetupState::derive_inherited(&InheritedConfigFacts {
+            has_provider_route: true,
+            ..Default::default()
+        });
+        let verdict = super::doctor_verdict(&derived, "openai", &facts(true, None, None));
+        assert!(
+            verdict.starts_with("Ready: onboarding is complete"),
+            "{verdict}"
+        );
+
+        let mut recorded = derived.clone();
+        recorded.inherited = false;
+        let verdict = super::doctor_verdict(&recorded, "openai", &facts(true, None, None));
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+    }
+
+    #[test]
+    fn a_set_env_key_is_ready_and_named_for_any_provider() {
+        use codewhale_config::{InheritedConfigFacts, SetupState};
+        // Structural derivation keeps NeedsAction: env never certifies it.
+        let derived = SetupState::derive_inherited(&InheritedConfigFacts {
+            has_provider_route: true,
+            ..Default::default()
+        });
+        let verdict = super::doctor_verdict(
+            &derived,
+            "anthropic",
+            &facts(false, Some("ANTHROPIC_API_KEY"), None),
+        );
+        assert_eq!(
+            verdict,
+            "Ready: anthropic key is set via ANTHROPIC_API_KEY (not checked offline; run `codewhale doctor --probe-api` to verify)."
+        );
+    }
+
+    #[test]
+    fn the_live_probe_result_decides_the_verdict() {
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "0.10.1"),
+        );
+        let verdict = super::doctor_verdict(&state, "openai", &facts(false, None, Some(true)));
+        assert!(
+            verdict.starts_with("Ready: the live openai API check passed"),
+            "{verdict}"
+        );
+
+        let verdict = super::doctor_verdict(
+            &state,
+            "openai",
+            &facts(true, Some("OPENAI_API_KEY"), Some(false)),
+        );
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("API Connectivity"), "{verdict}");
+    }
+
+    #[test]
+    fn env_key_source_names_the_providers_own_variable_without_its_value() {
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let _openai = crate::test_support::EnvVarGuard::set("OPENAI_API_KEY", "MUST-NOT-BE-SHOWN");
+        let config = crate::config::Config {
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let source = crate::config::active_provider_env_api_key_source(&config)
+            .expect("ambient key present");
+        assert_eq!(source, "OPENAI_API_KEY");
+        let label = super::doctor_env_key_label(&source);
+        assert_eq!(
+            label,
+            "set via OPENAI_API_KEY (value not shown; not checked offline)"
+        );
+        assert!(!label.contains("MUST-NOT-BE-SHOWN"));
+        // The structural contract is untouched: env presence is not readiness.
+        assert!(
+            !super::resolve_credential_diagnostic(&config)
+                .availability
+                .certifies_ready()
+        );
+
+        let _openai = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        assert_eq!(
+            crate::config::active_provider_env_api_key_source(&config),
+            None
         );
     }
 }

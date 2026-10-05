@@ -126,8 +126,8 @@ fn lowercase_bash_description_matches_the_timeout_it_actually_applies() {
     };
 
     // `bash {command}` with no `timeout` translates to a legacy input carrying
-    // no `timeout_ms`, and the contract delegate then bounds the foreground run
-    // at the 120 s default and kills the process there.
+    // no `timeout_ms`. The contract delegate waits the 120 s default in the
+    // foreground, then moves a still-running process to the background.
     let translated =
         contract_bash_legacy_input(&json!({"command": "sleep 600"})).expect("translated input");
     assert!(
@@ -142,7 +142,8 @@ fn lowercase_bash_description_matches_the_timeout_it_actually_applies() {
     // The tool description is the only place the model learns this. It used to
     // say "when omitted there is no default timeout", so a model running a
     // four-minute build had every reason not to pass a timeout, and got the
-    // process killed at two minutes anyway.
+    // process killed at two minutes anyway. It now names that wait and says
+    // the process is not killed there.
     let description = LowercaseBashTool.description();
     assert!(
         !description.contains("no default timeout"),
@@ -686,27 +687,6 @@ fn shell_execution_failure_names_resource_exhaustion_and_says_retry() {
         message,
         "Shell execution failed: working directory does not exist"
     );
-}
-
-#[tokio::test]
-async fn lowercase_bash_timeout_uses_seconds_and_fails() {
-    let workspace = tempdir().expect("workspace");
-    let context = ToolContext::new(workspace.path());
-    let error = LowercaseBashTool
-        .execute(
-            json!({"command": sleep_command(2), "timeout": 0.01}),
-            &context,
-        )
-        .await
-        .expect_err("timeout must fail");
-    assert!(
-        error
-            .to_string()
-            .contains("Command timed out after 0.01 seconds"),
-        "{error}"
-    );
-    let metadata = error.metadata().expect("timeout metadata");
-    assert_eq!(metadata["status"], "TimedOut");
 }
 
 fn execute_shell(
@@ -2163,7 +2143,11 @@ async fn background_shell_job_preserves_origin_identity() {
         "owned background work must describe its real completion route: {}",
         result.content
     );
-    assert!(result.content.contains("Bash action=\"wait\""));
+    assert!(
+        result.content.contains("`tool_search`") && result.content.contains("task_shell_wait"),
+        "owned background work must name a callable wait tool: {}",
+        result.content
+    );
     assert_eq!(
         metadata
             .get("auto_resume_on_completion")
@@ -3240,66 +3224,6 @@ async fn test_exec_shell_combined_output_uses_single_stream() {
     );
 }
 
-#[tokio::test]
-async fn test_exec_shell_foreground_timeout_guides_background_rerun() {
-    let tmp = tempdir().expect("tempdir");
-    let ctx = ToolContext::new(tmp.path());
-    let tool = BashTool::new("Bash");
-
-    let result = tool
-        .execute(
-            json!({
-                "command": sleep_command(10),
-                "timeout_ms": 1000
-            }),
-            &ctx,
-        )
-        .await
-        .expect("execute");
-
-    assert!(!result.success);
-    // The rerun instruction has to be spelled in the canonical action form:
-    // `exec_shell` / `task_shell_start` are not both dispatchable, and the
-    // model can only reach the shell through `Bash`.
-    assert!(
-        result
-            .content
-            .contains("Bash action=\"run\" background=true")
-    );
-    assert!(result.content.contains("Bash action=\"wait\""));
-    assert!(!result.content.contains("exec_shell"));
-    assert!(result.content.contains("process killed"));
-    let meta = result.metadata.expect("metadata");
-    assert_eq!(meta.get("status").and_then(Value::as_str), Some("TimedOut"));
-    let recovery = meta
-        .get("foreground_timeout_recovery")
-        .expect("timeout recovery metadata");
-    assert_eq!(
-        recovery
-            .get("rerun_as")
-            .and_then(|rerun| rerun.get("background"))
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        recovery
-            .get("rerun_as")
-            .and_then(|rerun| rerun.get("tool"))
-            .and_then(Value::as_str),
-        Some("Bash")
-    );
-    let hint = recovery
-        .get("hint")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    assert!(hint.contains("Bash action=\"wait\""), "{hint}");
-    assert!(!hint.contains("exec_shell"), "{hint}");
-    // The structured tool list is read by the model too; it must not hand
-    // over names the registry does not resolve.
-    let recommended = recovery.to_string();
-    assert!(!recommended.contains("exec_shell"), "{recommended}");
-}
-
 #[test]
 fn background_schema_distinguishes_temporary_jobs_from_persistent_services() {
     let schema = BashTool::new("Bash").input_schema();
@@ -3377,15 +3301,11 @@ async fn test_exec_shell_foreground_can_move_to_background() {
         .expect("task should not panic");
 
     assert!(result.success);
+    assert!(result.content.contains("moved to the background"));
+    // The detach message points the model at a tool it can actually call.
+    // `Bash` is hidden; `task_shell_wait` is deferred behind `tool_search`.
     assert!(
-        result
-            .content
-            .contains("Foreground shell wait moved to /jobs")
-    );
-    // The detach message points the model at the wait action for early
-    // output, and hands over the task_id it needs to make that call.
-    assert!(
-        result.content.contains("Bash action=\"wait\""),
+        result.content.contains("`tool_search`") && result.content.contains("task_shell_wait"),
         "{}",
         result.content
     );
@@ -3498,7 +3418,10 @@ async fn lowercase_bash_foreground_detach_is_a_successful_running_receipt() {
 
     assert!(result.success, "{}", result.content);
     assert!(
-        result.content.contains("moved to /jobs"),
+        result.content.contains("moved to the background")
+            && result.content.contains("not killed")
+            && result.content.contains("`tool_search`")
+            && result.content.contains("task_shell_wait"),
         "{}",
         result.content
     );
@@ -4430,44 +4353,6 @@ fn shell_escaped_grandchild_helper_process() {
     std::thread::sleep(Duration::from_secs(30));
 }
 
-/// Required regression: a foreground command that ignores SIGTERM must be
-/// dead and the tool must have returned within timeout + a small grace
-/// (2s timeout, assert wall < 10s).
-#[cfg(unix)]
-#[tokio::test]
-async fn foreground_timeout_kills_sigterm_ignoring_command_within_grace() {
-    let tmp = tempdir().expect("tempdir");
-    let pid_file = tmp.path().join("sigterm-helper.pid");
-    let test_binary = std::env::current_exe().expect("current test binary");
-    let command = format!(
-        "{SHELL_SIGTERM_HELPER_ENV}=1 {SHELL_DESCENDANT_PID_FILE_ENV}={} exec {} --exact {} --nocapture",
-        shell_words::quote(&pid_file.display().to_string()),
-        shell_words::quote(&test_binary.display().to_string()),
-        shell_words::quote("tools::shell::tests::shell_sigterm_ignoring_helper_process"),
-    );
-    let ctx = ToolContext::new(tmp.path());
-
-    let started = Instant::now();
-    let result = BashTool::new("Bash")
-        .execute(json!({"command": command, "timeout_ms": 2_000}), &ctx)
-        .await
-        .expect("execute");
-    let wall = started.elapsed();
-
-    assert!(!result.success);
-    let meta = result.metadata.expect("metadata");
-    assert_eq!(meta.get("status").and_then(Value::as_str), Some("TimedOut"));
-    assert!(
-        wall < Duration::from_secs(10),
-        "kill path overshot the 2s timeout: wall {wall:?}"
-    );
-    let helper_pid = wait_for_shell_pid_file(&pid_file);
-    assert!(
-        wait_for_shell_pid_exit(helper_pid),
-        "SIGTERM-ignoring helper {helper_pid} survived the timeout kill"
-    );
-}
-
 /// Regression for the ~180s kill-path overshoot: a descendant that escaped
 /// the process group keeps the output pipe open after the group is killed.
 /// kill() must still return within a bounded grace instead of blocking on
@@ -4832,15 +4717,6 @@ fn bash_required_groups_survive_a_provider_that_drops_root_composition() {
     assert_eq!(schema["type"], "object");
     assert!(schema.get("anyOf").is_none(), "root anyOf must be removed");
     assert!(schema["properties"]["command"].is_object());
-}
-
-/// Every hint in this file has to name a tool the model can actually call.
-/// `exec_shell` / `exec_shell_wait` were retired in v0.9.3.
-#[test]
-fn shell_recovery_hints_name_only_dispatchable_tools() {
-    assert!(!FOREGROUND_TIMEOUT_RECOVERY_HINT.contains("exec_shell"));
-    assert!(FOREGROUND_TIMEOUT_RECOVERY_HINT.contains("Bash"));
-    assert!(FOREGROUND_TIMEOUT_RECOVERY_HINT.contains("action=\"wait\""));
 }
 
 /// One documented default hid three real ones: `wait` uses 30s and
@@ -5805,4 +5681,30 @@ async fn note_tool_refuses_symlinked_targets_that_leave_the_workspace() {
             .expect("read notes")
             .contains("kept")
     );
+}
+
+#[tokio::test]
+async fn a_foreground_command_past_its_wait_moves_to_the_background_alive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let result = BashTool::new("Bash")
+        .execute(
+            json!({"command": "echo started; sleep 3; echo finished", "timeout_ms": 1_000}),
+            &ctx,
+        )
+        .await
+        .expect("bash");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("not killed"), "{}", result.content);
+    assert!(result.content.contains("started"), "{}", result.content);
+    let task_id = result.metadata.as_ref().expect("metadata")["task_id"]
+        .as_str()
+        .expect("task_id")
+        .to_string();
+    let mut manager = ctx.shell_manager.lock().expect("shell manager lock");
+    assert_eq!(
+        manager.poll_status(&task_id).expect("status"),
+        ShellStatus::Running
+    );
+    assert!(manager.processes.get(&task_id).expect("tracked").background);
 }

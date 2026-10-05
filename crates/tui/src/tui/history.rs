@@ -41,10 +41,9 @@ use checklist::{
 #[cfg(test)]
 use checklist::{ChecklistChange, ChecklistItemSnapshot, ChecklistSnapshot};
 use constants::{
-    ASSISTANT_GLYPH, FOREGROUND_SHELL_WAIT_HINT, TOOL_COMMAND_LINE_LIMIT, TOOL_DONE_SYMBOL,
-    TOOL_FAILED_SYMBOL, TOOL_FAILURE_PREVIEW_LINES, TOOL_HEADER_SUMMARY_LIMIT,
-    TOOL_OUTPUT_LINE_LIMIT, TOOL_SUCCESS_OUTPUT_PREVIEW_LINES, TOOL_SUMMARY_CARD_LINES,
-    TRANSCRIPT_RAIL, USER_GLYPH,
+    ASSISTANT_GLYPH, TOOL_COMMAND_LINE_LIMIT, TOOL_DONE_SYMBOL, TOOL_FAILED_SYMBOL,
+    TOOL_FAILURE_PREVIEW_LINES, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT,
+    TOOL_SUCCESS_OUTPUT_PREVIEW_LINES, TOOL_SUMMARY_CARD_LINES, TRANSCRIPT_RAIL, USER_GLYPH,
 };
 #[cfg(test)]
 use constants::{TOOL_RUNNING_SYMBOLS, TOOL_STATUS_SYMBOL_MS};
@@ -1026,7 +1025,7 @@ impl ExecCell {
         self.render(width, low_motion, RenderMode::Live)
     }
 
-    /// Foreground `exec_shell` blocking the turn — eligible for Ctrl+B detach.
+    /// Foreground `exec_shell` blocking the turn.
     fn is_foreground_shell_wait(&self) -> bool {
         self.status == ToolStatus::Running
             && self.source == ExecSource::Assistant
@@ -1052,14 +1051,13 @@ impl ExecCell {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let command_summary = command_header_summary(&self.command);
-        let compact_foreground_wait = self.is_foreground_shell_wait();
-        let header_summary = if compact_foreground_wait {
-            Some(FOREGROUND_SHELL_WAIT_HINT)
-        } else {
-            self.interaction
-                .as_deref()
-                .or(Some(command_summary.as_str()))
-        };
+        // The header names the command, always. A long wait moves itself to
+        // the background (see `execute_foreground_via_background`), so the
+        // card never needs to advertise a key to rescue the turn.
+        let header_summary = self
+            .interaction
+            .as_deref()
+            .or(Some(command_summary.as_str()));
         let stale_status = self
             .stale_elapsed_since_output_ms
             .map(stale_shell_status_label);
@@ -1082,11 +1080,10 @@ impl ExecCell {
             low_motion || stale_status.is_some(),
         ));
 
-        // Foreground shell waits block the turn but do not need a verbose
-        // transcript card — spinner + running badge + Ctrl+B hint only.
-        // Command, live output, and artifact paths belong in the Activity sidebar
-        // and `/jobs` detail surfaces.
-        if compact_foreground_wait {
+        // A foreground shell wait stays a compact card — command, spinner and
+        // running badge. Live output and artifact paths belong in the
+        // Activity sidebar and `/jobs` detail surfaces.
+        if self.is_foreground_shell_wait() {
             return wrap_card_rail(lines, self.status);
         }
 
@@ -1166,12 +1163,6 @@ impl ExecCell {
                     width,
                     TOOL_OUTPUT_LINE_LIMIT,
                     mode,
-                ));
-            } else if self.status == ToolStatus::Running && self.source == ExecSource::Assistant {
-                lines.extend(wrap_plain_line(
-                    "  Ctrl+B moves this shell wait to /jobs.",
-                    Style::default().fg(palette::TEXT_MUTED),
-                    width,
                 ));
             } else if self.status != ToolStatus::Running && mode == RenderMode::Transcript {
                 // #3031: Suppress "(no output)" in compact/Live mode;

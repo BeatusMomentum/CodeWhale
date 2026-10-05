@@ -689,7 +689,7 @@ fn streaming_reasoning_shows_its_newest_line_not_a_placeholder() {
 ///
 /// Replaces three tests.
 #[test]
-fn a_foreground_shell_wait_offers_the_escape_hatch_not_the_command_echo() {
+fn a_foreground_shell_wait_names_its_command_without_a_key_hint() {
     let command = "cargo test --workspace --all-features";
     let running = {
         let mut exec = exec_tool(command, ToolStatus::Running);
@@ -706,17 +706,16 @@ fn a_foreground_shell_wait_offers_the_escape_hatch_not_the_command_echo() {
         ),
     ] {
         assert!(
-            text.contains("Ctrl+B"),
-            "[{label}] the backgrounding chord is the point of the card: {text}"
+            text.contains(command),
+            "[{label}] the card names what is running: {text}"
+        );
+        assert!(
+            !text.contains("Ctrl+B"),
+            "[{label}] a long wait moves itself to the background: {text}"
         );
         assert!(
             !text.contains("running line 1"),
             "[{label}] the live tail belongs to the sidebar and /jobs: {text}"
-        );
-        assert!(
-            !text.contains(command),
-            "[{label}] the header already carries the summary; do not echo the \
-             command target: {text}"
         );
         assert!(!text.contains("command:"), "[{label}] {text}");
     }

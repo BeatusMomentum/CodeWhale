@@ -8012,3 +8012,84 @@ fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
         "the pasted text must not land outside the workspace"
     );
 }
+
+#[cfg(not(windows))]
+#[test]
+fn dropped_screenshot_path_becomes_an_image_attachment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    // Terminal.app / iTerm2 deliver a drop as a shell-escaped paste.
+    let dropped = shot.display().to_string().replace(' ', "\\ ");
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "what is wrong here?".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    app.insert_paste_text(&dropped);
+
+    let line = format!("[Attached image: {}]", shot.display());
+    assert!(app.input.contains(&line), "{}", app.input);
+    assert!(!app.input.contains("\\ "), "{}", app.input);
+    assert_eq!(app.composer_attachment_count(), 1);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(format!("Attached image: {}", shot.display()).as_str())
+    );
+    let expanded = crate::image_attach::expand_attachment_blocks(&app.input);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    assert!(
+        expanded
+            .blocks
+            .iter()
+            .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
+    );
+}
+
+#[test]
+fn image_path_pasted_on_a_command_line_stays_literal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("shot.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "/rename ".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    app.insert_paste_text(&shot.display().to_string());
+
+    assert_eq!(app.input, format!("/rename {}", shot.display()));
+    assert_eq!(app.composer_attachment_count(), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_typed_drop_with_the_question_on_its_line_still_sends_the_image() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let mut app = App::new(test_options(false), &Config::default());
+    // Arrived as keystrokes, so the paste-time check never saw it.
+    app.input = format!(
+        "{}  why does it show jobs 2?",
+        shot.display().to_string().replace(' ', "\\ ")
+    );
+    app.cursor_position = app.input.chars().count();
+
+    let submitted = app.submit_input().expect("submitted");
+
+    assert!(
+        submitted.starts_with(&format!("[Attached image: {}]\n", shot.display())),
+        "{submitted}"
+    );
+    assert!(
+        submitted.ends_with("why does it show jobs 2?"),
+        "{submitted}"
+    );
+    let expanded = crate::image_attach::expand_attachment_blocks(&submitted);
+    assert!(expanded.notices.is_empty(), "{expanded:?}");
+    assert!(
+        expanded
+            .blocks
+            .iter()
+            .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
+    );
+}

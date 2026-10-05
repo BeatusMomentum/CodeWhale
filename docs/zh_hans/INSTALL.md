@@ -489,7 +489,7 @@ codewhale doctor --probe-api
 #   · Testing connection...  ✓ API connection successful
 ```
 
-请用 `auth status`。单独运行 `codewhale doctor` **不会**告诉你：即使密钥已设置，它也会打印 `deepseek: env_source=not inspected`；即使找不到密钥，它也以 0 退出。
+单独运行 `codewhale doctor` 会列出它能看到的环境变量密钥（`deepseek: env_source=set via DEEPSEEK_API_KEY (value not shown; not checked offline)`），但不会读取密钥存储或验证密钥；`--probe-api` 会两者都做。即使找不到密钥，doctor 也以 0 退出，所以脚本请用 `auth status`。
 
 ### 删除已保存的密钥
 

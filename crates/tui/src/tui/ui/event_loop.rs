@@ -444,7 +444,11 @@ pub(super) fn flush_paste_burst_before_composer(app: &mut App, now: Instant) -> 
     }
     match app.take_paste_burst_flush_if_enabled(now) {
         crate::tui::paste_burst::FlushResult::Paste(text) => {
-            app.insert_str(&text);
+            // Terminals without bracketed paste deliver a dropped file the
+            // same way; attach it exactly as `insert_paste_text` would.
+            if !app.attach_pasted_image_paths(&text) {
+                app.insert_str(&text);
+            }
             true
         }
         crate::tui::paste_burst::FlushResult::Typed(' ')
