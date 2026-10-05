@@ -19,6 +19,8 @@ use super::types::{
     PluginTrustStatus,
 };
 
+pub(crate) mod gc;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_REVIEW_HISTORY: usize = 32;
 
@@ -1375,15 +1377,20 @@ fn builtin_predecessor<'a>(
         .filter(|entry| entry.trust.is_some())
 }
 
-fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+/// Directory name of a plugin id's runtime snapshots under `.runtime/v2`.
+fn runtime_stage_key(id: &PluginId) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codewhale-plugin-stage-v2\0");
     hasher.update(id.as_str().as_bytes());
-    let key = hasher
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .collect::<String>()
+}
+
+fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {
+    let key = runtime_stage_key(id);
     let state_parent = state_path.parent().unwrap_or_else(|| Path::new("."));
     let state_parent = state_parent
         .canonicalize()

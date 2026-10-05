@@ -50,7 +50,7 @@ const SNAPSHOTS_DIR_NAME: &str = "snapshots";
 
 /// Publication marker, outside the plugin itself. It is checked along with
 /// every embedded byte and directory entry, never used as proof by itself.
-const STAMP_NAME: &str = ".stamp";
+pub(crate) const STAMP_NAME: &str = ".stamp";
 
 const COMPUTER_USE: &str = "computer-use";
 
@@ -123,7 +123,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
 
 /// Digest of one bundle's entire contents, including its file names, so a
 /// renamed or removed file is as much a change as an edited one.
-fn digest(files: &[(&str, &[u8])]) -> String {
+pub(crate) fn digest(files: &[(&str, &[u8])]) -> String {
     let mut hasher = Sha256::new();
     for (relative, contents) in files {
         hasher.update((relative.len() as u64).to_le_bytes());
@@ -132,6 +132,61 @@ fn digest(files: &[(&str, &[u8])]) -> String {
         hasher.update(contents);
     }
     super::manifest::hex_digest(hasher.finalize())
+}
+
+/// A bundle this build embeds, identified by the digest of its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbeddedBundle {
+    pub name: &'static str,
+    pub digest: String,
+}
+
+impl EmbeddedBundle {
+    /// Directory name of this build's snapshot under the snapshots root.
+    pub(crate) fn snapshot_dir_name(&self) -> String {
+        format!("{}-{}", self.name, self.digest)
+    }
+}
+
+/// The bundles this build would materialize. Garbage collection compares
+/// on-disk snapshots against this list to decide which belong to other builds.
+pub(crate) fn embedded_bundles() -> Vec<EmbeddedBundle> {
+    vec![EmbeddedBundle {
+        name: COMPUTER_USE,
+        digest: digest(COMPUTER_USE_FILES),
+    }]
+}
+
+/// `<home>/builtin-plugins/snapshots`, the only place snapshots are published.
+pub(crate) fn snapshots_dir(home: &Path) -> PathBuf {
+    home.join(BUILTIN_DIR_NAME).join(SNAPSHOTS_DIR_NAME)
+}
+
+/// Split `<bundle>-<64 hex>` into the embedded bundle name and its digest.
+/// Anything else in the snapshots root is not ours to classify.
+pub(crate) fn parse_snapshot_dir_name(
+    dir_name: &str,
+    bundles: &[EmbeddedBundle],
+) -> Option<(&'static str, String)> {
+    bundles.iter().find_map(|bundle| {
+        let digest = dir_name.strip_prefix(bundle.name)?.strip_prefix('-')?;
+        (digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| (bundle.name, digest.to_string()))
+    })
+}
+
+/// Record that this build started with `snapshot`, so garbage collection can
+/// tell a snapshot a recent binary still uses from one nobody has opened in
+/// weeks. Best effort and mtime only: the stamp's bytes are never touched.
+fn mark_snapshot_used(snapshot: &Path) {
+    if let Ok(Some(stamp)) =
+        super::registry::open_existing_regular_file(&snapshot.join(STAMP_NAME), true)
+    {
+        let _ = stamp.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Discovery roots holding the built-in bundles, writing them out if what is
@@ -227,7 +282,11 @@ fn materialize_at_home(home: &Path) -> io::Result<Option<PathBuf>> {
 /// never replaces an existing entry, including an empty or damaged directory.
 /// Concurrent publishers of identical bytes converge after verifying the winner;
 /// different builds retain different source paths and therefore trust identities.
-fn write_bundle(root: &Path, name: &str, files: &[(&str, &[u8])]) -> io::Result<PathBuf> {
+pub(crate) fn write_bundle(
+    root: &Path,
+    name: &str,
+    files: &[(&str, &[u8])],
+) -> io::Result<PathBuf> {
     reject_symlink(root)?;
     if !super::agent_plugin::is_standard_plugin_name(name) || files.is_empty() {
         return Err(invalid_bundle(
@@ -252,6 +311,7 @@ fn write_bundle(root: &Path, name: &str, files: &[(&str, &[u8])]) -> io::Result<
     }
     if snapshot_exists(&destination)? {
         verify_snapshot(&destination, &expected)?;
+        mark_snapshot_used(&destination);
         return Ok(destination);
     }
 

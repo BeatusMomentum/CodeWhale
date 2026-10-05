@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `/plugin doctor` reports stale built-in records and snapshots, and
+  `/plugin doctor --fix` retires them. A user plugin, a snapshot a running
+  process names, and a snapshot inside the grace window are kept. The
+  previous `state.json` is kept as `state.json.pre-gc`.
+
 ## [0.10.1] - 2026-10-01
 
 Codewhale v0.10.1 focuses on reliability and first-run behavior. Turns that
