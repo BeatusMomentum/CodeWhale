@@ -100,7 +100,7 @@ const SUBAGENT_COMPLETION_CHANNEL_CAPACITY: usize = 256;
 /// slot instead of being dropped.
 const MCP_BOOT_CHANNEL_CAPACITY: usize = 64;
 const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
-const PLAN_SHELL_NETWORK_DENIED_HINT: &str = "Shell command blocked: Plan mode runs shell commands in a read-only sandbox — no writes, no network. Use Act mode (`/mode act`) for any command that creates or modifies files, or that needs network access.";
+const PLAN_SHELL_NETWORK_DENIED_HINT: &str = "Shell command blocked: in Plan mode shell commands run in a read-only sandbox with no writes and no network access. The user can change modes with /mode.";
 
 fn context_pressure_message(usage_percent: f64) -> Option<&'static str> {
     if usage_percent >= crate::tui::context_inspector::CONTEXT_CRITICAL_THRESHOLD_PERCENT {
@@ -6405,6 +6405,8 @@ impl Engine {
             });
         }
 
+        self.record_mode_notice(mode);
+
         // The Operate contract (docs/MODES.md) precedes the first Operate
         // prompt. KV-cache effect: append-only history, one user-role runtime
         // message; it is derived from the session log rather than a flag so a
@@ -8246,6 +8248,36 @@ impl Engine {
         }
         let message = crate::runtime_handoff::workspace_trust_runtime_message(warning.as_deref());
         if previous != Some(&message) {
+            self.session.add_message(message);
+        }
+    }
+
+    /// Record the current mode and its purpose as a runtime notice (KV-cache
+    /// effect: append-only user history; the system prompt is byte-identical
+    /// across modes).
+    ///
+    /// Derived from the session log, like the workspace-trust note: a session
+    /// with no notice gets one only in Plan, and once a notice exists a new
+    /// one is appended whenever the mode differs from the latest, so leaving
+    /// Plan is announced too and history never ends on a stale mode. A
+    /// compaction that dropped the notice re-records it on the next Plan turn.
+    /// Child and RLM hosts get none: their mode is fixed by their parent.
+    fn record_mode_notice(&mut self, mode: AppMode) {
+        if self.child_host.is_some() || self.rlm_host.is_some() {
+            return;
+        }
+        let previous = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| crate::runtime_handoff::mode_notice_display(message).is_some());
+        let message = crate::runtime_handoff::mode_runtime_message(mode);
+        let record = match previous {
+            None => mode == AppMode::Plan,
+            Some(previous) => previous != &message,
+        };
+        if record {
             self.session.add_message(message);
         }
     }

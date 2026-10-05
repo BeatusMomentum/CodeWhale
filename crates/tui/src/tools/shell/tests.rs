@@ -574,8 +574,12 @@ async fn lowercase_bash_readonly_refusal_names_work_mode() {
         "{error}"
     );
     let message = error.to_string();
-    assert!(message.contains("Work mode (`/mode work`)"), "{message}");
+    assert!(
+        message.contains("The user can change modes with /mode."),
+        "{message}"
+    );
     assert!(!message.contains("Act mode"));
+    assert!(!message.contains("switch to"), "{message}");
     assert!(!workspace.path().join("blocked-by-plan").exists());
 }
 
@@ -1590,7 +1594,7 @@ async fn read_only_refusal_names_child_alternatives_instead_of_mode_switch() {
         message.contains("return your findings and the blocked probe to the parent"),
         "{message}"
     );
-    for absent in ["/mode work", "Git", "Run tests", "merge_tree"] {
+    for absent in ["/mode", "Git", "Run tests", "merge_tree"] {
         assert!(!message.contains(absent), "{absent} in {message}");
     }
     assert!(!tmp.path().join("evil.txt").exists());
@@ -1602,7 +1606,10 @@ async fn read_only_refusal_names_child_alternatives_instead_of_mode_switch() {
         .await
         .expect_err("refused")
         .to_string();
-    assert!(message.contains("/mode work"), "{message}");
+    assert!(
+        message.contains("The user can change modes with /mode."),
+        "{message}"
+    );
 }
 
 #[test]

@@ -71,7 +71,7 @@ impl ToolSpec for WebTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web, fetch a known URL, or wait for a local dev server. Prefer fetch for a canonical URL and search when the source is unknown. Web actions are read-only and network-policy aware."
+        "Search the web, fetch a known URL, or wait for a local dev server. fetch retrieves a canonical URL directly; search finds sources when the URL is unknown. Web actions are read-only and network-policy aware."
     }
 
     fn input_schema(&self) -> Value {

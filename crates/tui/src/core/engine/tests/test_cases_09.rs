@@ -1456,12 +1456,12 @@ fn tool_error_messages_include_actionable_hints() {
     // "Adjust approval mode" suffix, but the denial lead stays so a receipt
     // can tell the call never ran.
     let plan_denied = ToolError::permission_denied(
-        "'bash' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code.",
+        "'bash' is not available in Plan mode: Plan has no shell or code-execution tools. The user can change modes with /mode.",
     );
     let formatted = format_tool_error(&plan_denied, "bash");
     assert_eq!(
         formatted,
-        "Tool 'bash' was denied: 'bash' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
+        "Tool 'bash' was denied: 'bash' is not available in Plan mode: Plan has no shell or code-execution tools. The user can change modes with /mode."
     );
 
     // The same for an `allow_shell` denial, which names its own fix.

@@ -1804,7 +1804,7 @@ impl Engine {
 
             if mode_blocks_command_execution(mode, &tool_name) {
                 blocked_error = Some(ToolError::permission_denied(format!(
-                    "'{tool_name}' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
+                    "'{tool_name}' is not available in Plan mode: Plan has no shell or code-execution tools. The user can change modes with /mode."
                 )));
             }
 
@@ -2087,7 +2087,7 @@ impl Engine {
                 && mode_blocks_write_capable_tool(mode, &tool_name, &tool_input, read_only)
             {
                 blocked_error = Some(ToolError::permission_denied(format!(
-                    "'{tool_name}' is not available in Plan mode - switch to Work mode (`/mode work`) to modify files or run write-capable tools."
+                    "'{tool_name}' is not available in Plan mode: Plan has no file-writing or write-capable tools. The user can change modes with /mode."
                 )));
             }
 

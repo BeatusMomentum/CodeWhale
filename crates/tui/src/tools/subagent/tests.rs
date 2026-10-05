@@ -21991,9 +21991,11 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // lists (D04-11, 46835a2fc; `apply_patch`'s `oneOf` had degraded to three
 // unsatisfiable `{}` branches), and +56B for the finance timeout description
 // now saying the budget is shared with the chart fallback (D03-m3,
-// 7c36620d4). Linux measured 13B above macOS last time, so the ceiling is
-// 88,837B until a hosted Linux run re-measures it.
-const PARENT_SURFACE_BYTE_CEILING: usize = 89_602;
+// 7c36620d4). Re-measured 2026-10-05 at 89,602B on macOS (9dbc2efe1).
+// Re-measured 2026-10-05 at 90,121B on macOS, +519B: the model-facing tool
+// description rewrites (goal, file read/write/edit, web search/fetch,
+// workflow, request_user_input). The static prompt bytes are unchanged.
+const PARENT_SURFACE_BYTE_CEILING: usize = 90_121;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {

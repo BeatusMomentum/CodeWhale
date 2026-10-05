@@ -1661,3 +1661,39 @@ fn stream_retry_scenario() {
         );
     }
 }
+
+#[test]
+fn mode_notice_is_recorded_on_entering_plan_and_on_leaving_it() {
+    let _lock = lock_test_env();
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    let notices = |engine: &Engine| {
+        engine
+            .session
+            .messages
+            .iter()
+            .filter_map(crate::runtime_handoff::mode_notice_display)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // A Work session that never entered Plan carries no notice.
+    engine.record_mode_notice(AppMode::Agent);
+    assert!(notices(&engine).is_empty());
+
+    engine.record_mode_notice(AppMode::Plan);
+    engine.record_mode_notice(AppMode::Plan);
+    let recorded = notices(&engine);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(recorded[0].starts_with("Mode: Plan."), "{recorded:?}");
+
+    // Leaving Plan is announced so history never ends on a stale mode.
+    engine.record_mode_notice(AppMode::Agent);
+    let recorded = notices(&engine);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(recorded[1].starts_with("Mode: Work."), "{recorded:?}");
+}

@@ -464,7 +464,7 @@ impl ToolSpec for FileTool {
         let action = self.required_action(&input)?;
         if matches!(action.as_str(), "write" | "edit") && !self.allow_writes {
             return Err(ToolError::not_available(format!(
-                "File action=\"{action}\" is unavailable in the current mode; nothing was written. Available actions here: {}. Switch to Work mode (`/mode work`) for write-capable file work.",
+                "File action=\"{action}\" is unavailable in the current mode; nothing was written. Available actions here: {}. The user can change modes with /mode.",
                 self.available_actions().join(", ")
             )));
         }

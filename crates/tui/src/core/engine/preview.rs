@@ -687,8 +687,7 @@ impl Engine {
         model: &str,
     ) -> PromptProvenance {
         let base = crate::prompts::effective_base_prompt_text();
-        let configured =
-            crate::prompts::compose_default_static_layers(crate::prompts::Personality::Calm, model);
+        let configured = crate::prompts::compose_default_static_layers(model);
 
         let assembly = if effective.trim().is_empty() {
             SystemPromptAssembly::None

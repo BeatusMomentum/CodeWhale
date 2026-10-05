@@ -5791,14 +5791,15 @@ impl ToolSpec for BashTool {
                     // A typed denial, so a Fleet worker's no-progress guard
                     // counts it. #6298: an agent has no mode to switch to,
                     // so it gets the same next steps as the other read-only
-                    // gates; only a parent session is pointed at Work mode.
+                    // gates; only a parent session is told the user can
+                    // change modes.
                     let message = if context.owner_agent_id.is_some()
                         || context.tool_authority.is_some()
                     {
                         readonly_refusal(&rejection, readonly_enforced_lane_available(context))
                     } else {
                         format!(
-                            "{rejection}. Use a read-only inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
+                            "{rejection}. This shell admits read-only inspection commands only. The user can change modes with /mode."
                         )
                     };
                     return Err(ToolError::permission_denied(message));
