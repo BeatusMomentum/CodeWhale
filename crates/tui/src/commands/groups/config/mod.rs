@@ -67,7 +67,7 @@ static LOGIN_INFO: CommandInfo = CommandInfo {
 static AUTH_INFO: CommandInfo = CommandInfo {
     name: "auth",
     aliases: &[],
-    usage: "/auth xai-device|chatgpt|chatgpt-revoke",
+    usage: "/auth xai-device|chatgpt|chatgpt-revoke|orcarouter|orcarouter-revoke",
     description_id: MessageId::CmdAuthDescription,
 };
 static RAIL_INFO: CommandInfo = CommandInfo {
@@ -220,7 +220,15 @@ pub(in crate::commands) fn dispatch(
             Some("chatgpt-revoke") | Some("chatgpt_revoke") => {
                 CommandResult::action(crate::tui::app::AppAction::StartChatgptRevoke)
             }
-            _ => CommandResult::error("Usage: /auth xai-device|chatgpt|chatgpt-revoke"),
+            Some("orcarouter") | Some("orca") => {
+                CommandResult::action(crate::tui::app::AppAction::StartOrcarouterPkceLogin)
+            }
+            Some("orcarouter-revoke") | Some("orcarouter_revoke") | Some("orca-revoke") => {
+                CommandResult::action(crate::tui::app::AppAction::StartOrcarouterRevoke)
+            }
+            _ => CommandResult::error(
+                "Usage: /auth xai-device|chatgpt|chatgpt-revoke|orcarouter|orcarouter-revoke",
+            ),
         },
         "workbar" | "rail" | "sidebar" => config::sidebar(app, arg),
         "pet" => config::pet(app, arg),

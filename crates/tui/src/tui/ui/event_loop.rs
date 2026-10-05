@@ -7413,6 +7413,110 @@ pub(crate) async fn run_chatgpt_pkce_login_from_tui(
     Ok(switched)
 }
 
+/// OrcaRouter PKCE sign-in from the `/auth orcarouter` command and the provider
+/// picker's "Connect with OrcaRouter" option.
+///
+/// The TUI is suspended for the same reason as ChatGPT/Xai sign-in: the flow
+/// prints the consent URL and blocks on a loopback callback, so it must own the
+/// terminal. Unlike those flows it returns an [`crate::oauth::OrcaCredential`] —
+/// a durable API key — which is stored through the ordinary provider credential
+/// path, so the live route ends up identical to the API-key adapter's.
+pub(crate) async fn run_orcarouter_pkce_login_from_tui(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+) -> Result<bool> {
+    pause_terminal(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+    )?;
+    let login_result = tokio::task::spawn_blocking(|| {
+        let inputs = crate::oauth::OrcaLoginInputs::from_env();
+        let mut challenge = crate::oauth::cli_challenge_writer()?;
+        crate::oauth::orcarouter_pkce_login(&inputs, challenge.as_mut())
+    })
+    .await
+    .context("OrcaRouter PKCE login worker failed")
+    .and_then(|result| result);
+    resume_terminal(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+        app.synchronized_output_enabled,
+    )?;
+
+    let mut login_message = "OrcaRouter sign-in complete".to_string();
+    let switched = match login_result {
+        Ok(credential) => {
+            let scope_note = (!credential.scope_satisfies_purpose()).then(|| {
+                format!(
+                    "OrcaRouter granted scope \"{}\" while this client asked for \"{}\"; the narrower grant is reused as-is.",
+                    credential.granted_scope(),
+                    crate::oauth::ORCAROUTER_SCOPE
+                )
+            });
+            match crate::oauth::activate_orcarouter_credential(
+                &credential,
+                app.config_path.as_deref(),
+            ) {
+                Ok(saved) => {
+                    login_message = format!("OrcaRouter is ready; stored the key in {}", saved.describe());
+                    if let Some(note) = scope_note {
+                        login_message.push('\n');
+                        login_message.push_str(&note);
+                    }
+                    apply_orcarouter_credential_login(app, engine_handle, config).await
+                }
+                Err(err) => {
+                    let message = format!("OrcaRouter sign-in failed: {err:#}");
+                    app.add_message(HistoryCell::System {
+                        content: message.clone(),
+                    });
+                    app.status_message = Some(message);
+                    false
+                }
+            }
+        }
+        Err(err) => {
+            let message = format!("OrcaRouter sign-in failed: {err:#}");
+            app.add_message(HistoryCell::System {
+                content: message.clone(),
+            });
+            app.status_message = Some(message);
+            false
+        }
+    };
+    app.needs_redraw = true;
+    if switched {
+        app.add_message(HistoryCell::System {
+            content: login_message,
+        });
+    }
+    Ok(switched)
+}
+
+/// Switch the live route onto OrcaRouter after its credential landed, using the
+/// same store the API-key adapter wrote to. The key itself never passes through
+/// here — only the identity.
+async fn apply_orcarouter_credential_login(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+) -> bool {
+    let identity = match config.builtin_provider_identity(ProviderKind::Orcarouter) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            return false;
+        }
+    };
+    switch_provider(app, engine_handle, config, identity, None).await
+}
+
 /// Move held permission receipts into the transcript: those for `tool_id`
 /// when given, otherwise every remaining one. Returns whether anything moved.
 pub(super) fn flush_gate_receipts_for(app: &mut App, tool_id: Option<&str>) -> bool {

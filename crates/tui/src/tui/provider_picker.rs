@@ -88,6 +88,10 @@ enum Stage {
     /// Official ChatGPT plan sign-in; imported CLI credentials cannot grant
     /// plan permission to this route.
     ChatgptAuthChoice,
+    /// Explicit OrcaRouter acquisition choice. Both entries produce the same
+    /// durable `sk-orca-...` key and are independently usable: a pasted key,
+    /// or OAuth 2.0 + PKCE against the user's OrcaRouter account.
+    OrcarouterAuthChoice,
     KeyEntry,
     /// Explicit disabled/read-only/managed external-credential policy choice.
     ExternalConsentChoice,
@@ -119,6 +123,12 @@ enum ExternalConsentChoice {
 enum XaiAuthChoice {
     ApiKey,
     DeviceOAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrcarouterAuthChoice {
+    ApiKey,
+    Pkce,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +207,7 @@ pub struct ProviderPickerView {
     key_entry_error: Option<String>,
     locale: Locale,
     xai_auth_choice: XaiAuthChoice,
+    orcarouter_auth_choice: OrcarouterAuthChoice,
     external_consent_choice: ExternalConsentChoice,
     /// Where Esc returns from the revoke confirmation. Revocation is reachable
     /// both from the list (`x`) and from the policy choice, and "back" has to
@@ -1909,6 +1920,7 @@ impl ProviderPickerView {
             key_entry_error: None,
             locale: Locale::En,
             xai_auth_choice: XaiAuthChoice::ApiKey,
+            orcarouter_auth_choice: OrcarouterAuthChoice::ApiKey,
             external_consent_choice: ExternalConsentChoice::Disabled,
             external_revoke_return: Stage::List,
             interacted: false,
@@ -2336,6 +2348,8 @@ impl ProviderPickerView {
             self.enter_xai_auth_choice();
         } else if self.selected_provider() == ProviderKind::OpenaiCodex {
             self.enter_chatgpt_auth_choice();
+        } else if self.selected_provider() == ProviderKind::Orcarouter {
+            self.enter_orcarouter_auth_choice();
         } else if self.stepfun_billing_route_applies() {
             self.enter_stepfun_billing_route();
         } else {
@@ -2356,6 +2370,21 @@ impl ProviderPickerView {
         self.api_key_input.clear();
         self.key_entry_error = None;
         self.pending_api_key = None;
+    }
+
+    fn enter_orcarouter_auth_choice(&mut self) {
+        self.orcarouter_auth_choice = OrcarouterAuthChoice::ApiKey;
+        self.stage = Stage::OrcarouterAuthChoice;
+        self.api_key_input.clear();
+        self.key_entry_error = None;
+        self.pending_api_key = None;
+    }
+
+    fn move_orcarouter_auth_choice(&mut self) {
+        self.orcarouter_auth_choice = match self.orcarouter_auth_choice {
+            OrcarouterAuthChoice::ApiKey => OrcarouterAuthChoice::Pkce,
+            OrcarouterAuthChoice::Pkce => OrcarouterAuthChoice::ApiKey,
+        };
     }
 
     fn move_xai_auth_choice(&mut self) {
@@ -3456,6 +3485,42 @@ impl ProviderPickerView {
         );
     }
 
+    fn render_orcarouter_auth_choice(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                self.tr(MessageId::OrcarouterAuthChoiceTitle),
+                Style::default()
+                    .fg(palette::WHALE_ACTION)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓/1-2", self.tr(MessageId::ProviderExternalActionChoose)),
+                ActionHint::new("Enter", self.tr(MessageId::SetupActionContinue)),
+                ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
+            ],
+        );
+        self.render_setup_choices(
+            content,
+            buf,
+            vec![Line::from(self.tr(MessageId::OrcarouterAuthChoiceIntro))],
+            [
+                self.tr(MessageId::OrcarouterAuthChoiceApiKeyOption)
+                    .into_owned(),
+                self.tr(MessageId::OrcarouterAuthChoicePkceOption)
+                    .into_owned(),
+            ],
+            usize::from(self.orcarouter_auth_choice == OrcarouterAuthChoice::Pkce),
+        );
+    }
+
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
         let row = &self.rows[self.selected_idx];
         let codex_oauth = row.provider == ProviderKind::OpenaiCodex;
@@ -4481,6 +4546,7 @@ impl ModalView for ProviderPickerView {
             Stage::List
             | Stage::XaiAuthChoice
             | Stage::ChatgptAuthChoice
+            | Stage::OrcarouterAuthChoice
             | Stage::ExternalConsentChoice
             | Stage::ExternalConsentConfirm
             | Stage::ExternalConsentRevokeConfirm
@@ -4726,6 +4792,34 @@ impl ModalView for ProviderPickerView {
                 }
                 _ => ViewAction::None,
             },
+            Stage::OrcarouterAuthChoice => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::List;
+                    ViewAction::None
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.move_orcarouter_auth_choice();
+                    ViewAction::None
+                }
+                KeyCode::Char('1') => {
+                    self.orcarouter_auth_choice = OrcarouterAuthChoice::ApiKey;
+                    ViewAction::None
+                }
+                KeyCode::Char('2') => {
+                    self.orcarouter_auth_choice = OrcarouterAuthChoice::Pkce;
+                    ViewAction::None
+                }
+                KeyCode::Enter => match self.orcarouter_auth_choice {
+                    OrcarouterAuthChoice::ApiKey => {
+                        self.enter_key_entry();
+                        ViewAction::None
+                    }
+                    OrcarouterAuthChoice::Pkce => {
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerOrcarouterOAuthRequested)
+                    }
+                },
+                _ => ViewAction::None,
+            },
             Stage::KeyEntry => match key.code {
                 KeyCode::Esc => {
                     // Back to the route choice when one was made, so Esc undoes
@@ -4734,6 +4828,8 @@ impl ModalView for ProviderPickerView {
                         Stage::XaiAuthChoice
                     } else if self.selected_provider() == ProviderKind::OpenaiCodex {
                         Stage::ChatgptAuthChoice
+                    } else if self.selected_provider() == ProviderKind::Orcarouter {
+                        Stage::OrcarouterAuthChoice
                     } else if self.pending_base_url.is_some() {
                         Stage::StepfunBillingRoute
                     } else {
@@ -4770,17 +4866,26 @@ impl ModalView for ProviderPickerView {
                     let key = self.api_key_input.trim().to_string();
                     if key.is_empty() {
                         // Stay in key-entry; the user can press Esc to abort.
-                        ViewAction::None
-                    } else {
-                        let Some(identity) = self.selected_identity() else {
-                            return ViewAction::None;
-                        };
-                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
-                            identity,
-                            api_key: key,
-                            base_url: self.pending_base_url.clone(),
-                        })
+                        return ViewAction::None;
                     }
+                    if self.selected_provider() == ProviderKind::Orcarouter {
+                        // Shape-check through the OrcaRouter credential seam, so
+                        // a mistyped or non-OrcaRouter key fails in the form
+                        // instead of after a save. The PKCE adapter feeds this
+                        // same `OrcaCredential` type from the browser flow.
+                        if let Err(error) = crate::oauth::OrcaCredential::from_api_key(&key) {
+                            self.key_entry_error = Some(error.to_string());
+                            return ViewAction::None;
+                        }
+                    }
+                    let Some(identity) = self.selected_identity() else {
+                        return ViewAction::None;
+                    };
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
+                        identity,
+                        api_key: key,
+                        base_url: self.pending_base_url.clone(),
+                    })
                 }
                 KeyCode::Char(c)
                     if !key.modifiers.intersects(
@@ -4807,6 +4912,8 @@ impl ModalView for ProviderPickerView {
                         Stage::XaiAuthChoice
                     } else if self.selected_provider() == ProviderKind::OpenaiCodex {
                         Stage::ChatgptAuthChoice
+                    } else if self.selected_provider() == ProviderKind::Orcarouter {
+                        Stage::OrcarouterAuthChoice
                     } else {
                         Stage::KeyEntry
                     };
@@ -5090,6 +5197,7 @@ impl ModalView for ProviderPickerView {
             Stage::PlanTier
             | Stage::StepfunBillingRoute
             | Stage::XaiAuthChoice
+            | Stage::OrcarouterAuthChoice
             | Stage::ChatgptAuthChoice => {
                 let hit = self
                     .choice_row_hitboxes
@@ -5144,6 +5252,7 @@ impl ModalView for ProviderPickerView {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
             Stage::XaiAuthChoice => 12,
             Stage::ChatgptAuthChoice => 13,
+            Stage::OrcarouterAuthChoice => 13,
             // Key/OAuth help is intentionally multi-line and wraps at narrow
             // widths. One shared height keeps every provider's final guidance
             // visible instead of special-casing whichever route clipped last.
@@ -5171,6 +5280,9 @@ impl ModalView for ProviderPickerView {
             Stage::List => self.render_list(popup_area, buf),
             Stage::XaiAuthChoice => self.render_xai_auth_choice(popup_area, buf),
             Stage::ChatgptAuthChoice => self.render_chatgpt_auth_choice(popup_area, buf),
+            Stage::OrcarouterAuthChoice => {
+                self.render_orcarouter_auth_choice(popup_area, buf)
+            }
             Stage::KeyEntry => self.render_key_entry(popup_area, buf),
             Stage::ExternalConsentChoice => self.render_external_consent_choice(popup_area, buf),
             Stage::ExternalConsentConfirm => self.render_external_consent_confirm(popup_area, buf),

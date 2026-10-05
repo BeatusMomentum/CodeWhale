@@ -540,6 +540,13 @@ enum TuiAuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE; run again to switch accounts.
+    #[command(name = "orcarouter")]
+    Orcarouter,
+    /// Revoke the saved OrcaRouter credential. The OrcaRouter console also
+    /// revokes every key it issued to this app in one click.
+    #[command(name = "orcarouter-revoke")]
+    OrcarouterRevoke,
 }
 
 const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
@@ -2479,6 +2486,10 @@ async fn run_async_main_dispatch(
                 TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::Chatgpt => run_chatgpt_pkce_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::ChatgptRevoke => run_chatgpt_pkce_revoke(cli.config.as_deref()),
+                TuiAuthCommand::Orcarouter => run_orcarouter_pkce_auth(cli.config.as_deref()).await,
+                TuiAuthCommand::OrcarouterRevoke => {
+                    run_orcarouter_revoke(cli.config.as_deref())
+                }
             },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -9277,6 +9288,62 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
 fn run_chatgpt_pkce_revoke(config_path: Option<&Path>) -> Result<()> {
     crate::oauth::revoke_owned_login(crate::oauth::OAuthProvider::Chatgpt, config_path, None)?;
     println!("Removed Codewhale's saved ChatGPT sign-in.");
+    Ok(())
+}
+
+/// OrcaRouter account sign-in: OAuth 2.0 + PKCE on a loopback redirect,
+/// exchanged for a durable `sk-orca-...` key.
+///
+/// This is the "OrcaRouter - Auth" entry point. It never replaces the
+/// API-key path (`codewhale auth set --provider orcarouter`); both land in the
+/// same credential slot and are independently usable.
+async fn run_orcarouter_pkce_auth(config_path: Option<&Path>) -> Result<()> {
+    let inputs = crate::oauth::OrcaLoginInputs::from_env();
+    if inputs.auth_base == crate::oauth::ORCAROUTER_AUTH_BASE
+        && std::env::var_os("ORCA_AUTH_BASE_URL").is_none()
+    {
+        println!(
+            "Signing in to OrcaRouter at {} (consent is granted on the OrcaRouter site).",
+            crate::oauth::ORCAROUTER_AUTH_BASE
+        );
+    }
+    let api_base = inputs.api_base.clone();
+    if api_base != crate::oauth::ORCAROUTER_API_BASE {
+        println!("OrcaRouter inference and model discovery will use {api_base}.");
+    }
+    let mut challenge = crate::oauth::cli_challenge_writer()?;
+    let credential = tokio::task::spawn_blocking(move || {
+        crate::oauth::orcarouter_pkce_login(&inputs, challenge.as_mut())
+    })
+    .await
+    .context("OrcaRouter PKCE login worker failed")??;
+    let saved = crate::oauth::activate_orcarouter_credential(&credential, config_path)?;
+    println!(
+        "OrcaRouter is ready; stored the key in {}",
+        saved.describe()
+    );
+    if !credential.scope_satisfies_purpose() {
+        println!(
+            "Note: OrcaRouter granted scope \"{}\"; this client asked for \"{}\". The narrower grant is reused as-is.",
+            credential.granted_scope(),
+            crate::oauth::ORCAROUTER_SCOPE
+        );
+    }
+    println!(
+        "Revoke access any time at https://www.orcarouter.ai/console/authorized-apps. To switch accounts, run `codewhale auth orcarouter` again."
+    );
+    Ok(())
+}
+
+/// Clear the saved OrcaRouter credential from the secret store and config.
+fn run_orcarouter_revoke(config_path: Option<&Path>) -> Result<()> {
+    let mut store = codewhale_config::ConfigStore::load(config_path.map(Path::to_path_buf))?;
+    let Some(secrets) = crate::config::credential_secret_store() else {
+        anyhow::bail!("no credential store is available in this environment");
+    };
+    let provider = codewhale_config::ProviderKind::Orcarouter;
+    codewhale_config::credentials::clear_provider_api_key(&mut store, &secrets, provider)?;
+    println!("Removed Codewhale's saved OrcaRouter credential.");
     Ok(())
 }
 

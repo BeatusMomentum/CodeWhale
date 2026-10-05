@@ -1652,6 +1652,15 @@ enum AuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE and store the issued key.
+    ///
+    /// Opens the OrcaRouter consent screen on a loopback callback and
+    /// exchanges the authorization code for a durable `sk-orca-...` API key.
+    /// The key is billed to your OrcaRouter account and revocable there.
+    /// To paste an existing key instead, use
+    /// `codewhale auth set --provider orcarouter`.
+    #[command(name = "orcarouter")]
+    Orcarouter,
     /// Explicitly allow read-only access to one credential file owned by
     /// another CLI. Managed mutation is currently unsupported and fails closed.
     #[command(name = "external-consent")]
@@ -2450,6 +2459,14 @@ fn run() -> Result<()> {
                     &cli,
                     &resolved_runtime,
                     vec!["auth".to_string(), "chatgpt-revoke".to_string()],
+                )
+            }
+            AuthCommand::Orcarouter => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec!["auth".to_string(), "orcarouter".to_string()],
                 )
             }
             command @ AuthCommand::Status {
@@ -4621,6 +4638,15 @@ fn run_auth_command_with_secrets_and_runtime(
         }
         AuthCommand::ChatgptRevoke => {
             let argv = vec!["auth".to_string(), "chatgpt-revoke".to_string()];
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            })
+        }
+        AuthCommand::Orcarouter => {
+            let argv = vec!["auth".to_string(), "orcarouter".to_string()];
             let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0

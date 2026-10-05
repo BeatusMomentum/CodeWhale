@@ -651,6 +651,16 @@ since = "unreleased"
 docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
 owner = "crates/tui/src/oauth.rs"
 
+[[feature]]
+id = "orcarouter-sign-in"
+name = "Sign in with OrcaRouter"
+summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
+status = "experimental"
+surfaces = { tui = "preview", api = "none", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md"
+owner = "crates/tui/src/oauth.rs"
+
 # Community marketing website, separate from the Runtime's local web client.
 [[feature]]
 id = "merch-interest"

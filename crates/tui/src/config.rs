@@ -8177,7 +8177,11 @@ fn provider_env_base_url_override(provider: ProviderKind) -> Option<String> {
         ProviderKind::Openai => &["OPENAI_BASE_URL"],
         ProviderKind::Atlascloud => &["ATLASCLOUD_BASE_URL"],
         ProviderKind::Openrouter => &["OPENROUTER_BASE_URL"],
-        ProviderKind::Orcarouter => &["ORCAROUTER_BASE_URL"],
+        // The inference/catalog origin. OrcaRouter's **auth** origin is a
+        // different host and is resolved by
+        // `crate::oauth::resolve_orcarouter_auth_base`; the two never derive
+        // from each other.
+        ProviderKind::Orcarouter => &["ORCA_API_BASE_URL", "ORCA_BASE_URL", "ORCAROUTER_BASE_URL"],
         ProviderKind::XiaomiMimo => &["XIAOMI_MIMO_BASE_URL", "MIMO_BASE_URL"],
         ProviderKind::WanjieArk => &[
             "WANJIE_ARK_BASE_URL",

@@ -2805,6 +2805,15 @@ pub(crate) async fn handle_view_events(
                     switched,
                 );
             }
+            ViewEvent::ProviderPickerOrcarouterOAuthRequested => {
+                let switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config).await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Orcarouter,
+                    switched,
+                );
+            }
             ViewEvent::ProviderPickerExternalConsentConfirmed {
                 provider,
                 consent_provider,

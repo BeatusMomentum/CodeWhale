@@ -2466,6 +2466,15 @@ async fn apply_command_result_inner(
             AppAction::StartChatgptRevoke => {
                 run_chatgpt_revoke_from_tui(app, config).await;
             }
+            AppAction::StartOrcarouterPkceLogin => {
+                let _switched = run_orcarouter_pkce_login_from_tui(
+                    terminal, app, engine_handle, config,
+                )
+                .await?;
+            }
+            AppAction::StartOrcarouterRevoke => {
+                run_orcarouter_revoke_from_tui(app, config).await;
+            }
             AppAction::SetScreenMode(mode) => {
                 // The terminal transition is the only fallible part; a failed
                 // probe leaves the previous screen live and says why.
@@ -4092,6 +4101,42 @@ pub(crate) async fn run_chatgpt_revoke_from_tui(app: &mut App, config: &mut Conf
         (Err(err), Ok(())) => format!("ChatGPT revoke failed: {err:#}"),
         (Err(err), Err(live_err)) => format!(
             "ChatGPT revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
+        ),
+    };
+    app.add_message(HistoryCell::System {
+        content: message.clone(),
+    });
+    app.status_message = Some(message);
+    app.needs_redraw = true;
+}
+
+/// `/auth orcarouter-revoke`. OrcaRouter mints a durable API key with no remote
+/// revocation endpoint this client owns, so revoke is local-only: clear the
+/// `orcarouter` secret-store slot, the route's saved key, and the in-memory
+/// override. Re-authenticating is a fresh PKCE sign-in or a freshly pasted key.
+pub(crate) async fn run_orcarouter_revoke_from_tui(app: &mut App, config: &mut Config) {
+    let provider = ProviderKind::Orcarouter;
+    let provider_name = provider.as_str().to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::config::clear_active_provider_api_key(&provider_name)
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("OrcaRouter revoke task was lost: {err}"))
+    .and_then(|result| result);
+    let live_clear = match config.builtin_provider_identity(provider) {
+        Ok(identity) => config
+            .set_provider_api_key_override(&identity, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string())),
+        Err(err) => Err(anyhow::anyhow!(err)),
+    };
+    let message = match (outcome, live_clear) {
+        (Ok(()), Ok(())) => "Removed Codewhale's saved OrcaRouter credential.".to_string(),
+        (Ok(()), Err(err)) => {
+            format!("OrcaRouter credential removed; the live route could not be refreshed: {err:#}")
+        }
+        (Err(err), Ok(())) => format!("OrcaRouter revoke failed: {err:#}"),
+        (Err(err), Err(live_err)) => format!(
+            "OrcaRouter revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
         ),
     };
     app.add_message(HistoryCell::System {
