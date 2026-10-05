@@ -7015,6 +7015,43 @@ fn resolve_project_mcp_cwd(workspace: &Path, cwd: Option<&Path>) -> Result<PathB
     Ok(resolved)
 }
 
+/// Drop the Win32 verbatim prefix before handing a path to an external child
+/// (Node MCP peers, etc.). `Path::canonicalize` returns `\\?\C:\...`; Node's
+/// ESM loader and several Windows tools refuse or mis-handle that spelling for
+/// ordinary paths under MAX_PATH. Containment checks keep the prefixed form;
+/// only argv and current_dir are rewritten. Same rule as runtime_api job cwd
+/// and Git for Windows.
+#[cfg(any(windows, test))]
+fn plain_windows_child_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match path.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && rest.as_bytes().get(1) == Some(&b':') =>
+        {
+            rest.to_string()
+        }
+        _ => path.to_string(),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn strip_windows_verbatim_for_child(
+    path: impl AsRef<std::ffi::OsStr>,
+) -> std::ffi::OsString {
+    let raw = path.as_ref().to_string_lossy();
+    std::ffi::OsString::from(plain_windows_child_path(&raw))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn strip_windows_verbatim_for_child(
+    path: impl AsRef<std::ffi::OsStr>,
+) -> std::ffi::OsString {
+    path.as_ref().to_os_string()
+}
+
 fn normalize_path_components(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -7653,6 +7690,32 @@ fn snapshot_from_config(
         config_exists,
         reload_required,
         servers,
+    }
+}
+
+#[cfg(test)]
+mod windows_child_path_tests {
+    use super::plain_windows_child_path;
+
+    #[test]
+    fn plain_windows_child_path_drops_only_the_verbatim_prefix() {
+        assert_eq!(
+            plain_windows_child_path(r"\\?\C:\ws\peer.mjs"),
+            r"C:\ws\peer.mjs"
+        );
+        assert_eq!(
+            plain_windows_child_path(r"\\?\UNC\host\share\peer.mjs"),
+            r"\\host\share\peer.mjs"
+        );
+        for unchanged in [
+            r"C:\ws\peer.mjs",
+            r"\\host\share",
+            r"\\?\Volume{0}\ws",
+            "/tmp/peer.mjs",
+            "peer.mjs",
+        ] {
+            assert_eq!(plain_windows_child_path(unchanged), unchanged);
+        }
     }
 }
 
