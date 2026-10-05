@@ -371,8 +371,16 @@ fn key_is_sensitive(raw: &str) -> bool {
     let names_an_outcome = key_norm.rsplit('_').next().is_some_and(|last| {
         matches!(
             last,
-            "failed" | "failure" | "error" | "denied" | "rejected" | "refused" | "expired"
-                | "invalid" | "required" | "missing"
+            "failed"
+                | "failure"
+                | "error"
+                | "denied"
+                | "rejected"
+                | "refused"
+                | "expired"
+                | "invalid"
+                | "required"
+                | "missing"
         )
     });
     !key_norm.is_empty()
