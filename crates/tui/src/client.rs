@@ -390,6 +390,37 @@ fn client_user_agent(_api_provider: ProviderKind) -> &'static str {
 /// of committing to the full remaining window up front.
 const RATE_LIMIT_PAUSE_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Total budget for one non-streaming request. Two layers use it: each
+/// attempt carries it as a reqwest per-request total (connect through body
+/// end, so a trickling body cannot extend forever), and the retry loop
+/// through `send_with_retry` is wrapped in one outer envelope of the same
+/// length (all attempts, backoff, and honored Retry-After included). The
+/// shared client intentionally has no client-level total timeout, so without
+/// these nothing bounds a non-streaming completion: a provider that accepts
+/// the connection and then stalls — or a gateway answering 429 +
+/// `Retry-After: 3600` forever — wedged the caller indefinitely.
+///
+/// Streaming paths never carry it: their opens go through
+/// `send_stream_open_with_retry`, which sets no per-request total (a total
+/// would ride on the returned body and hard-cut a live stream), so a stream
+/// stays bounded by its open cap and per-chunk idle checks only.
+pub(super) const NON_STREAMING_REQUEST_ENVELOPE: Duration = Duration::from_secs(1800);
+
+#[cfg(test)]
+static TEST_NON_STREAMING_ENVELOPE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn non_streaming_request_envelope() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_NON_STREAMING_ENVELOPE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    NON_STREAMING_REQUEST_ENVELOPE
+}
+
 pub(super) const SSE_BACKPRESSURE_HIGH_WATERMARK: usize = 1024 * 1024; // 1 MB
 pub(super) const SSE_BACKPRESSURE_SLEEP_MS: u64 = 10;
 pub(super) const SSE_MAX_LINES_PER_CHUNK: usize = 256;
@@ -3267,9 +3298,16 @@ impl CodewhaleClient {
                         let disclosure = ErrorBodyDisclosure::Guarded {
                             request_secrets: request_query_secret_values(&url),
                         };
-                        self.send_with_retry_error_body(build, &disclosure)
-                            .await
-                            .map_err(ModelsFetchError::Interactive)?
+                        // The pinned 30s per-attempt total survives: the retry
+                        // loop's shared envelope is not allowed to overwrite a
+                        // caller's own budget.
+                        self.send_with_retry_total_error_body(
+                            NON_STREAMING_HTTP_TIMEOUT,
+                            build,
+                            &disclosure,
+                        )
+                        .await
+                        .map_err(ModelsFetchError::Interactive)?
                     }
                     ModelsRequestMode::Refresh => build()
                         .send()
@@ -3381,8 +3419,10 @@ impl CodewhaleClient {
     /// Activated for model-list authorities that are not satisfied by the
     /// cross-provider Models.dev snapshot: OpenRouter, named live gateways,
     /// and Baseten's account-scoped endpoint (no static snapshot can serve a
-    /// per-credential roster). Every other custom host is an ordinary
-    /// provider served by Models.dev plus its configured models (#6289).
+    /// per-credential roster). Custom OpenAI-compatible hosts are included
+    /// too: a private relay is not in the Models.dev snapshot, so without a
+    /// probe its `/model` picker stays empty even though the chat route
+    /// already talks to the same endpoint (#6289 widened).
     /// The refresh is non-fatal: on failure, persisted prior rows and static
     /// seeds remain available with a typed failed receipt.
     pub fn spawn_active_provider_catalog_refresh(config: &Config) {
@@ -3395,21 +3435,11 @@ impl CodewhaleClient {
                 return;
             };
             let provider = identity.provider;
-            let is_baseten_endpoint = provider == ProviderKind::Custom
-                && codewhale_config::catalog::endpoint_is_baseten(
-                    &config.base_url_for_route(&identity),
-                );
-            if !matches!(
-                provider,
-                ProviderKind::Openrouter
-                    | ProviderKind::Telecomjs
-                    | ProviderKind::Edenai
-                    | ProviderKind::Zenmux
-                    | ProviderKind::Concentrate
-                    | ProviderKind::Codewhale
-                    | ProviderKind::Ollama
-            ) && !is_baseten_endpoint
-            {
+            // Custom hosts include Baseten (its `/models` dialect is detected
+            // at fetch time) and every other custom host. A private route is
+            // the only place its roster exists, and a failed probe stays
+            // non-fatal.
+            if !crate::provider_catalog_live::provider_owns_live_catalog(provider) {
                 return;
             }
 
@@ -3698,7 +3728,7 @@ impl CodewhaleClient {
     /// much of the body reaches retry logs, state updates and the user.
     async fn send_with_retry_error_body<F>(
         &self,
-        mut build: F,
+        build: F,
         disclosure: &ErrorBodyDisclosure,
     ) -> Result<reqwest::Response>
     where
@@ -3707,13 +3737,79 @@ impl CodewhaleClient {
         if self.isolated_request_state {
             return self.send_with_isolated_retry(build, disclosure).await;
         }
+        self.send_retry_loop(build, Some(non_streaming_request_envelope()), disclosure)
+            .await
+    }
+
+    /// [`Self::send_with_retry_error_body`] with a caller-pinned per-attempt
+    /// total (connect through body end). `list_models` pins its own 30s: the
+    /// plain variant would otherwise stretch that pinned budget out to the
+    /// shared envelope, because `.timeout()` on the builder is a pure
+    /// overwrite.
+    async fn send_with_retry_total_error_body<F>(
+        &self,
+        total: Duration,
+        build: F,
+        disclosure: &ErrorBodyDisclosure,
+    ) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        if self.isolated_request_state {
+            return self.send_with_isolated_retry(build, disclosure).await;
+        }
+        self.send_retry_loop(build, Some(total), disclosure).await
+    }
+
+    /// The streaming-open twin of [`Self::send_with_retry`]: the same retry
+    /// and rate-limit handling with no total deadline anywhere. reqwest's
+    /// per-request timeout wraps the response *body*, so a total set on the
+    /// open would ride along inside the returned body and hard-cut a live
+    /// stream mid-generation. Stream opens stay bounded by the caller's
+    /// `stream_open_timeout` around the open and per-chunk idle checks on
+    /// the returned body instead.
+    pub(super) async fn send_stream_open_with_retry<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        if self.isolated_request_state {
+            return self
+                .send_with_isolated_retry(build, &ErrorBodyDisclosure::Full)
+                .await;
+        }
+        self.send_retry_loop(build, None, &ErrorBodyDisclosure::Full)
+            .await
+    }
+
+    async fn send_retry_loop<F>(
+        &self,
+        mut build: F,
+        attempt_total: Option<Duration>,
+        disclosure: &ErrorBodyDisclosure,
+    ) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
         let pause_scope = self.rate_limit_scope();
         let callback_scope = pause_scope.clone();
-        let request_result = with_retry(
+        // Two bounded layers around a non-streaming completion
+        // (`attempt_total` = `Some`): the per-attempt request total (connect
+        // through body end) and an envelope around the whole retry loop (all
+        // attempts + backoff + honored Retry-After). Streaming opens
+        // (`None`) set no deadline at all: any total here would be
+        // inherited by the returned body and truncate the stream, so those
+        // calls keep only the caller's own open budget.
+        let retry_future = with_retry(
             &retry_cfg,
             || {
-                let request = build();
+                // Per-attempt total: unlike the loop envelope below,
+                // reqwest's per-request timeout also covers the response
+                // body, so a slow-drip body cannot outlive the budget.
+                let request = match attempt_total {
+                    Some(total) => build().timeout(total),
+                    None => build(),
+                };
                 let pause_scope = pause_scope.as_str();
                 async move {
                     // Sleep in bounded slices rather than the full remaining
@@ -3753,8 +3849,30 @@ impl CodewhaleClient {
                 }
                 crate::retry_status::start(attempt + 1, delay, human_reason);
             })),
-        )
-        .await;
+        );
+        let request_result = if let Some(total) = attempt_total {
+            // The loop envelope must dominate the per-attempt total it
+            // wraps: a caller-pinned budget (list_models' 30s) may exceed
+            // the shared envelope, and the envelope must never strangle
+            // its own attempts.
+            let loop_envelope = total.max(non_streaming_request_envelope());
+            match tokio::time::timeout(loop_envelope, retry_future).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    let last = LlmError::Timeout(loop_envelope);
+                    logging::warn(format!(
+                        "non-streaming request envelope exceeded ({loop_envelope:?}); retry loop aborted"
+                    ));
+                    crate::retry_status::failed(last.to_string());
+                    self.mark_request_failure("non-streaming request envelope exceeded")
+                        .await;
+                    self.maybe_probe_recovery().await;
+                    return Err(anyhow::Error::new(last));
+                }
+            }
+        } else {
+            retry_future.await
+        };
 
         match request_result {
             Ok(response) => {
@@ -3856,6 +3974,25 @@ impl CodewhaleClient {
         let request_body =
             serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
         self.send_with_retry(|| {
+            self.http_client
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(request_body.clone())
+        })
+        .await
+    }
+
+    /// JSON POST through the streaming-open retry path: no total deadline,
+    /// because the response body outlives the open (see
+    /// [`Self::send_stream_open_with_retry`]).
+    pub(super) async fn open_stream_json_with_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
+        self.send_stream_open_with_retry(|| {
             self.http_client
                 .post(url)
                 .header(CONTENT_TYPE, "application/json")
