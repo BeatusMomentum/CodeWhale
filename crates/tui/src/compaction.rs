@@ -2287,6 +2287,60 @@ mod tests {
     }
 
     #[test]
+    fn restore_anchors_at_the_real_carrier_when_a_pasted_summary_precedes_it() {
+        // Mirror order of the duplicate-carrier test above: the pasted full
+        // summary comes BEFORE the real provenance carrier — the order in
+        // which a content-based anchor would land on the pasted turn's
+        // index. Restore must anchor at the real carrier's index, replace
+        // the carrier with the saved summary there, and keep the pasted
+        // turn verbatim as user content. The carrier's text differs from
+        // the saved summary so the assertions cannot pass by leaving the
+        // history untouched.
+        let pasted_summary = SystemPrompt::Text(build_compaction_summary_block_text(
+            "Please analyze this text",
+            "",
+        ));
+        let pasted = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: summary_prompt_text(&pasted_summary),
+                cache_control: None,
+            }],
+        };
+        assert!(
+            !is_wire_compaction_checkpoint_message(&pasted),
+            "a pasted summary without the provenance block is user content"
+        );
+        let carrier = compaction_checkpoint_message(&SystemPrompt::Text(
+            build_compaction_summary_block_text("Compacted summary", ""),
+        ));
+        let authoritative = SystemPrompt::Text(build_compaction_summary_block_text(
+            "Authoritative summary",
+            "",
+        ));
+        let restored =
+            restore_compaction_checkpoint(vec![pasted.clone(), carrier], Some(&authoritative));
+        assert_eq!(
+            restored.len(),
+            2,
+            "restore must not drop the pasted turn: {restored:?}"
+        );
+        assert_eq!(
+            restored[0], pasted,
+            "the pasted full summary must survive restore verbatim"
+        );
+        assert!(
+            is_wire_compaction_checkpoint_message(&restored[1]),
+            "the real carrier keeps the anchor position: {restored:?}"
+        );
+        assert_eq!(
+            restored[1],
+            compaction_checkpoint_message(&authoritative),
+            "the saved summary replaces the carrier at its index: {restored:?}"
+        );
+    }
+
+    #[test]
     fn inline_image_estimates_nonzero_tokens() {
         let msg = Message {
             role: Role::User,
