@@ -619,7 +619,14 @@ where
 
 const RUNTIME_RESTART_REASON: &str = "Interrupted by process restart";
 const EMPTY_TURN_REASON: &str = "Turn completed without engine output";
-const DYNAMIC_TOOL_RESULT_TIMEOUT: Duration = Duration::from_secs(300);
+// Backstop for the wait on a dynamic (client-executed) tool result. It must
+// not undercut the MCP `tools/call` budget (`McpTimeouts::default()`
+// execute_timeout, 1800s): a legitimate long execution — a build, a test
+// suite, a remote job — would otherwise have its result delivery dropped
+// here while the tool itself was still allowed to run. The wait still ends
+// on turn interrupt or runtime shutdown, so this cap only matters when the
+// client never answers.
+const DYNAMIC_TOOL_RESULT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 impl RuntimeThreadManager {
     /// Wait for one external approval decision. The one approval clock,

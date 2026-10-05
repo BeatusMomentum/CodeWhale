@@ -14892,6 +14892,19 @@ async fn dynamic_tool_timeout_clears_snapshot_and_emits_once() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn dynamic_tool_result_backstop_matches_mcp_tools_call_budget() {
+    // The dynamic-result wait is a backstop for client-executed tools, not a
+    // cap on the tool itself: the MCP `tools/call` budget legitimately allows
+    // 1800s executions, so the backstop must not fire earlier than that.
+    assert_eq!(
+        DYNAMIC_TOOL_RESULT_TIMEOUT,
+        Duration::from_secs(crate::mcp::McpTimeouts::default().execute_timeout),
+        "dynamic tool-result backstop must not undercut the MCP tools/call budget"
+    );
+    assert_eq!(DYNAMIC_TOOL_RESULT_TIMEOUT, Duration::from_secs(1800));
+}
+
 #[tokio::test]
 async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()> {
     use crate::tools::spec::DynamicToolExecutor;
