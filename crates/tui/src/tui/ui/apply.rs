@@ -273,6 +273,10 @@ pub(crate) fn apply_engine_error_to_app(
     {
         app.offline_mode = true;
         app.onboarding_needs_api_key = true;
+        // The key was rejected, not missing: Esc returns to the composer and
+        // the picker focuses the configured route, as missing-key recovery
+        // does, instead of walking back through first-run screens.
+        app.onboarding_missing_key_recovery = true;
         app.onboarding = OnboardingState::Provider;
         let provider = app.api_provider;
         let config_path = match crate::config::resolve_load_config_path(app.config_path.clone()) {
@@ -280,11 +284,20 @@ pub(crate) fn apply_engine_error_to_app(
             Ok(None) => "~/.codewhale/config.toml".to_string(),
             Err(error) => error.to_string(),
         };
+        let notice = tr(app.ui_locale, MessageId::OnboardApiKeyRejectedEnv)
+            .replace("{provider}", provider.as_str())
+            .replace("{env}", &provider.provider().env_vars().join(" / "))
+            .replace("{path}", &config_path);
+        // The setup screen covers the transcript, so it must say why it
+        // opened. The log records the reason without the provider's message,
+        // which the transcript already carries.
+        crate::logging::warn(format!(
+            "{} rejected the environment API key; opening provider setup",
+            provider.as_str()
+        ));
+        app.onboarding_key_rejected = Some(notice.clone());
         app.push_status_toast(
-            tr(app.ui_locale, MessageId::OnboardApiKeyRejectedEnv)
-                .replace("{provider}", provider.as_str())
-                .replace("{env}", &provider.provider().env_vars().join(" / "))
-                .replace("{path}", &config_path),
+            notice,
             StatusToastLevel::Error,
             Some(App::STICKY_ERROR_TTL_MS),
         );
@@ -3609,7 +3622,8 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
         return;
     }
     match outcome {
-        Ok(()) => {
+        Ok(roster) => {
+            publish_verified_roster(&identity, &base_url, roster);
             app.provider_health.record_models_probe_success(
                 &scoped_config,
                 &identity,
@@ -3711,7 +3725,10 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
         return;
     }
     match outcome {
-        Ok(()) => {
+        Ok(roster) => {
+            // Before the model pick reads the route roster: list what this
+            // key can call today, not catalog rows the provider has retired.
+            publish_verified_roster(&identity, &base_url, roster);
             // Keep the readiness row aligned with the live check the wizard
             // just completed. This probe only proves the endpoint and
             // credentials are reachable: the model is chosen after the probe,

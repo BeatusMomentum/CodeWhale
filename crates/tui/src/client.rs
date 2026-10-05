@@ -2486,7 +2486,15 @@ pub(crate) fn provider_api_key_verification_is_observed(api_provider: ProviderKi
 /// Verify a provider API key by hitting the `/models` endpoint
 /// (#3875). Builds a minimal HTTP client with the canonical auth
 /// headers for `provider`, issues a single GET, and returns
-/// `Ok(())` on a 2xx response or `Err(reason)` on any failure.
+/// `Ok(roster)` on a 2xx response or `Err(reason)` on any failure.
+///
+/// `roster` is the listing that 2xx already carried, projected by the same
+/// rules as a catalog refresh and scoped to `provider`'s own id: the caller
+/// rescopes it to the exact route identity and publishes it, so guided setup
+/// offers the models this key can call today rather than bundled or
+/// Models.dev rows the provider may have retired. It is `None` when the body
+/// is not one complete, valid roster (a paginated first page, malformed or
+/// empty JSON); a valid 2xx still verifies the key, and the existing rows stay.
 ///
 /// This is intentionally a one-shot call — no retry, no rate-limit
 /// wait — so a bad key is surfaced immediately.
@@ -2494,11 +2502,11 @@ pub async fn verify_provider_api_key(
     provider: ProviderKind,
     api_key: &str,
     base_url: &str,
-) -> Result<(), String> {
+) -> Result<Option<ProviderCatalogDelta>, String> {
     if api_provider_skips_models_probe(provider) {
         // Providers without a /models endpoint can't be verified this
         // way; accept the key optimistically (same as health_check).
-        return Ok(());
+        return Ok(None);
     }
     let headers = build_default_headers(
         api_key,
@@ -2529,30 +2537,27 @@ pub async fn verify_provider_api_key(
         .map_err(|err| format!("request failed: {}", err.without_url()))?;
     let status = response.status();
     if status.is_success() {
-        // TelecomJS verification already returns the key-scoped model roster.
-        // Publish it before returning so the guided model picker can render the
-        // live choices in this session instead of requiring a restart. A valid
-        // 2xx response remains sufficient to verify the key even if the body is
-        // malformed; in that case failure-preserving catalog semantics keep the
-        // existing/static rows.
+        // A valid 2xx verifies the key even when the body is not a usable
+        // roster; failure-preserving catalog semantics then keep the
+        // existing rows.
         let body = bounded_provider_catalog_text(response, PROVIDER_CATALOG_MAX_RESPONSE_BYTES)
             .await
             .unwrap_or_default();
-        if matches!(
-            provider,
-            ProviderKind::Telecomjs | ProviderKind::Edenai | ProviderKind::Zenmux
-        ) && serde_json::from_str::<ModelsPage<'_>>(&body).is_ok_and(|page| !page.has_more)
-            && let Ok(offerings) = named_gateway_catalog_offerings_from_body(
-                &body,
-                provider,
-                provider.as_str(),
-                &base_url_fingerprint(base_url),
-                now_unix(),
-            )
-        {
-            crate::provider_lake::merge_live_offerings(offerings);
-        }
-        Ok(())
+        let complete =
+            serde_json::from_str::<ModelsPage<'_>>(&body).is_ok_and(|page| !page.has_more);
+        let secrets = [api_key.trim().to_string()];
+        Ok(complete
+            .then(|| {
+                catalog_delta_from_models_body(
+                    provider,
+                    provider.as_str().to_string(),
+                    base_url,
+                    &body,
+                    &secrets,
+                )
+                .ok()
+            })
+            .flatten())
     } else {
         let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
         let body = if api_key.trim().is_empty() {
@@ -3302,9 +3307,9 @@ impl CodewhaleClient {
     /// about the host (#6289). Catalog ownership still uses the exact
     /// configured identity, so a renamed Baseten table keeps its own
     /// partition.
+    #[cfg(test)]
     fn catalog_endpoint_is_baseten(&self) -> bool {
-        self.api_provider == ProviderKind::Custom
-            && codewhale_config::catalog::endpoint_is_baseten(&self.base_url)
+        catalog_endpoint_is_baseten(self.api_provider, &self.base_url)
     }
 
     /// Fetch the provider's live `/models` listing as a secret-free
@@ -3323,150 +3328,17 @@ impl CodewhaleClient {
             .await
             .map_err(ModelsFetchError::into_catalog)?;
 
-        let provider = self.catalog_provider_id();
-        let fingerprint = base_url_fingerprint(&self.base_url);
-        let fetched_at = now_unix();
-
-        // OpenRouter returns extended capability metadata in its /models
-        // response (#3385). Capture limits, pricing, reasoning, and modalities
-        // from the live API instead of leaving them unknown.
-        let offerings: Vec<CatalogOffering> = if self.api_provider == ProviderKind::Openrouter {
-            let or_models = parse_openrouter_models_response(&body)?;
-            if or_models.is_empty() {
-                return Err(CatalogRefreshError::EmptyList);
-            }
-            // A row with an unreadable or implausible price is skipped and
-            // counted, not allowed to fail every other row (#6690).
-            let offerings: Vec<_> = or_models
-                .iter()
-                .filter_map(|item| {
-                    openrouter_to_catalog_offering(item, &provider, &fingerprint, fetched_at).ok()
-                })
-                .collect();
-            let skipped = or_models.len() - offerings.len();
-            if skipped > 0 {
-                tracing::warn!(
-                    skipped,
-                    listed = or_models.len(),
-                    "skipped OpenRouter model rows with invalid pricing"
-                );
-            }
-            if offerings.is_empty() {
-                return Err(CatalogRefreshError::InvalidResponse);
-            }
-            offerings
-        } else if self.catalog_endpoint_is_baseten() {
-            let baseten_models = parse_baseten_models_response(&body)?;
-            if baseten_models.is_empty() {
-                return Err(CatalogRefreshError::EmptyList);
-            }
-            baseten_models
-                .iter()
-                .map(|item| baseten_to_catalog_offering(item, &provider, &fingerprint, fetched_at))
-                .collect::<Result<Vec<_>, _>>()?
-        } else if self.api_provider == ProviderKind::Telecomjs {
-            named_gateway_catalog_offerings_from_body(
-                &body,
-                codewhale_config::ProviderKind::Telecomjs,
-                &provider,
-                &fingerprint,
-                fetched_at,
-            )?
-        } else if self.api_provider == ProviderKind::Edenai {
-            named_gateway_catalog_offerings_from_body(
-                &body,
-                codewhale_config::ProviderKind::Edenai,
-                &provider,
-                &fingerprint,
-                fetched_at,
-            )?
-        } else if self.api_provider == ProviderKind::Zenmux {
-            named_gateway_catalog_offerings_from_body(
-                &body,
-                codewhale_config::ProviderKind::Zenmux,
-                &provider,
-                &fingerprint,
-                fetched_at,
-            )?
-        } else if provider == "codewhale" {
-            // The Codewhale API's own listing states the wire protocol per
-            // model, so it is the catalog authority for this route.
-            codewhale_catalog_offerings_from_body(&body, &provider, &fingerprint, fetched_at)?
-        } else if provider == "concentrate" {
-            // Concentrate's unauthenticated `GET /v1/models` is the same
-            // OpenAI list shape (`{"object":"list","data":[{"id":..}]}`);
-            // rows stay unclaimed unless a same-provider bundled row exists.
-            named_gateway_catalog_offerings_from_body(
-                &body,
-                codewhale_config::ProviderKind::Concentrate,
-                &provider,
-                &fingerprint,
-                fetched_at,
-            )?
-        } else {
-            let models = apply_provider_model_cutline(
-                self.api_provider,
-                parse_models_response_for_provider(&body, self.api_provider)
-                    .map_err(|_| CatalogRefreshError::InvalidResponse)?,
-            );
-            if models.is_empty() {
-                return Err(CatalogRefreshError::EmptyList);
-            }
-            models
-                .into_iter()
-                .map(|model| CatalogOffering {
-                    cost_source: None,
-                    modalities_source: None,
-                    provider: provider.clone(),
-                    endpoint_key: if self.api_provider == ProviderKind::OpencodeGo {
-                        codewhale_config::opencode_go_endpoint_key(&model.id)
-                            .expect("filtered Go roster")
-                    } else {
-                        "chat"
-                    }
-                    .to_string(),
-                    wire_model_id: model.id,
-                    canonical_model: None,
-                    default_for_provider: false,
-                    family: None,
-                    limit: None,
-                    cost: None,
-                    modalities: None,
-                    attachment: None,
-                    reasoning: None,
-                    tool_call: None,
-                    structured_output: None,
-                    reasoning_options: Vec::new(),
-                    source: CatalogSource::Live {
-                        base_url_fingerprint: fingerprint.clone(),
-                        fetched_at,
-                    },
-                })
-                .collect()
-        };
-
-        if offerings.iter().any(|row| {
-            !crate::provider_lake::valid_catalog_model_id(&row.wire_model_id)
-                || self
-                    .model_bound_secret_values
-                    .iter()
-                    .any(|secret| !secret.is_empty() && row.wire_model_id.contains(secret))
-        }) {
-            return Err(CatalogRefreshError::InvalidResponse);
-        }
-        if offerings.len() > PROVIDER_CATALOG_MAX_ROWS {
-            return Err(CatalogRefreshError::InvalidResponse);
-        }
-
+        let delta = catalog_delta_from_models_body(
+            self.api_provider,
+            self.catalog_provider_id(),
+            &self.base_url,
+            &body,
+            &self.model_bound_secret_values,
+        )?;
         if tokio::time::Instant::now() >= deadline {
             return Err(CatalogRefreshError::Network);
         }
-        Ok(ProviderCatalogDelta {
-            provider,
-            base_url_fingerprint: fingerprint,
-            fetched_at,
-            offerings,
-        })
+        Ok(delta)
     }
 
     /// Refresh `cache` for this client's provider + base URL, recording either a
@@ -4574,6 +4446,163 @@ fn codewhale_catalog_offerings_from_body(
         return Err(CatalogRefreshError::EmptyList);
     }
     Ok(offerings)
+}
+
+/// Whether a route speaks Baseten's `/models` dialect: recognized by
+/// endpoint, never by table name (#6289).
+fn catalog_endpoint_is_baseten(api_provider: ProviderKind, base_url: &str) -> bool {
+    api_provider == ProviderKind::Custom && codewhale_config::catalog::endpoint_is_baseten(base_url)
+}
+
+/// Project one `/models` document onto a secret-free, endpoint-scoped roster
+/// delta (#3385). Shared by [`CodewhaleClient::fetch_catalog_delta`] and the
+/// guided-setup key probe ([`verify_provider_api_key`]), so the listing a key
+/// check already downloaded is read by exactly the rules a refresh uses.
+fn catalog_delta_from_models_body(
+    api_provider: ProviderKind,
+    provider: String,
+    base_url: &str,
+    body: &str,
+    model_bound_secret_values: &[String],
+) -> Result<ProviderCatalogDelta, CatalogRefreshError> {
+    let fingerprint = base_url_fingerprint(base_url);
+    let fetched_at = now_unix();
+
+    // OpenRouter returns extended capability metadata in its /models
+    // response (#3385). Capture limits, pricing, reasoning, and modalities
+    // from the live API instead of leaving them unknown.
+    let offerings: Vec<CatalogOffering> = if api_provider == ProviderKind::Openrouter {
+        let or_models = parse_openrouter_models_response(body)?;
+        if or_models.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+        // A row with an unreadable or implausible price is skipped and
+        // counted, not allowed to fail every other row (#6690).
+        let offerings: Vec<_> = or_models
+            .iter()
+            .filter_map(|item| {
+                openrouter_to_catalog_offering(item, &provider, &fingerprint, fetched_at).ok()
+            })
+            .collect();
+        let skipped = or_models.len() - offerings.len();
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                listed = or_models.len(),
+                "skipped OpenRouter model rows with invalid pricing"
+            );
+        }
+        if offerings.is_empty() {
+            return Err(CatalogRefreshError::InvalidResponse);
+        }
+        offerings
+    } else if catalog_endpoint_is_baseten(api_provider, base_url) {
+        let baseten_models = parse_baseten_models_response(body)?;
+        if baseten_models.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+        baseten_models
+            .iter()
+            .map(|item| baseten_to_catalog_offering(item, &provider, &fingerprint, fetched_at))
+            .collect::<Result<Vec<_>, _>>()?
+    } else if api_provider == ProviderKind::Telecomjs {
+        named_gateway_catalog_offerings_from_body(
+            body,
+            codewhale_config::ProviderKind::Telecomjs,
+            &provider,
+            &fingerprint,
+            fetched_at,
+        )?
+    } else if api_provider == ProviderKind::Edenai {
+        named_gateway_catalog_offerings_from_body(
+            body,
+            codewhale_config::ProviderKind::Edenai,
+            &provider,
+            &fingerprint,
+            fetched_at,
+        )?
+    } else if api_provider == ProviderKind::Zenmux {
+        named_gateway_catalog_offerings_from_body(
+            body,
+            codewhale_config::ProviderKind::Zenmux,
+            &provider,
+            &fingerprint,
+            fetched_at,
+        )?
+    } else if provider == "codewhale" {
+        // The Codewhale API's own listing states the wire protocol per
+        // model, so it is the catalog authority for this route.
+        codewhale_catalog_offerings_from_body(body, &provider, &fingerprint, fetched_at)?
+    } else if provider == "concentrate" {
+        // Concentrate's unauthenticated `GET /v1/models` is the same
+        // OpenAI list shape (`{"object":"list","data":[{"id":..}]}`);
+        // rows stay unclaimed unless a same-provider bundled row exists.
+        named_gateway_catalog_offerings_from_body(
+            body,
+            codewhale_config::ProviderKind::Concentrate,
+            &provider,
+            &fingerprint,
+            fetched_at,
+        )?
+    } else {
+        let models = apply_provider_model_cutline(
+            api_provider,
+            parse_models_response_for_provider(body, api_provider)
+                .map_err(|_| CatalogRefreshError::InvalidResponse)?,
+        );
+        if models.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+        models
+            .into_iter()
+            .map(|model| CatalogOffering {
+                cost_source: None,
+                modalities_source: None,
+                provider: provider.clone(),
+                endpoint_key: if api_provider == ProviderKind::OpencodeGo {
+                    codewhale_config::opencode_go_endpoint_key(&model.id)
+                        .expect("filtered Go roster")
+                } else {
+                    "chat"
+                }
+                .to_string(),
+                wire_model_id: model.id,
+                canonical_model: None,
+                default_for_provider: false,
+                family: None,
+                limit: None,
+                cost: None,
+                modalities: None,
+                attachment: None,
+                reasoning: None,
+                tool_call: None,
+                structured_output: None,
+                reasoning_options: Vec::new(),
+                source: CatalogSource::Live {
+                    base_url_fingerprint: fingerprint.clone(),
+                    fetched_at,
+                },
+            })
+            .collect()
+    };
+
+    if offerings.iter().any(|row| {
+        !crate::provider_lake::valid_catalog_model_id(&row.wire_model_id)
+            || model_bound_secret_values
+                .iter()
+                .any(|secret| !secret.is_empty() && row.wire_model_id.contains(secret))
+    }) {
+        return Err(CatalogRefreshError::InvalidResponse);
+    }
+    if offerings.len() > PROVIDER_CATALOG_MAX_ROWS {
+        return Err(CatalogRefreshError::InvalidResponse);
+    }
+    Ok(ProviderCatalogDelta {
+        provider,
+        base_url_fingerprint: fingerprint,
+        fetched_at,
+        offerings,
+    })
 }
 
 fn named_gateway_catalog_offerings_from_body(

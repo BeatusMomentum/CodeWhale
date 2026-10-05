@@ -996,6 +996,7 @@ impl App {
             onboarding_provider: provider,
             onboarding_workspace_trust_gate,
             onboarding_missing_key_recovery,
+            onboarding_key_rejected: None,
             onboarding_explore_offline: false,
             // Language is asked in /setup, never at launch: counting it here
             // made the one launch screen read "Getting started · 2/3" with no

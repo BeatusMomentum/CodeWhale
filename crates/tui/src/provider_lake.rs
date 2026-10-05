@@ -368,9 +368,10 @@ pub fn clear_live_snapshot() {
 /// Unlike [`set_live_snapshot`] for `LiveSource::PerProvider` (which replaces
 /// each represented provider's partition), this merges new rows by
 /// `(provider, wire_model_id)` identity within that provider's partition,
-/// preserving every other provider and the Models.dev partition. This is used
-/// by provider catalog refreshes (e.g. TelecomJS `/v1/models`) that need to
-/// coexist with the cross-provider Models.dev live layer.
+/// preserving every other provider and the Models.dev partition. Production
+/// rosters publish through `provider_catalog_live` (the guided-setup key probe
+/// included), so this remains a fixture seam for lake tests.
+#[cfg(test)]
 pub fn merge_live_offerings(new_offerings: Vec<CatalogOffering>) {
     if new_offerings.is_empty() {
         return;

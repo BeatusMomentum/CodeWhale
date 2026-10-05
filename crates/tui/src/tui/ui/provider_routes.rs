@@ -83,6 +83,7 @@ pub(crate) fn onboarding_key_route(
 }
 
 pub(crate) fn back_from_provider_onboarding(app: &mut App) {
+    app.onboarding_key_rejected = None;
     if app.onboarding_missing_key_recovery {
         // A returning user declined missing-key recovery: leave onboarding
         // for the offline composer without mutating the saved route.
@@ -132,6 +133,7 @@ pub(crate) fn complete_provider_picker_onboarding(app: &mut App, provider: Provi
     };
     app.onboarding_provider = provider;
     app.onboarding_needs_api_key = false;
+    app.onboarding_key_rejected = None;
     // The route now has its key, so a later local-Ollama probe must not treat
     // this session as still recovering from a missing one.
     app.onboarding_missing_key_recovery = false;

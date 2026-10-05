@@ -1638,7 +1638,16 @@ fn model_cost_label(provider: ProviderKind, model: &str) -> String {
     }
     let pricing =
         catalog_offering_for_model(provider, model).map(|offering| offering.to_offering().pricing);
-    model_cost_label_for_pricing(provider, pricing.as_ref())
+    let label = model_cost_label_for_pricing(provider, pricing.as_ref());
+    if label != "price unknown" {
+        return label;
+    }
+    // A catalog row can withhold a rate the reviewed table still owns:
+    // DeepSeek bills by time of day (`pricing_withheld` in
+    // catalog_corrections.json), and live roster rows carry no price at all.
+    // Ask pricing.rs before calling the price unknown, as `/model` does.
+    crate::pricing::model_rate_label(provider, model, crate::pricing::CostCurrency::Usd)
+        .map_or(label, |rate| format!("{rate} per 1M"))
 }
 
 /// Slice D two-pane picker: `(model, per-model cost, is_default_route)` rows
@@ -2295,6 +2304,19 @@ impl ProviderPickerView {
         self.rows[self.selected_idx].route_ok
     }
 
+    /// The provider refused this row's credential in this session. Enter
+    /// then asks for a new key instead of reusing the refused one, which
+    /// only loops back into the same rejection.
+    fn selected_credential_rejected(&self) -> bool {
+        matches!(
+            self.rows[self.selected_idx].readiness,
+            ResolvedProviderReadiness::SavedLastCheckFailed {
+                category: crate::error_taxonomy::ErrorCategory::Authentication,
+                ..
+            }
+        )
+    }
+
     fn enter_key_entry(&mut self) {
         self.stage = Stage::KeyEntry;
         self.api_key_input.clear();
@@ -2515,9 +2537,28 @@ impl ProviderPickerView {
             // Last-resort so the guided flow never dead-ends without a choice.
             models.push(provider.as_str().to_string());
         }
+        // Without a live roster the list is catalog rows, which can still name
+        // a compatibility alias this route rewrites to another id (DeepSeek's
+        // retired `deepseek-chat` -> `deepseek-v4-flash`). Offering both shows
+        // one model twice under a name the provider no longer serves; keep
+        // the id the route actually sends whenever that id is also listed.
+        let base_url = self.rows[self.selected_idx].base_url.clone();
+        let wire =
+            |model: &str| crate::config::wire_model_for_provider_route(provider, &base_url, model);
+        let listed: Vec<String> = models.clone();
+        models.retain(|model| {
+            let target = wire(model);
+            target == model.trim() || !listed.iter().any(|other| *other == target)
+        });
+        let preferred_wire = wire(&preferred);
         let selected = models
             .iter()
             .position(|model| model.eq_ignore_ascii_case(preferred.trim()))
+            .or_else(|| {
+                models
+                    .iter()
+                    .position(|model| model.eq_ignore_ascii_case(preferred_wire.trim()))
+            })
             .unwrap_or(0);
         self.model_options = models;
         self.model_selected_idx = selected.min(self.model_options.len().saturating_sub(1));
@@ -2747,7 +2788,7 @@ impl ProviderPickerView {
             self.tr(MessageId::PickerActionCustom)
         } else if !self.selected_route_is_valid() {
             self.tr(MessageId::PickerActionUnavailable)
-        } else if self.selected_has_key() {
+        } else if self.selected_has_key() && !self.selected_credential_rejected() {
             self.tr(MessageId::PickerActionApply)
         } else {
             self.tr(MessageId::PickerActionSetKey)
@@ -4314,7 +4355,7 @@ impl ProviderPickerView {
             ViewAction::None
         } else if !self.selected_route_is_valid() {
             ViewAction::None
-        } else if self.selected_has_key() {
+        } else if self.selected_has_key() && !self.selected_credential_rejected() {
             ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
                 identity: self.selected_identity().expect("checked admitted row"),
             })
@@ -6553,6 +6594,68 @@ mod tests {
                 .iter()
                 .any(|message| message == "credential rejected")
         );
+    }
+
+    /// Release QA: a DeepSeek key from the environment that the provider
+    /// refused stayed "key saved · not checked" (an ambient key has no
+    /// read-only generation), and Enter re-applied the same key, looping
+    /// send → setup → send. The rejection holds for every model on the route.
+    #[test]
+    fn rejected_env_key_is_marked_and_enter_asks_for_a_new_key() {
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _key = EnvVarGuard::set("DEEPSEEK_API_KEY", "sk-env-rejected");
+        let config = Config::default();
+        let identity = config.test_identity_for_kind(ProviderKind::Deepseek);
+        assert!(
+            config
+                .readonly_health_credential_generation(&identity)
+                .is_none(),
+            "fixture must exercise the opaque ambient-key path"
+        );
+        let mut health = ProviderReadinessSnapshot::default();
+        health.record_failure(
+            &config,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Deepseek,
+                "model-the-turn-ran",
+            ),
+            "model-the-turn-ran",
+            &crate::error_taxonomy::ErrorEnvelope::fatal_auth(
+                "Authentication failed: invalid API key",
+            ),
+        );
+
+        let mut picker = ProviderPickerView::new_for_onboarding(
+            ProviderKind::Deepseek,
+            Some(ProviderKind::Deepseek.as_str().into()),
+            &config,
+            None,
+        )
+        .with_provider_health(&health);
+        assert_eq!(picker.selected_provider(), ProviderKind::Deepseek);
+        let readiness = picker.rows[picker.selected_idx].readiness.clone();
+        assert!(
+            matches!(
+                readiness,
+                ResolvedProviderReadiness::SavedLastCheckFailed {
+                    category: crate::error_taxonomy::ErrorCategory::Authentication,
+                    ..
+                }
+            ),
+            "{readiness:?}"
+        );
+        assert!(!format!("{readiness:?}").contains("sk-env-rejected"));
+
+        let action = picker.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ViewAction::None),
+            "Enter must not re-apply the refused key"
+        );
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert!(picker.api_key_input.is_empty());
     }
 
     #[test]

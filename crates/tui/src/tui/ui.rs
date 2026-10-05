@@ -1184,7 +1184,15 @@ fn ignore_stale_stream_event_while_idle(event: &EngineEvent) -> bool {
     )
 }
 
-type ProviderKeyVerification<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+/// `Ok` carries the `/models` roster the probe already downloaded, when it
+/// was one complete listing (see [`crate::client::verify_provider_api_key`]).
+type ProviderKeyVerification<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<codewhale_config::catalog::ProviderCatalogDelta>, String>>
+            + Send
+            + 'a,
+    >,
+>;
 
 pub(crate) fn request_foreground_shell_background(app: &mut App) {
     if !app.is_loading {
@@ -1531,6 +1539,7 @@ mod provider_key_validation_tests {
 
     struct MockProviderKeyVerifier {
         result: Result<(), String>,
+        roster: Option<codewhale_config::catalog::ProviderCatalogDelta>,
         calls: std::sync::Mutex<Vec<(ProviderKind, String, String)>>,
     }
 
@@ -1538,8 +1547,14 @@ mod provider_key_validation_tests {
         fn new(result: Result<(), String>) -> Self {
             Self {
                 result,
+                roster: None,
                 calls: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_roster(mut self, roster: codewhale_config::catalog::ProviderCatalogDelta) -> Self {
+            self.roster = Some(roster);
+            self
         }
 
         fn calls(&self) -> Vec<(ProviderKind, String, String)> {
@@ -1559,7 +1574,9 @@ mod provider_key_validation_tests {
                 api_key.to_string(),
                 base_url.to_string(),
             ));
-            Box::pin(std::future::ready(self.result.clone()))
+            Box::pin(std::future::ready(
+                self.result.clone().map(|()| self.roster.clone()),
+            ))
         }
     }
 
@@ -1632,6 +1649,92 @@ mod provider_key_validation_tests {
         assert_eq!(
             provider_verification_error_category("HTTP 500 upstream failure"),
             crate::error_taxonomy::ErrorCategory::Network
+        );
+    }
+
+    /// Release QA: a DeepSeek key probe returned two served ids, yet guided
+    /// setup offered catalog rows the endpoint rejects at the first turn. The
+    /// roster the probe already downloaded must become the route's model list.
+    #[tokio::test]
+    async fn provider_key_probe_roster_becomes_the_model_pick_roster() {
+        use codewhale_config::catalog::{
+            CatalogOffering, CatalogSource, ProviderCatalogDelta, base_url_fingerprint, now_unix,
+        };
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::provider_catalog_live::reset_cache_for_test();
+                crate::provider_lake::clear_live_snapshot();
+            }
+        }
+        let _config_env = ConfigPathEnvGuard::new();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let _reset = Reset;
+        crate::provider_catalog_live::reset_cache_for_test();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = Config::default();
+        let identity = picker_provider_identity(&config, ProviderKind::Deepseek, None)
+            .expect("DeepSeek identity");
+        let mut scoped = config.clone();
+        scoped
+            .scope_to_provider_identity(&identity)
+            .expect("scope DeepSeek");
+        let base_url = scoped.active_route_base_url();
+        let fingerprint = base_url_fingerprint(&base_url);
+        let fetched_at = now_unix();
+        let served = ["deepseek-flash", "deepseek-v4-pro"];
+        // Scoped to the provider kind, exactly as the live probe returns it,
+        // plus an id the catalog does not offer as a chat model.
+        let roster = ProviderCatalogDelta {
+            provider: "deepseek".into(),
+            base_url_fingerprint: fingerprint.clone(),
+            fetched_at,
+            offerings: served
+                .iter()
+                .chain(&["deepseek-embedding-fixture"])
+                .map(|id| CatalogOffering {
+                    provider: "deepseek".into(),
+                    wire_model_id: (*id).into(),
+                    endpoint_key: "chat".into(),
+                    source: CatalogSource::Live {
+                        base_url_fingerprint: fingerprint.clone(),
+                        fetched_at,
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        assert_ne!(
+            crate::provider_lake::catalog_models_for_route(
+                ProviderKind::Deepseek,
+                identity.key.as_str(),
+                &base_url,
+            ),
+            served,
+            "precondition: the catalog fallback lists more than the endpoint serves"
+        );
+        let verifier = MockProviderKeyVerifier::new(Ok(())).with_roster(roster);
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            identity.clone(),
+            "sk-verified".to_string(),
+            None,
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
+        assert_eq!(
+            crate::provider_lake::catalog_models_for_route(
+                ProviderKind::Deepseek,
+                identity.key.as_str(),
+                &base_url,
+            ),
+            served
         );
     }
 

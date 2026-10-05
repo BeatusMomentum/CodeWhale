@@ -2102,6 +2102,10 @@ pub struct App {
     /// provider is missing its key. Esc then exits to the offline composer
     /// instead of walking back through first-run steps.
     pub onboarding_missing_key_recovery: bool,
+    /// Why provider setup reopened after the provider refused the active
+    /// key. The setup screen covers the transcript, so it shows this until
+    /// the user leaves or completes setup.
+    pub(crate) onboarding_key_rejected: Option<String>,
     /// True when the user explicitly chose "Explore offline" during onboarding
     /// (#3927). No provider was selected, no route was activated, and no secret
     /// was saved: the session browses with queued input until a route is

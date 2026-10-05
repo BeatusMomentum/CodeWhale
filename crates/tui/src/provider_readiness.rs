@@ -462,10 +462,38 @@ impl ResolvedProviderReadiness {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProviderReadinessSnapshot {
     checks: Vec<(ProviderRouteIdentity, LastProviderCheck)>,
+    /// Credentials the provider refused (authentication failures), keyed by
+    /// route without the model: a rejected key is rejected for every model.
+    /// Unlike `checks`, an entry may carry no credential generation — an
+    /// ambient `*_API_KEY`, a secret-store key or a command source cannot be
+    /// fingerprinted read-only, and without this the picker kept offering a
+    /// refused env key as "key saved · not checked".
+    ///
+    /// Known limitation: an opaque (generation-less) rejection cannot see a
+    /// key rotated outside this process; it lasts until the next success on
+    /// that route, or until a saved key makes the generation provable.
+    credential_rejections: Vec<(ProviderRouteIdentity, LastProviderCheck)>,
+}
+
+fn same_credential(candidate: &ProviderRouteIdentity, identity: &ProviderRouteIdentity) -> bool {
+    candidate.identity == identity.identity
+        && candidate.endpoint == identity.endpoint
+        && candidate.auth_class == identity.auth_class
+        && candidate.credential_generation == identity.credential_generation
 }
 
 impl ProviderReadinessSnapshot {
     fn last(&self, identity: &ProviderRouteIdentity) -> Option<&LastProviderCheck> {
+        // A refused credential outranks any older per-model success with it;
+        // a later success on the route clears the rejection.
+        if let Some(check) = self
+            .credential_rejections
+            .iter()
+            .rev()
+            .find_map(|(candidate, check)| same_credential(candidate, identity).then_some(check))
+        {
+            return Some(check);
+        }
         identity.credential_generation.as_ref()?;
         if let Some(check) = self
             .checks
@@ -483,13 +511,10 @@ impl ProviderReadinessSnapshot {
         if identity.model != "auto" {
             return None;
         }
-        self.checks.iter().rev().find_map(|(candidate, check)| {
-            (candidate.identity == identity.identity
-                && candidate.endpoint == identity.endpoint
-                && candidate.auth_class == identity.auth_class
-                && candidate.credential_generation == identity.credential_generation)
-                .then_some(check)
-        })
+        self.checks
+            .iter()
+            .rev()
+            .find_map(|(candidate, check)| same_credential(candidate, identity).then_some(check))
     }
 
     pub(crate) fn record_success(
@@ -502,6 +527,9 @@ impl ProviderReadinessSnapshot {
         let mut route = route_identity_for_model(config, identity, model);
         route.endpoint = receipt.endpoint_identity().to_string();
         route.credential_generation = Some(receipt.credential_generation().clone());
+        self.credential_rejections.retain(|(candidate, _)| {
+            candidate.identity != route.identity || candidate.endpoint != route.endpoint
+        });
         self.replace(route, LastProviderCheck::Passed);
     }
 
@@ -555,13 +583,28 @@ impl ProviderReadinessSnapshot {
         if !provider_owned_failure(envelope) {
             return;
         }
-        self.replace(
-            route,
-            LastProviderCheck::Failed {
-                category: envelope.category,
-                message: sanitize_message(&envelope.message),
-            },
-        );
+        let check = LastProviderCheck::Failed {
+            category: envelope.category,
+            message: sanitize_message(&envelope.message),
+        };
+        if envelope.category == ErrorCategory::Authentication {
+            // Record the rejection under the generation the picker will
+            // compute. When that projection proves a different credential is
+            // configured now, the refused one is already gone.
+            let current = config.readonly_health_credential_generation(identity);
+            if current
+                .as_ref()
+                .is_none_or(|generation| generation == receipt.credential_generation())
+            {
+                let mut rejected = route.clone();
+                rejected.model.clear();
+                rejected.credential_generation = current;
+                self.credential_rejections
+                    .retain(|(candidate, _)| !same_credential(candidate, &rejected));
+                self.credential_rejections.push((rejected, check.clone()));
+            }
+        }
+        self.replace(route, check);
     }
 
     #[cfg(test)]
