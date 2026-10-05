@@ -6,7 +6,19 @@ import { Icon } from "@/components/icon";
 import { TerminalCapture } from "@/components/terminal-capture";
 import { getNativeTerminalCopy, NATIVE_TERMINAL_VIEWS } from "@/lib/content/native-terminal";
 import { TERMINAL_CAPTURE_FRAMES, type TerminalCaptureFrameId } from "@/lib/terminal-capture.generated";
+import { cueWhale, type WhaleCue } from "@/lib/whale-motion";
 import "./native-terminal-gallery.css";
+
+// What the homepage whale acts out beside each captured view. Illustration
+// only: it mirrors the screen the reader picked, not a running session.
+const WHALE_CUES: Record<string, WhaleCue> = {
+  home: { presence: "Idle", label: "rest", chosen: true },
+  composer: { presence: "Listening", label: "listen", chosen: true },
+  workbar: { presence: "Working", kind: "editing", label: "write", chosen: true },
+  "workbar-fleet": { presence: "Working", kind: "delegating", parallel: 3, label: "pod", chosen: true },
+  "provider-picker": { presence: "Working", kind: "network", label: "connect", chosen: true },
+  help: { presence: "Thinking", label: "think", chosen: true },
+};
 
 function hasCapture(id: string): id is TerminalCaptureFrameId {
   return Object.prototype.hasOwnProperty.call(TERMINAL_CAPTURE_FRAMES, id);
@@ -47,7 +59,12 @@ export function NativeTerminalGallery({
             className="native-terminal-button"
             aria-pressed={selected.id === view.id}
             aria-controls={captureId}
-            onClick={() => setFrame(view.id)}
+            onClick={() => {
+              setFrame(view.id);
+              // Only a reader's choice moves the whale; the page loads at rest.
+              const cue = WHALE_CUES[view.id];
+              if (cue) cueWhale(cue);
+            }}
           >
             {copy.views[view.id].label}
           </button>
@@ -62,7 +79,6 @@ export function NativeTerminalGallery({
         />
       </div>
       <div className="native-terminal-footer">
-        <span className="native-terminal-scroll-hint">{copy.scrollHint}</span>
         <Link href={`/${locale}/ratatui`} className="native-terminal-components-link">
           {copy.componentsLink}
           <Icon name="arrow-right" className="icon icon-flip" />

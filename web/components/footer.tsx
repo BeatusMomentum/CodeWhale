@@ -12,12 +12,10 @@ import { SITE_CONTACT_EMAIL, SITE_SECURITY_EMAIL } from "@/lib/page-meta";
 import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
 import { pickText } from "@/lib/i18n/dictionaries";
 import { getStorefrontCopy } from "@/lib/content/merch-storefront";
-import { Strata } from "./strata";
 import { WhalePose } from "./whale-pose";
 
 /**
- * Site footer: one waterline band from the page's ground into deep water,
- * then the sea below the horizon, in both appearances.
+ * Site footer: the sea below one horizon line, in both appearances.
  * One dictionary path for every routed locale; the Product column carries
  * the full link set everywhere.
  */
@@ -30,12 +28,8 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
 
   return (
     <footer className="site-footer">
-      <div className="waterline" aria-hidden="true">
-        <Strata variant="band" />
-      </div>
       <div className="site-footer-sea">
         <div className="horizon" aria-hidden="true" />
-        <div className="sea-texture" aria-hidden="true" />
         <div className="site-footer-main">
           <div className="site-footer-brand">
             <Link href={homeHref} className="site-wordmark site-wordmark-footer" aria-label="Codewhale">
