@@ -447,7 +447,7 @@ fn remote_env_open_encodes_branch_and_never_echoes_credentials() {
     assert!(!result.is_error, "{result:?}");
     assert_eq!(
         external_url(&result),
-        "https://app.codewhale.net/work?repo=Hmbown%2FCodeWhale&branch=feature%2Fmobile%26cloud-%7Burl%7D"
+        "https://app.codewhale.net/work?repo=codewhale-hq%2FCodeWhale&branch=feature%2Fmobile%26cloud-%7Burl%7D"
     );
     assert!(result_text(&result).contains("feature/mobile&cloud-{url}"));
     assert!(!external_url(&result).contains(secret));
@@ -459,17 +459,17 @@ fn remote_env_supported_https_ssh_and_cnb_origins_remain_accepted() {
     for (origin, expected) in [
         (
             "https://github.com/codewhale-hq/CodeWhale.git",
-            "Hmbown%2FCodeWhale",
+            "codewhale-hq%2FCodeWhale",
         ),
         (
             "https://user:token@github.com/codewhale-hq/CodeWhale",
-            "Hmbown%2FCodeWhale",
+            "codewhale-hq%2FCodeWhale",
         ),
         (
             "ssh://git@github.com/codewhale-hq/CodeWhale.git",
-            "Hmbown%2FCodeWhale",
+            "codewhale-hq%2FCodeWhale",
         ),
-        ("git@github.com:codewhale-hq/CodeWhale.git", "Hmbown%2FCodeWhale"),
+        ("git@github.com:codewhale-hq/CodeWhale.git", "codewhale-hq%2FCodeWhale"),
         ("https://cnb.cool/whale/codewhale.git", "whale%2Fcodewhale"),
         (
             "ssh://git@cnb.cool:2222/whale/codewhale.git",

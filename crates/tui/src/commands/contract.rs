@@ -7078,7 +7078,7 @@ mod tests {
             assert_eq!(target.branch, "main");
             assert_eq!(
                 target.url,
-                "https://app.codewhale.net/work?repo=Hmbown%2FCodeWhale&branch=main"
+                "https://app.codewhale.net/work?repo=codewhale-hq%2FCodeWhale&branch=main"
             );
             assert!(!target.url.contains(secret));
             assert!(!target.repo.contains(secret));
