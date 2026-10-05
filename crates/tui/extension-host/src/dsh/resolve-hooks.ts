@@ -21,6 +21,11 @@ import {createHash} from 'node:crypto'
 import {fileURLToPath,pathToFileURL} from 'node:url'
 import {relative,resolve,sep,isAbsolute,dirname} from 'node:path'
 import {readFileSync,realpathSync} from 'node:fs'
+// JS realpath lstats every ancestor from the drive root, and a Windows LPAC
+// host cannot read `C:\` (EPERM). The native call asks Windows for the opened
+// file's final path, which needs access to that file only. Other platforms
+// keep the JS implementation unchanged.
+const canonicalPath:(path:string)=>string=process.platform==='win32'?path=>realpathSync.native(path):path=>realpathSync(path)
 import { RUNTIME } from '../runtime.ts'
 import { prepareBunSource, REVIEWED_IMPORT } from './bun-closure.ts'
 
@@ -152,7 +157,7 @@ function installBunResolver(modules: Record<string, Record<string, unknown>>) {
               :extension==='jsx' || extension==='js'?'jsx':'js'
           return {contents:readFileSync(args.path,'utf8'),loader}
         }
-        if(!(closure.path in closure.receipt.files) || realpathSync(args.path)!==args.path)throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
+        if(!(closure.path in closure.receipt.files) || canonicalPath(args.path)!==args.path)throw new Error('module was absent from reviewed composition closure or contains a symbolic link')
         const bytes=readFileSync(args.path)
         if(bytes.length>64*1024*1024 || createHash('sha256').update(bytes).digest('hex')!==closure.receipt.files[closure.path])throw new Error('composition module bytes changed after review')
         // Bun 1.4 runtime onLoad treats its JSON loader as JS. Preserve exact
@@ -189,7 +194,7 @@ function checkedBunSpecifier(specifier:string,root:string,files:Readonly<Record<
 // session or plugin state store. Native JS remains arbitrary co-resident code.
 const reviewedClosures=new Map<string,{files:Readonly<Record<string,string>>,refs:number}>()
 export function admitReviewedClosure(baseUrl:string,files:Readonly<Record<string,string>>):()=>void {
-  const root=realpathSync(resolve(fileURLToPath(baseUrl)))
+  const root=canonicalPath(resolve(fileURLToPath(baseUrl)))
   const accepted:Record<string,string>=Object.create(null)
   const keys=Object.keys(files)
   if (keys.length>4096) throw new Error('reviewed composition closure exceeds its file limit')
@@ -207,7 +212,7 @@ export function admitReviewedClosure(baseUrl:string,files:Readonly<Record<string
 }
 /** Both runtimes consume the same exact admitted source-file receipt. */
 export async function importReviewedModule(baseUrl:string,path:string):Promise<unknown> {
-  const root=realpathSync(resolve(fileURLToPath(baseUrl)))
+  const root=canonicalPath(resolve(fileURLToPath(baseUrl)))
   const receipt=reviewedClosures.get(root)
   if(!receipt)throw new Error('composition module closure is no longer admitted')
   const entry=resolve(root,path)
