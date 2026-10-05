@@ -3472,13 +3472,20 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
         ),
         (
             HostRuntimeKind::Node,
-            vec![
-                "--max-old-space-size=256",
-                "--disable-proto=throw",
-                "--no-addons",
-                "--no-experimental-sqlite",
-                "--no-experimental-ffi",
-            ],
+            [
+                &[
+                    "--max-old-space-size=256",
+                    "--disable-proto=throw",
+                    "--no-addons",
+                ][..],
+                if cfg!(windows) {
+                    &["--preserve-symlinks", "--preserve-symlinks-main"][..]
+                } else {
+                    &[][..]
+                },
+                &["--no-experimental-sqlite", "--no-experimental-ffi"][..],
+            ]
+            .concat(),
         ),
     ] {
         let runtime = HostRuntime {

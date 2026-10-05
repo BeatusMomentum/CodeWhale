@@ -309,7 +309,9 @@ pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 ///
 /// - Node: a 256 MB old-space cap, `__proto__` throws, no native addons,
 ///   and the [`crate::dependencies::NODE_NATIVE_CODE_FLAGS`] this Node
-///   accepts (`node:sqlite`, and `node:ffi` where it exists).
+///   accepts (`node:sqlite`, and `node:ffi` where it exists). On Windows it
+///   also keeps symlinked paths as given, so module resolution never lstats
+///   the drive root the LPAC cannot read.
 /// - Bun ignores all of those except `--no-addons`. Instead it gets
 ///   `--no-install`, because Bun otherwise fetches a missing package from npm
 ///   while plugin code is running. It also gets `--no-env-file` and
@@ -356,10 +358,23 @@ pub(crate) fn runtime_env(kind: HostRuntimeKind) -> Vec<(String, String)> {
 
 fn base_runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
     match kind {
+        #[cfg(not(windows))]
         HostRuntimeKind::Node => &[
             "--max-old-space-size=256",
             "--disable-proto=throw",
             "--no-addons",
+        ],
+        // Node resolves the entry bundle with realpathSync, which lstats every
+        // ancestor from `C:\`. A Windows LPAC cannot read the drive root, so
+        // the host died before its handshake (EPERM, lstat 'C:\'). Keep the
+        // granted path as given; the LPAC still decides every access.
+        #[cfg(windows)]
+        HostRuntimeKind::Node => &[
+            "--max-old-space-size=256",
+            "--disable-proto=throw",
+            "--no-addons",
+            "--preserve-symlinks",
+            "--preserve-symlinks-main",
         ],
         #[cfg(windows)]
         HostRuntimeKind::Bun => &[

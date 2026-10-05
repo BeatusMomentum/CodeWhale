@@ -33,6 +33,7 @@ export const HOST_ARGS = IS_BUN
       '--max-old-space-size=256',
       '--disable-proto=throw',
       '--no-addons',
+      ...(process.platform === 'win32' ? ['--preserve-symlinks', '--preserve-symlinks-main'] : []),
       '--no-experimental-sqlite',
       ...(process.allowedNodeEnvironmentFlags.has('--no-experimental-ffi') ? ['--no-experimental-ffi'] : []),
     ]
