@@ -313,6 +313,7 @@ impl Engine {
             first_token_at,
             request_dispatched_at,
             stream_error,
+            frame_error,
         } = self
             .process_stream(
                 client.as_ref(),
@@ -424,6 +425,7 @@ impl Engine {
                 };
                 self.add_interrupted_assistant_text(&current_text_visible)
                     .await;
+                self.post_held_frame_error(&frame_error).await;
                 return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
             }
             // Rejected fragments remain in the interrupted Session/code receipt,
@@ -532,6 +534,7 @@ impl Engine {
                     )
                 };
                 crate::logging::warn(&error);
+                self.post_held_frame_error(&frame_error).await;
                 return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
             }
         }
@@ -567,6 +570,7 @@ impl Engine {
                 None
             };
             if let Some(refusal) = refusal {
+                self.post_held_frame_error(&frame_error).await;
                 return PhaseResult::Return((
                     TurnOutcomeStatus::Failed,
                     Some(format!("bounded Core report refused: {refusal}")),
@@ -717,6 +721,10 @@ impl Engine {
             progress.turn_error = None;
             return PhaseResult::Retry;
         }
+        // #6795: the request is not being re-issued, so a retryable error
+        // frame that was held back is now the turn's outcome. Post it as the
+        // non-recoverable envelope it was built as (severity Error), once.
+        self.post_held_frame_error(&frame_error).await;
         if pending_resume.is_some() {
             if progress.stream_retry_budget.spent() > 0 {
                 let _ = self

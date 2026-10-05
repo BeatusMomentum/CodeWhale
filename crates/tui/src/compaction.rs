@@ -2218,12 +2218,13 @@ fn is_context_window_error(e: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Only genuine overflow wording drops history. The category alone is far
+    // too wide: it now covers every rejected request (#6843), so a bare
+    // `token` or `maximum` ("max_tokens must be <= 8192", "temperature exceeds
+    // maximum 2") must not peel the summary input away on each retry.
     let lower = text.to_lowercase();
-    lower.contains("context")
-        || lower.contains("token")
-        || lower.contains("prompt is too long")
-        || lower.contains("requested")
-        || lower.contains("maximum")
+    is_context_window_error_message(&text)
+        || (lower.contains("requested") && lower.contains("tokens") && lower.contains("maximum"))
 }
 
 /// Collect text from a user message without treating tool-result payloads
@@ -2554,6 +2555,17 @@ mod tests {
         assert!(!is_context_window_error(&anyhow::anyhow!(
             "503 Service Unavailable"
         )));
+        // A rejected parameter names a token or a maximum without being a
+        // length overflow; dropping history cannot fix it.
+        for msg in [
+            r#"Invalid request (400): {"message":"max_tokens must be <= 8192","type":"invalid_request_error"}"#,
+            "HTTP 422: temperature exceeds maximum 2",
+        ] {
+            assert!(
+                !is_context_window_error(&anyhow::anyhow!(msg)),
+                "a non-length rejection must not trigger the drop-oldest ladder: `{msg}`",
+            );
+        }
     }
 
     #[test]

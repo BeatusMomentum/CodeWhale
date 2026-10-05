@@ -44,7 +44,7 @@ impl Engine {
         // never a clean success — the turn ends `Failed` with the limit
         // named, matching how the step ceiling below reports.
         if let Some(error) = self.turn_wall_clock_exhausted_error() {
-            let _ = self.send_event(Event::status(error.clone())).await;
+            self.post_turn_budget_stop(&error).await;
             return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
         }
 
@@ -192,7 +192,7 @@ impl Engine {
                     turn.max_steps,
                     turn.budget_source.key_label(),
                 );
-                let _ = self.send_event(Event::status(error.clone())).await;
+                self.post_turn_budget_stop(&error).await;
                 return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(error)));
             }
         }
