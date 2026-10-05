@@ -2797,7 +2797,7 @@ async fn run_async_main_dispatch(
                             show_qr: args.qr,
                             config_path: cli.config.clone(),
                             config_profile,
-                            control_frontend: None,
+                            control_frontend: cli.control_frontend.clone(),
                         },
                     )
                     .await
