@@ -130,14 +130,13 @@ function parseCodexConfig(raw) {
 }
 
 // src/dsh/shell-hooks.ts
-var canonicalPath = (path) => process.platform === "win32" ? realpathSync.native(path) : realpathSync(path);
 var EVENTS = { SessionStart: "session_start", UserPromptSubmit: "message_submit", PreToolUse: "tool_call_before", PostToolUse: "tool_call_after", Stop: "turn_end", SubagentStart: "subagent_spawn", SubagentStop: "subagent_complete" };
 function reviewedHookModule(dialect, root, files) {
   return { name: `hooks-${dialect}`, inject: ["shellHooks"], apply(ctx, config) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
     const path = resolve(root, config.configPath);
     const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || canonicalPath(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || realpathSync(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
     const bytes = readFileSync(path);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");

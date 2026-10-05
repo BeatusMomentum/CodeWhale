@@ -6257,7 +6257,7 @@ function reviewedHookModule(dialect, root, files) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
     const path = resolve(root, config.configPath);
     const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || canonicalPath(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || realpathSync(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
     const bytes = readFileSync(path);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");
@@ -6278,13 +6278,12 @@ function reviewedHookModule(dialect, root, files) {
     if (count === 0) throw new Error("reviewed hook config has no supported command hooks");
   } };
 }
-var canonicalPath, EVENTS;
+var EVENTS;
 var init_shell_hooks = __esm({
   "src/dsh/shell-hooks.ts"() {
     "use strict";
     init_config();
     init_config2();
-    canonicalPath = (path) => process.platform === "win32" ? realpathSync.native(path) : realpathSync(path);
     EVENTS = { SessionStart: "session_start", UserPromptSubmit: "message_submit", PreToolUse: "tool_call_before", PostToolUse: "tool_call_after", Stop: "turn_end", SubagentStart: "subagent_spawn", SubagentStop: "subagent_complete" };
   }
 });
@@ -12009,7 +12008,7 @@ import { fileURLToPath as fileURLToPath2, pathToFileURL as pathToFileURL2 } from
 import { relative as relative2, resolve as resolve2, sep as sep2, isAbsolute as isAbsolute2, dirname } from "node:path";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
 function admitReviewedClosure(baseUrl, files) {
-  const root = canonicalPath2(resolve2(fileURLToPath2(baseUrl)));
+  const root = realpathSync2(resolve2(fileURLToPath2(baseUrl)));
   const accepted = /* @__PURE__ */ Object.create(null);
   const keys = Object.keys(files);
   if (keys.length > 4096) throw new Error("reviewed composition closure exceeds its file limit");
@@ -12031,7 +12030,7 @@ function admitReviewedClosure(baseUrl, files) {
   };
 }
 async function importReviewedModule(baseUrl, path) {
-  const root = canonicalPath2(resolve2(fileURLToPath2(baseUrl)));
+  const root = realpathSync2(resolve2(fileURLToPath2(baseUrl)));
   const receipt = reviewedClosures.get(root);
   if (!receipt) throw new Error("composition module closure is no longer admitted");
   const entry = resolve2(root, path);
@@ -12048,13 +12047,12 @@ function closureAt(url) {
     return { root, receipt, path: inside.split(sep2).join("/") };
   }
 }
-var canonicalPath2, reviewedClosures;
+var reviewedClosures;
 var init_resolve_hooks = __esm({
   "src/dsh/resolve-hooks.ts"() {
     "use strict";
     init_runtime();
     init_bun_closure();
-    canonicalPath2 = process.platform === "win32" ? (path) => realpathSync2.native(path) : (path) => realpathSync2(path);
     reviewedClosures = /* @__PURE__ */ new Map();
   }
 });

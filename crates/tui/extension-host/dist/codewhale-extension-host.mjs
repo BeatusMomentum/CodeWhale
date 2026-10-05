@@ -6636,7 +6636,7 @@ function reviewedHookModule(dialect, root, files) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
     const path = resolve2(root, config.configPath);
     const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || canonicalPath(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || realpathSync(path) !== path || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
     const bytes = readFileSync(path);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");
@@ -6657,14 +6657,13 @@ function reviewedHookModule(dialect, root, files) {
     if (count === 0) throw new Error("reviewed hook config has no supported command hooks");
   } };
 }
-var canonicalPath, EVENTS;
+var EVENTS;
 var init_shell_hooks = __esm({
   "src/dsh/shell-hooks.ts"() {
     "use strict";
     init_define_BUILTIN_MODULE_DIGESTS();
     init_config();
     init_config2();
-    canonicalPath = (path) => process.platform === "win32" ? realpathSync.native(path) : realpathSync(path);
     EVENTS = { SessionStart: "session_start", UserPromptSubmit: "message_submit", PreToolUse: "tool_call_before", PostToolUse: "tool_call_after", Stop: "turn_end", SubagentStart: "subagent_spawn", SubagentStop: "subagent_complete" };
   }
 });
@@ -12704,7 +12703,7 @@ function installBunResolver(modules) {
           const loader2 = extension === "tsx" ? "tsx" : extension === "ts" || extension === "mts" || extension === "cts" ? "ts" : extension === "jsx" || extension === "js" ? "jsx" : "js";
           return { contents: readFileSync2(args.path, "utf8"), loader: loader2 };
         }
-        if (!(closure.path in closure.receipt.files) || canonicalPath2(args.path) !== args.path) throw new Error("module was absent from reviewed composition closure or contains a symbolic link");
+        if (!(closure.path in closure.receipt.files) || realpathSync2(args.path) !== args.path) throw new Error("module was absent from reviewed composition closure or contains a symbolic link");
         const bytes = readFileSync2(args.path);
         if (bytes.length > 64 * 1024 * 1024 || createHash2("sha256").update(bytes).digest("hex") !== closure.receipt.files[closure.path]) throw new Error("composition module bytes changed after review");
         if (closure.path.endsWith(".json")) return { contents: `export default JSON.parse(${JSON.stringify(bytes.toString("utf8"))});`, loader: "js" };
@@ -12736,7 +12735,7 @@ function checkedBunSpecifier(specifier, root, files, caller, require3) {
   return require3 ? path : file.href;
 }
 function admitReviewedClosure(baseUrl, files) {
-  const root = canonicalPath2(resolve3(fileURLToPath2(baseUrl)));
+  const root = realpathSync2(resolve3(fileURLToPath2(baseUrl)));
   const accepted = /* @__PURE__ */ Object.create(null);
   const keys = Object.keys(files);
   if (keys.length > 4096) throw new Error("reviewed composition closure exceeds its file limit");
@@ -12758,7 +12757,7 @@ function admitReviewedClosure(baseUrl, files) {
   };
 }
 async function importReviewedModule(baseUrl, path) {
-  const root = canonicalPath2(resolve3(fileURLToPath2(baseUrl)));
+  const root = realpathSync2(resolve3(fileURLToPath2(baseUrl)));
   const receipt = reviewedClosures.get(root);
   if (!receipt) throw new Error("composition module closure is no longer admitted");
   const entry = resolve3(root, path);
@@ -12815,14 +12814,13 @@ function installResolveHooks(modules) {
     }
   });
 }
-var canonicalPath2, SCHEME, REGISTRY_KEY, SINGLETONS, SUBPATH_SINGLETONS, UnsupportedPeerError, PEER_PATH, reviewedClosures, installed;
+var SCHEME, REGISTRY_KEY, SINGLETONS, SUBPATH_SINGLETONS, UnsupportedPeerError, PEER_PATH, reviewedClosures, installed;
 var init_resolve_hooks = __esm({
   "src/dsh/resolve-hooks.ts"() {
     "use strict";
     init_define_BUILTIN_MODULE_DIGESTS();
     init_runtime();
     init_bun_closure();
-    canonicalPath2 = process.platform === "win32" ? (path) => realpathSync2.native(path) : (path) => realpathSync2(path);
     SCHEME = "codewhale-host:";
     REGISTRY_KEY = /* @__PURE__ */ Symbol.for("codewhale.extension-host.modules");
     SINGLETONS = {
