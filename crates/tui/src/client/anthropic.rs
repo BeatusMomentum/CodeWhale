@@ -236,11 +236,12 @@ impl CodewhaleClient {
     /// Open the streaming Messages request through the shared stream-entry
     /// transport policy: bounded header wait, dual-client selection, and at
     /// most one HTTP/1.1 fallback retry on a classified H2 header stall.
-    /// Inside each open attempt the provider retry loop (`send_with_retry`)
-    /// handles rate limits and transient upstream failures before any stream
-    /// body exists, as the Chat and Responses adapters do. Wire-specific
-    /// request construction (headers, endpoint, body) stays here at the
-    /// adapter edge.
+    /// Inside each open attempt the provider retry loop
+    /// (`send_stream_open_with_retry`) handles rate limits and transient
+    /// upstream failures before any stream body exists — with no total
+    /// deadline, which would ride on the returned body — as the Chat and
+    /// Responses adapters do. Wire-specific request construction (headers,
+    /// endpoint, body) stays here at the adapter edge.
     async fn open_anthropic_stream_response(
         &self,
         url: &str,
@@ -259,7 +260,7 @@ impl CodewhaleClient {
                     self.http1_fallback_client(),
                     policy,
                 );
-                self.send_with_retry(|| {
+                self.send_stream_open_with_retry(|| {
                     client
                         .post(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/json")

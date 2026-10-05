@@ -1351,7 +1351,10 @@ impl CodewhaleClient {
                         .await?)
                 }
                 super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
-                    self.send_json_with_retry(url, body).await
+                    // Stream open, not a JSON retry: the response body outlives
+                    // the open, so this path must not carry any total deadline
+                    // (`open_stream_json_with_retry`, not `send_json_with_retry`).
+                    self.open_stream_json_with_retry(url, body).await
                 }
             }
         })
