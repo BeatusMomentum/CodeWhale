@@ -35,9 +35,12 @@
 }
 
 /* Type is the hero's structure: large, tight, set in the brand face. */
+/* Measured in em, not ch, so CJK and long compound words wrap the same as
+   English; hyphenation lets German compounds break at syllables. */
 .home-title {
-  max-width: 15ch;
-  font-size: clamp(2.75rem, 1.5rem + 5.2vw, 5.75rem);
+  max-width: 9.5em;
+  font-size: clamp(2.5rem, 1.4rem + 4.4vw, 5rem);
+  hyphens: auto;
   font-weight: 650;
   line-height: 0.98;
   letter-spacing: -0.035em;
@@ -53,6 +56,19 @@
   text-wrap: pretty;
 }
 .home-lede strong { color: var(--text); font-weight: 600; }
+
+/* CJK headlines carry more meaning per glyph: a step smaller, wider measure,
+   and no breaks inside words (Korean) or mid-phrase where avoidable. */
+:lang(zh) .home-title,
+:lang(ja) .home-title,
+:lang(ko) .home-title {
+  max-width: 11em;
+  font-size: clamp(2.125rem, 1.2rem + 3.4vw, 4rem);
+  line-height: 1.12;
+  letter-spacing: -0.01em;
+  word-break: keep-all;
+  line-break: strict;
+}
 
 .home-hero-copy .hero-install { max-width: 32rem; margin-top: var(--space-2); }
 .home-hero-copy .actions { margin-top: calc(var(--space-2) * -1); }
