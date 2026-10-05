@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की
 खुद जाँच करता है — आपके टर्मिनल में, आपके चुने हुए होस्ट किए गए या लोकल मॉडल के साथ।
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -152,7 +152,7 @@ Codewhale आपकी मशीन पर उतने ही एक्से�
 
 बग रिपोर्ट, फ़ीचर के सुझाव और pull request का स्वागत है — चाहे आप Codewhale का कई महीनों से
 इस्तेमाल कर रहे हों या पहली बार आज़मा रहे हों। अगर कोई प्रोवाइडर उपलब्ध नहीं है या कोई
-वर्कफ़्लो असहज है, तो [issue खोलें](https://github.com/Hmbown/CodeWhale/issues/new/choose)
+वर्कफ़्लो असहज है, तो [issue खोलें](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)
 या [pull request भेजें](CONTRIBUTING.md)। पहले योगदान का स्वागत है, और स्वीकार किए गए काम का
 श्रेय योगदानकर्ताओं के पास रहता है। [रिपॉज़िटरी की संरचना](CONTRIBUTING.md#project-structure)
 शुरुआत के लिए अच्छी जगह है।

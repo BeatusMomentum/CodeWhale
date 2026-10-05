@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 يقرأ Codewhale مشروعك ويعدّل الملفات ويشغّل الأوامر ويتحقق من عمله بنفسه — في طرفيتك،
 باستخدام نموذج مستضاف أو محلي تختاره.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -151,7 +151,7 @@ codewhale exec "fix the failing tests and explain what changed"
 
 نرحّب ببلاغات الأخطاء وأفكار الميزات وطلبات pull request — سواء كنت تستخدم
 Codewhale منذ أشهر أو تجربه للمرة الأولى. إذا كان هناك مزوّد مفقود أو سير عمل
-غير مريح، فـ[افتح issue](https://github.com/Hmbown/CodeWhale/issues/new/choose)
+غير مريح، فـ[افتح issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)
 أو [أرسل pull request](CONTRIBUTING.md). المساهمات الأولى مرحَّب بها، ويحتفظ
 المساهمون بفضل العمل الذي يُقبل. و[بنية المستودع](CONTRIBUTING.md#project-structure)
 مكان جيد للبدء.

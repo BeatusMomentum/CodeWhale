@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale lit votre projet, modifie des fichiers, exécute des commandes et vérifie son propre
 travail — dans votre terminal, avec un modèle hébergé ou local de votre choix.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -155,7 +155,7 @@ d’utilisation sont activés par défaut et `codewhale config set telemetry fal
 Les signalements de bugs, les idées de fonctionnalités et les pull requests sont les bienvenus,
 que vous utilisiez Codewhale depuis des mois ou que vous l’essayiez pour la première fois.
 S’il manque un fournisseur ou si un workflow est peu pratique,
-[ouvrez une issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) ou
+[ouvrez une issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) ou
 [envoyez une pull request](CONTRIBUTING.md). Les premières contributions sont les bienvenues, et
 les personnes qui contribuent restent créditées pour le travail intégré.
 L’[organisation du dépôt](CONTRIBUTING.md#project-structure) est un bon point de départ.

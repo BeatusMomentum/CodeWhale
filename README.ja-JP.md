@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale はプロジェクトを読み、ファイルを編集し、コマンドを実行して、自分の作業を確認します。
 ターミナル上で、あなたが選んだホスト型またはローカルのモデルを使います。
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -147,7 +147,7 @@ Codewhale はあなたのマシン上で、あなたが与えたアクセス権�
 
 バグ報告、機能のアイデア、プルリクエストを歓迎します。Codewhale を何か月も使っている方も、初めて試す方も同じです。
 プロバイダーが足りない、あるいはワークフローが使いにくいと感じたら、
-[issue を作成](https://github.com/Hmbown/CodeWhale/issues/new/choose)するか、
+[issue を作成](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)するか、
 [プルリクエストを送って](CONTRIBUTING.md)ください。初めてのコントリビュートも歓迎で、
 取り込まれた作業の貢献者としてのクレジットは保たれます。
 [リポジトリの構成](CONTRIBUTING.md#project-structure)が最初の手がかりになります。

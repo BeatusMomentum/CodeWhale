@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale llegeix el teu projecte, edita fitxers, executa ordres i comprova la seva
 pròpia feina — al teu terminal, amb un model allotjat o local que tu tries.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -158,7 +158,7 @@ els desactiva.
 Els informes d’errors, les idees de funcionalitats i els pull requests són
 benvinguts, tant si fa mesos que fas servir Codewhale com si el proves per
 primera vegada. Si falta un proveïdor o un flux de treball resulta incòmode,
-[obre un issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) o
+[obre un issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) o
 [envia un pull request](CONTRIBUTING.md). Les primeres contribucions són
 benvingudes, i qui contribueix conserva el crèdit pel treball que s’hi integra.
 L’[estructura del repositori](CONTRIBUTING.md#project-structure) és un bon punt

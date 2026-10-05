@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -12,7 +12,7 @@ Codewhale은 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하
 스스로 확인합니다. 터미널에서, 사용자가 고른 호스팅 모델 또는 로컬 모델로
 동작합니다.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -159,7 +159,7 @@ Codewhale은 사용자의 컴퓨터에서 사용자가 부여한 권한으로 �
 
 버그 신고, 기능 제안, 풀 리퀘스트를 환영합니다. Codewhale을 몇 달째 쓰고 있든
 처음 써 보든 상관없습니다. 빠진 제공업체가 있거나 불편한 작업 흐름이 있다면
-[이슈를 열거나](https://github.com/Hmbown/CodeWhale/issues/new/choose)
+[이슈를 열거나](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)
 [풀 리퀘스트를 보내 주세요](CONTRIBUTING.md). 첫 기여도 환영하며, 반영된 작업의
 기여 이력은 기여자에게 남습니다.
 [저장소 구조](CONTRIBUTING.md#project-structure)에서 시작하면 좋습니다.

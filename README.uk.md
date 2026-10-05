@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale читає ваш проєкт, редагує файли, виконує команди та перевіряє власну
 роботу — у вашому терміналі, з хмарною чи локальною моделлю на ваш вибір.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -162,7 +162,7 @@ macOS; bubblewrap у Linux вмикається окремо). `/preview-request
 Звіти про помилки, ідеї та pull request вітаються — користуєтеся ви Codewhale
 вже місяцями чи пробуєте вперше. Якщо бракує провайдера або якийсь сценарій
 незручний,
-[відкрийте issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) або
+[відкрийте issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) або
 [надішліть pull request](CONTRIBUTING.md). Перші внески теж вітаються, а автори
 зберігають визнання за прийняту роботу. Добра відправна точка —
 [структура репозиторію](CONTRIBUTING.md#project-structure).

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -12,7 +12,7 @@ Codewhale đọc dự án của bạn, chỉnh sửa tệp, chạy lệnh và t�
 của mình, ngay trong terminal, với mô hình lưu trữ trực tuyến hoặc mô hình cục
 bộ do bạn chọn.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -162,7 +162,7 @@ bật theo mặc định và `codewhale config set telemetry false` sẽ tắt c
 Chúng tôi hoan nghênh báo lỗi, ý tưởng tính năng và pull request, dù bạn đã dùng
 Codewhale nhiều tháng hay mới thử lần đầu. Nếu thiếu một nhà cung cấp hoặc một
 quy trình làm việc còn vướng víu, hãy
-[mở một issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) hoặc
+[mở một issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) hoặc
 [gửi pull request](CONTRIBUTING.md). Đóng góp đầu tiên luôn được chào đón, và
 người đóng góp được ghi nhận công sức cho phần việc được tích hợp.
 [Cấu trúc kho mã](CONTRIBUTING.md#project-structure) là nơi tốt để bắt đầu.

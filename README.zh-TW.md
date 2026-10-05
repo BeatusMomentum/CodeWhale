@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale 會讀取你的專案、編輯檔案、執行指令並檢查自己的成果——
 在你的終端機中，使用你選擇的託管模型或本機模型。
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -144,7 +144,7 @@ Codewhale 在你的機器上執行，只擁有你授予它的存取權限。核�
 
 歡迎提交錯誤回報、功能想法與拉取請求——無論你已使用 Codewhale 數月，還是第一次嘗試。
 如果缺少某個供應商，或某個工作流程不順手，
-請[提出 issue](https://github.com/Hmbown/CodeWhale/issues/new/choose)或
+請[提出 issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)或
 [送出拉取請求](CONTRIBUTING.md)。歡迎首次貢獻，
 被合併的成果會保留貢獻者的署名。
 [儲存庫結構](CONTRIBUTING.md#project-structure)是個不錯的起點。

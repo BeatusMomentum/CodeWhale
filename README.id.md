@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -12,7 +12,7 @@ Codewhale membaca proyek Anda, mengedit berkas, menjalankan perintah, dan
 memeriksa pekerjaannya sendiri, di terminal Anda, dengan model hosted atau lokal
 pilihan Anda.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -163,7 +163,7 @@ menonaktifkannya.
 Laporan bug, ide fitur, dan pull request sangat disambut, baik Anda sudah
 berbulan-bulan memakai Codewhale maupun baru mencobanya. Jika ada penyedia yang
 belum ada atau alur kerja yang terasa canggung,
-[buka issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) atau
+[buka issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) atau
 [kirim pull request](CONTRIBUTING.md). Kontribusi pertama disambut, dan
 kontributor tetap mendapat kredit atas pekerjaan yang digabungkan.
 [Struktur repositori](CONTRIBUTING.md#project-structure) adalah tempat yang baik

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -11,7 +11,7 @@
 Codewhale projenizi okur, dosyaları düzenler, komutları çalıştırır ve kendi işini
 kontrol eder — terminalinizde, seçtiğiniz barındırılan veya yerel bir modelle.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -153,7 +153,7 @@ açıktır ve `codewhale config set telemetry false` bunları kapatır.
 
 Hata raporları, özellik fikirleri ve pull request'ler memnuniyetle karşılanır — ister
 Codewhale'i aylardır kullanıyor olun, ister ilk kez deneyin. Bir sağlayıcı eksikse veya
-bir iş akışı zahmetliyse [bir issue açın](https://github.com/Hmbown/CodeWhale/issues/new/choose)
+bir iş akışı zahmetliyse [bir issue açın](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)
 ya da [pull request gönderin](CONTRIBUTING.md). İlk katkılar memnuniyetle karşılanır ve
 katkıda bulunanlar, kabul edilen işin hakkını korur. [Depo yapısı](CONTRIBUTING.md#project-structure)
 başlamak için iyi bir yerdir.

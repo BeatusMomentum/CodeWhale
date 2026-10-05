@@ -10,7 +10,7 @@
 Codewhale reads your project, edits files, runs commands, and checks its own
 work — in your terminal, with a hosted or local model you choose.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -154,7 +154,7 @@ off.
 Bug reports, feature ideas, and pull requests are welcome — whether you have
 used Codewhale for months or are trying it for the first time. If a provider is
 missing or a workflow is awkward,
-[open an issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) or
+[open an issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) or
 [send a pull request](CONTRIBUTING.md). First contributions are welcome, and
 contributors keep credit for the work that lands. The
 [repository layout](CONTRIBUTING.md#project-structure) is a good place to start.

@@ -50,11 +50,11 @@ compatibility.
    `wingetcreate` or a manual PR that adds `manifests/h/HunterBown/CodeWhale/X.Y.Z/`:
    ```bash
    wingetcreate update HunterBown.CodeWhale --version X.Y.Z --urls \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/CodeWhaleSetup.exe \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64-portable.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64.zip \
-     https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64-portable.zip
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/CodeWhaleSetup.exe \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-x64-portable.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64.zip \
+     https://github.com/codewhale-hq/CodeWhale/releases/download/vX.Y.Z/codewhale-windows-arm64-portable.zip
    ```
    The generated PR must pass the winget-pkgs validation workflow before merge.
 

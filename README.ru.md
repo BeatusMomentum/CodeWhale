@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:0b635e0eb430 -->
+<!-- source: README.md sha256:604da19bff2c -->
 <div align="center">
 
 <picture>
@@ -12,7 +12,7 @@ Codewhale читает ваш проект, редактирует файлы, �
 собственную работу — в вашем терминале, с облачной или локальной моделью на ваш
 выбор.
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -164,7 +164,7 @@ Codewhale работает на вашей машине с теми правам
 Отчёты об ошибках, идеи и pull request приветствуются — пользуетесь ли вы
 Codewhale уже месяцы или пробуете его впервые. Если не хватает провайдера или
 какой-то сценарий неудобен,
-[откройте issue](https://github.com/Hmbown/CodeWhale/issues/new/choose) или
+[откройте issue](https://github.com/codewhale-hq/CodeWhale/issues/new/choose) или
 [отправьте pull request](CONTRIBUTING.md). Первые вклады тоже приветствуются, а
 авторы сохраняют признание за принятую работу. Хорошая отправная точка —
 [структура репозитория](CONTRIBUTING.md#project-structure).
