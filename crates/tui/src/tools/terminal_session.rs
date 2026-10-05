@@ -867,7 +867,7 @@ pub struct TerminalRunTool;
 impl ToolSpec for TerminalRunTool {
     terminal_tool_common!(
         "terminal/run",
-        "Run a command in a persistent PTY shell session. cd, exports, shell functions, and activated environments persist across calls in this process. Identity and a non-secret last-known summary persist across restarts; prior shells are surfaced as stale/lost and are never reattached."
+        "Run a command in a persistent PTY shell session. cd, exports, shell functions, and activated environments persist across calls in this process. Identity and a non-secret last-known summary persist across restarts; prior shells are surfaced as stale/lost and are never reattached. On timeout the wait is abandoned but the command keeps running in the session (use terminal/wait or cancel). (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"command":{"type":"string"},"session":{"type":"string","default":"term-1"},"timeout_secs":{"type":"integer","default":120}},"required":["command"]})
@@ -914,7 +914,7 @@ pub struct TerminalSendTool;
 impl ToolSpec for TerminalSendTool {
     terminal_tool_common!(
         "terminal/send",
-        "Send raw input to a live persistent terminal session. Use a literal ETX control byte to interrupt an interactive process. A prior-process shell is reported as stale/lost rather than reattached."
+        "Send raw input to a live persistent terminal session. Use a literal ETX control byte to interrupt an interactive process. A prior-process shell is reported as stale/lost rather than reattached. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"},"text":{"type":"string"},"wait_ms":{"type":"integer","default":250}},"required":["session","text"]})
@@ -956,7 +956,7 @@ pub struct TerminalWaitTool;
 impl ToolSpec for TerminalWaitTool {
     terminal_tool_common!(
         "terminal/wait",
-        "Wait for the current foreground command in a live persistent terminal session and return buffered output. A prior-process shell is reported as stale/lost rather than reattached."
+        "Wait for the current foreground command in a live persistent terminal session and return buffered output. A prior-process shell is reported as stale/lost rather than reattached. Output buffer holds at most 512KiB; older bytes are dropped silently. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"},"timeout_secs":{"type":"integer","default":120}},"required":["session"]})
@@ -995,7 +995,7 @@ pub struct TerminalCancelTool;
 impl ToolSpec for TerminalCancelTool {
     terminal_tool_common!(
         "terminal/cancel",
-        "Interrupt the running foreground command with ETX. The live terminal session survives and can be reused; its non-secret summary persists."
+        "Interrupt the running foreground command with ETX. The live terminal session survives and can be reused; its non-secret summary persists. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"]})
@@ -1039,7 +1039,7 @@ pub struct TerminalResetTool;
 impl ToolSpec for TerminalResetTool {
     terminal_tool_common!(
         "terminal/reset",
-        "Kill and recreate a persistent terminal session with a fresh environment. This loses live cd, exports, functions, activated environments, and running work while retaining the prior historical summary."
+        "Kill and recreate a persistent terminal session with a fresh environment. This loses live cd, exports, functions, activated environments, and running work while retaining the prior historical summary. (Unix only)"
     );
     fn input_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"]})
@@ -1127,6 +1127,37 @@ mod tests {
         assert!(tail.ends_with("error: the last line é\n"), "{tail:?}");
         assert!(tail.len() > OUTPUT_LIMIT / 2, "tail kept only {tail:?}");
         assert_eq!(head.len() + omitted + tail.len(), input.len());
+    }
+
+    // The whole family is compiled and registered on Unix only, a run's
+    // timeout abandons the wait without stopping the command, and the output
+    // ring silently drops the oldest bytes past 512KiB — the descriptions
+    // must say all three so the model can plan around them.
+    #[test]
+    fn terminal_descriptions_disclose_platform_and_wait_semantics() {
+        let descriptions = [
+            (TerminalRunTool.name(), TerminalRunTool.description()),
+            (TerminalSendTool.name(), TerminalSendTool.description()),
+            (TerminalWaitTool.name(), TerminalWaitTool.description()),
+            (TerminalCancelTool.name(), TerminalCancelTool.description()),
+            (TerminalResetTool.name(), TerminalResetTool.description()),
+        ];
+        for (name, description) in descriptions {
+            assert!(
+                description.contains("(Unix only)"),
+                "{name} must disclose its platform restriction: {description}"
+            );
+        }
+        assert!(
+            TerminalRunTool
+                .description()
+                .contains("the command keeps running in the session"),
+            "terminal/run must disclose that a timeout abandons the wait, not the command"
+        );
+        assert!(
+            TerminalWaitTool.description().contains("512KiB"),
+            "terminal/wait must disclose the retained-output bound"
+        );
     }
 
     #[test]
