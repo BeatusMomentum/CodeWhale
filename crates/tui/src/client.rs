@@ -3381,8 +3381,10 @@ impl CodewhaleClient {
     /// Activated for model-list authorities that are not satisfied by the
     /// cross-provider Models.dev snapshot: OpenRouter, named live gateways,
     /// and Baseten's account-scoped endpoint (no static snapshot can serve a
-    /// per-credential roster). Every other custom host is an ordinary
-    /// provider served by Models.dev plus its configured models (#6289).
+    /// per-credential roster). Custom OpenAI-compatible hosts are included
+    /// too: a private relay is not in the Models.dev snapshot, so without a
+    /// probe its `/model` picker stays empty even though the chat route
+    /// already talks to the same endpoint (#6289 widened).
     /// The refresh is non-fatal: on failure, persisted prior rows and static
     /// seeds remain available with a typed failed receipt.
     pub fn spawn_active_provider_catalog_refresh(config: &Config) {
@@ -3395,21 +3397,11 @@ impl CodewhaleClient {
                 return;
             };
             let provider = identity.provider;
-            let is_baseten_endpoint = provider == ProviderKind::Custom
-                && codewhale_config::catalog::endpoint_is_baseten(
-                    &config.base_url_for_route(&identity),
-                );
-            if !matches!(
-                provider,
-                ProviderKind::Openrouter
-                    | ProviderKind::Telecomjs
-                    | ProviderKind::Edenai
-                    | ProviderKind::Zenmux
-                    | ProviderKind::Concentrate
-                    | ProviderKind::Codewhale
-                    | ProviderKind::Ollama
-            ) && !is_baseten_endpoint
-            {
+            // Custom hosts include Baseten (its `/models` dialect is detected
+            // at fetch time) and every other custom host. A private route is
+            // the only place its roster exists, and a failed probe stays
+            // non-fatal.
+            if !crate::provider_catalog_live::provider_owns_live_catalog(provider) {
                 return;
             }
 
