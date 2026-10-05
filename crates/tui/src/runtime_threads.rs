@@ -1279,9 +1279,12 @@ fn projects_tool_history(item: &TurnItemRecord) -> bool {
 /// The result a rebuilt history must give a tool call whose outcome the turn
 /// store never recorded, or `None` when nothing is missing.
 ///
-/// A call that failed, was interrupted, or was canceled can be persisted as a
-/// single `tool_call` item that carries the call alone: the failure text lives
-/// on the item's own `detail`, and no `tool_result_for` item follows. Rebuilding
+/// A call that was interrupted or canceled can be persisted as a single
+/// `tool_call` item that carries the call alone, and so can a call that failed
+/// under a runtime older than #6803, which kept the failure text on the item's
+/// own `detail` without marking it `tool_result_for`. (A failure recorded now
+/// carries that marker, so the record answers it like any completed call and
+/// nothing is missing here.) Rebuilding
 /// only the call leaves it unanswered, which a provider rejects outright —
 /// `No tool output found for tool call …`. The missing result is also what
 /// stopped the first of two responses from flushing, so the rebuild glued them
@@ -16694,6 +16697,18 @@ impl RuntimeThreadManager {
                                 item.summary =
                                     summarize_text(&format!("{name} failed: {err}"), SUMMARY_LIMIT);
                                 item.detail = Some(err);
+                                // The engine answered this call with an error
+                                // result the model received, so the record
+                                // holds that answer the same way a completed
+                                // or `success: false` call holds its own: the
+                                // started identity stays, `detail` is the
+                                // result, and the item is marked as the call's
+                                // result. Without the marker a restart rebuilt
+                                // a call nothing answered (#6803).
+                                if let Some(Value::Object(meta)) = item.metadata.as_mut() {
+                                    meta.insert("tool_result_for".to_string(), json!(id));
+                                    meta.insert("is_error".to_string(), json!(true));
+                                }
                             }
                         }
                         self.store.save_item(&item)?;

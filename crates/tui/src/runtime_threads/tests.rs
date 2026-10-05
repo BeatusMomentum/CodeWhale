@@ -22518,6 +22518,130 @@ mod execution_identity {
         );
         Ok(())
     }
+
+    /// #6803: a tool that fails — a `read` of a missing file — is answered
+    /// with an error result the model receives. That answer must live in the
+    /// record itself (`tool_result_for` and `is_error` on the failed item, as a
+    /// completed call records its own), so a runtime restarted on the same
+    /// home rebuilds the call together with its result rather than a
+    /// `function_call` the provider rejects with `No tool output found`.
+    #[tokio::test]
+    async fn a_failed_tool_call_records_its_result_and_replays_after_restart() -> Result<()> {
+        let runtime = test_runtime_dir();
+        let manager = test_manager(runtime.clone())?;
+        let thread = manager.create_thread(Default::default()).await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "read a file that is not there".into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(_))
+        ));
+        harness
+            .tx_event
+            .send(EngineEvent::TurnStarted {
+                turn_id: turn.id.clone(),
+                created_at: Utc::now(),
+                route: None,
+                submission_id: None,
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallStarted {
+                id: "host-read".into(),
+                name: "read".into(),
+                input: json!({"path": "missing.txt"}),
+                model_call: Some(ModelToolCall {
+                    provider_id: "call_00_missing".into(),
+                    caller: None,
+                    thought_signature: None,
+                }),
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallComplete {
+                id: "host-read".into(),
+                name: "read".into(),
+                result: Err(crate::tools::spec::ToolError::execution_failed(
+                    "missing.txt: No such file or directory",
+                )),
+                model_call: None,
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        wait_for_terminal_turn(&manager, &turn.id).await?;
+
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        let failed = detail
+            .items
+            .iter()
+            .find(|item| {
+                item.metadata
+                    .as_ref()
+                    .is_some_and(|meta| meta["tool_use_id"] == "host-read")
+            })
+            .context("failed call")?;
+        assert_eq!(failed.status, TurnItemLifecycleStatus::Failed);
+        let meta = failed.metadata.as_ref().unwrap();
+        assert_eq!(meta["tool_result_for"], "host-read");
+        assert_eq!(meta["is_error"], true);
+        assert_eq!(meta["provider_tool_use_id"], "call_00_missing");
+
+        // Restart on the same home: the next request is rebuilt from the
+        // persisted records alone.
+        drop(harness);
+        drop(manager);
+        let manager = test_manager(runtime)?;
+        let reopened = manager.get_thread(&thread.id).await?;
+        let messages = manager.restore_thread_messages(&reopened)?;
+        let blocks: Vec<&ContentBlock> = messages.iter().flat_map(|m| &m.content).collect();
+        let calls: Vec<&ContentBlock> = blocks
+            .iter()
+            .copied()
+            .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            .collect();
+        let results: Vec<&ContentBlock> = blocks
+            .iter()
+            .copied()
+            .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1, "the failed call is replayed");
+        assert_eq!(results.len(), 1, "and answered exactly once");
+        assert_eq!(calls[0].tool_call_key(), results[0].tool_call_key());
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        } = results[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(tool_use_id, "call_00_missing");
+        assert_eq!(*is_error, Some(true));
+        assert!(content.contains("No such file or directory"), "{content}");
+        Ok(())
+    }
 }
 
 #[tokio::test]
