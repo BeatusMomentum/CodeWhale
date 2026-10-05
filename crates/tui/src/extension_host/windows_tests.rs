@@ -554,6 +554,36 @@ fn windows_profile_retirement_removes_only_its_grants_and_inherited_data_on_rest
 }
 
 #[test]
+fn windows_bundle_directory_listing_never_grants_children_and_retires_exactly() {
+    let root = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("builtin-private.json");
+    fs::write(&sibling, b"retained private data").unwrap();
+    let before = acl_snapshot_view(root.path(), None, true);
+    let sibling_before = acl_snapshot_view(&sibling, None, true);
+    let sandbox = NativeSandbox {
+        profile: Arc::new(Profile::create().unwrap()),
+        _assets: Arc::new(tempfile::tempdir().unwrap()),
+        program: PathBuf::new(),
+        data: root.path().to_path_buf(),
+    };
+    sandbox.grant_directory(root.path()).unwrap();
+    assert_ne!(acl_snapshot_view(root.path(), None, true), before);
+    assert_eq!(
+        acl_snapshot_view(root.path(), Some(sandbox.profile.sid), true),
+        before,
+        "directory listing must preserve every pre-existing ACE and control bit"
+    );
+    assert_no_profile_grant(&sibling, sandbox.profile.sid);
+    let created = root.path().join("created-after-grant.json");
+    fs::write(&created, b"private after admission").unwrap();
+    assert_no_profile_grant(&created, sandbox.profile.sid);
+    drop(sandbox);
+    assert_eq!(acl_snapshot_view(root.path(), None, true), before);
+    assert_eq!(acl_snapshot_view(&sibling, None, true), sibling_before);
+    assert_eq!(fs::read(&created).unwrap(), b"private after admission");
+}
+
+#[test]
 fn windows_profile_directory_budget_and_recorded_identity_refuse_before_overwrite() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("first"), b"one").unwrap();
@@ -567,13 +597,17 @@ fn windows_profile_directory_budget_and_recorded_identity_refuse_before_overwrit
     let profile = Profile::create().unwrap();
     let path = root.path().join("first");
     let original = File::open(&path).unwrap();
-    profile.remember(&path, &original, false).unwrap();
+    profile.remember(&path, &original, GrantKind::File).unwrap();
     let identity = profile.grants.lock().unwrap().get(&path).unwrap().identity;
     drop(original);
     fs::rename(&path, root.path().join("moved-original")).unwrap();
     fs::write(&path, b"different object").unwrap();
     let replacement = File::open(&path).unwrap();
-    assert!(profile.remember(&path, &replacement, false).is_err());
+    assert!(
+        profile
+            .remember(&path, &replacement, GrantKind::File)
+            .is_err()
+    );
     assert_eq!(
         profile.grants.lock().unwrap().get(&path).unwrap().identity,
         identity

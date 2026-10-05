@@ -50,7 +50,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
 
-use crate::dependencies::HostRuntime;
+use crate::dependencies::{HostRuntime, HostRuntimeKind};
 use crate::fleet::files::WindowsDirectory;
 use crate::process_tree::ProcessTree;
 
@@ -91,7 +91,17 @@ struct Profile {
 }
 struct GrantScope {
     identity: (u32, u64),
-    tree: bool,
+    kind: GrantKind,
+}
+/// What one recorded ACE covers, so retirement edits exactly that object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrantKind {
+    /// One regular file.
+    File,
+    /// One directory's own entry list: no inheritance, no children.
+    Directory,
+    /// A directory and everything below it (inherited and explicit ACEs).
+    Tree,
 }
 // A retained exact profile SID, never a parsed/guessed orphan identity.
 struct RetiredProfile {
@@ -147,14 +157,14 @@ impl Profile {
 }
 
 impl Profile {
-    fn remember(&self, path: &Path, file: &File, tree: bool) -> io::Result<()> {
+    fn remember(&self, path: &Path, file: &File, kind: GrantKind) -> io::Result<()> {
         let value = crate::plugins::windows_file_identity(file)?;
         let mut grants = self
             .grants
             .lock()
             .map_err(|_| io::Error::other("profile grant accounting poisoned"))?;
         if let Some(old) = grants.get(path) {
-            if old.identity != (value.volume, value.index) || old.tree != tree {
+            if old.identity != (value.volume, value.index) || old.kind != kind {
                 return Err(io::Error::other(
                     "recorded profile grant identity changed; refusing overwrite",
                 ));
@@ -168,7 +178,7 @@ impl Profile {
             path.to_path_buf(),
             GrantScope {
                 identity: (value.volume, value.index),
-                tree,
+                kind,
             },
         );
         Ok(())
@@ -228,7 +238,8 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
     if !root.try_exists()? {
         return Ok(());
     }
-    let root_pin = if scope.tree {
+    let directory = scope.kind != GrantKind::File;
+    let root_pin = if directory {
         WindowsDirectory::open_acl(root)?
     } else {
         WindowsDirectory::open(
@@ -237,7 +248,7 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
         )?
     };
     let root_file;
-    let file = if scope.tree {
+    let file = if directory {
         root_pin.acl_handle()?
     } else {
         root_file = acl_file_with_share(root, 1 | 2 | 4)?;
@@ -253,7 +264,7 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
     // children cannot inherit this retired SID. The kernel write never
     // propagates; every child is independently fenced and updated.
     edit_acl(file, sid, 0, 0, REVOKE_ACCESS)?;
-    if !scope.tree {
+    if scope.kind != GrantKind::Tree {
         return Ok(());
     }
     let mut pending = Vec::new();
@@ -429,6 +440,22 @@ impl NativeSandbox {
                 "grant host bundle",
                 sandbox.grant_file(bundle, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, true),
             )?;
+            // Bun's resolver lists the directory holding its entry file and
+            // refuses the entry when it cannot ("Module not found"); it treats
+            // unreadable ancestors as opaque. List that one directory only:
+            // no inheritance, so its other files (embedded builtin modules,
+            // notices) stay denied, and the Builtin's data beside it too.
+            // Node loads the entry by path and needs no listing.
+            if runtime.kind == HostRuntimeKind::Bun && !runtime.compiled {
+                in_step(
+                    "list host bundle directory",
+                    sandbox.grant_directory(
+                        bundle
+                            .parent()
+                            .ok_or_else(|| io::Error::other("host bundle has no parent"))?,
+                    ),
+                )?;
+            }
             fs::create_dir_all(data.join("tmp"))?;
             in_step("grant data directory", sandbox.grant_tree(data, true))?;
             in_step("isolation probe", sandbox.probe(runtime, memory_cap))?;
@@ -447,7 +474,8 @@ impl NativeSandbox {
     fn grant_tree(&self, root: &Path, writable: bool) -> io::Result<()> {
         let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
         let root_pin = WindowsDirectory::open_acl(root)?;
-        self.profile.remember(root, root_pin.acl_handle()?, true)?;
+        self.profile
+            .remember(root, root_pin.acl_handle()?, GrantKind::Tree)?;
         let access = FILE_GENERIC_READ
             | FILE_GENERIC_EXECUTE
             | if writable {
@@ -498,6 +526,21 @@ impl NativeSandbox {
         Ok(())
     }
 
+    /// Read/list/traverse on exactly one directory object. Not inherited:
+    /// each child keeps only the grants it is given explicitly.
+    fn grant_directory(&self, directory: &Path) -> io::Result<()> {
+        let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+        let pin = WindowsDirectory::open_acl(directory)?;
+        self.profile
+            .remember(directory, pin.acl_handle()?, GrantKind::Directory)?;
+        set_acl(
+            pin.acl_handle()?,
+            self.profile.sid,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            0,
+        )
+    }
+
     fn grant_file(&self, path: &Path, access: u32, remember: bool) -> io::Result<()> {
         let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
         let pin = WindowsDirectory::open(
@@ -528,7 +571,7 @@ impl NativeSandbox {
         }
         let file = acl_file(path)?;
         if remember {
-            self.profile.remember(path, &file, false)?;
+            self.profile.remember(path, &file, GrantKind::File)?;
         }
         set_acl(&file, self.profile.sid, access, 0)
     }
