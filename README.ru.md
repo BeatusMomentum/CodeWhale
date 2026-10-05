@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:bf9d6c3588f0 -->
+<!-- source: README.md sha256:0b635e0eb430 -->
 <div align="center">
 
 <picture>
@@ -46,8 +46,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 <summary><b>Windows, npm, Cargo и другие способы</b></summary>
 
 ```bash
-winget install Hmbown.CodeWhale     # Windows (or the installer from GitHub Releases)
-scoop install codewhale             # Windows, Scoop main bucket (may lag a release)
+winget install HunterBown.CodeWhale  # Windows x64 (or Scoop, or the installer from GitHub Releases)
 npm install -g codewhale            # wraps the same release binaries
 cargo install codewhale-cli --locked  # build from crates.io
 ```

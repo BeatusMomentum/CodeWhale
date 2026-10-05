@@ -1,9 +1,9 @@
-# Hmbown.CodeWhale — winget singleton manifest for CodeWhale (single binary)
+# HunterBown.CodeWhale — winget singleton manifest for CodeWhale (single binary)
 # PackageIdentifier follows the publisher convention used by the Homebrew formula (codewhale).
 # Canonical maintenance instructions live in packaging/winget/README.md; the generator mirrors these exact bytes to .winget/.
 # Winget installs only `codewhale` + `codew`; compatibility release filenames are not installed commands.
 
-PackageIdentifier: Hmbown.CodeWhale
+PackageIdentifier: HunterBown.CodeWhale
 PackageVersion: 0.9.6
 DefaultLocale: en-US
 ManifestType: singleton

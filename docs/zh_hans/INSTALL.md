@@ -920,20 +920,25 @@ codewhale --version
 
 Scoop 清单维护在本仓库的发布工作流之外，可能落后于 GitHub/npm/Cargo 的发布。当你需要立即拿到最新版本时，请使用 npm 或从 GitHub 手动下载发布资源。
 
-#### Windows winget（v0.9.5+）
+#### Windows winget
 
-Codewhale 为 `Hmbown.CodeWhale` 发布 winget 清单（解决 #1561）。Winget 只安装 `codewhale` + `codew` 命令。GitHub Releases 保留字节完全一致的 `codewhale-tui-*` 文件名，仅用于兼容旧版更新器；它们不是第三个已安装命令。
+已发布的 winget 包是 **`HunterBown.CodeWhale`**（2026-10-04 在
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/h/HunterBown/CodeWhale)
+核实；最新发布版本为 0.10.0）。它是便携式 x64 包：winget 下载
+`codewhale-tui-windows-x64.exe`，将其安装为 `codewhale` 命令，并安装 Microsoft Visual C++ 2015+ x64 运行库。
 
 ```powershell
-winget install Hmbown.CodeWhale
+winget install HunterBown.CodeWhale
 codewhale --version
 ```
 
-清单位于 [`packaging/winget/Hmbown.CodeWhale.yaml`](../../packaging/winget/Hmbown.CodeWhale.yaml)（在 [`.winget/Hmbown.CodeWhale.yaml`](../../.winget/Hmbown.CodeWhale.yaml) 也镜像了一份），列出了 NSIS 安装器（`CodeWhaleSetup.exe`，每用户安装，会把 `%LOCALAPPDATA%\Programs\CodeWhale\bin` 加入用户 PATH）和便携 ZIP 备选（`codewhale-windows-x64.zip` / `codewhale-windows-arm64.zip`）。winget 会自动选择匹配的架构；两者都安装单二进制（`codewhale.exe` + `codew.exe`）。ZIP 里还包含 `codewhale.bat`。请双击这个启动器（而不是原始的 `.exe`），这样如果已安装 Windows Terminal，第一个窗口就是 Windows Terminal。
+使用 `winget upgrade HunterBown.CodeWhale` 或 `codewhale update` 更新。每个版本在 GitHub Release 之后都要经过 winget-pkgs 审核，因此 winget 可能落后于 GitHub/npm/Cargo；需要立即获得最新版本时，请使用 npm 或 GitHub Release 资源。
 
-通过 `winget upgrade Hmbown.CodeWhale` 或 `codewhale update` 更新。winget 包维护在本仓库的发布工作流之外，可能比 GitHub/npm/Cargo 的发布滞后一个验证周期——需要立即拿到最新版本时，请使用 npm 或 GitHub Release 资源。如果 `winget install` 报告哈希不匹配，请校验同一标签的 `codewhale-artifacts-sha256.txt`，并通过 `packaging/winget/generate-winget-manifest.sh` 重新生成清单（见 [`packaging/winget/README.md`](../../packaging/winget/README.md)），然后重新提交到 [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs)。
+winget 方式的已知限制：
 
-> **Windows ARM64 说明。** NSIS 安装器目前只包含 x64 二进制。Windows ARM64 用户应通过 `winget install Hmbown.CodeWhale`（ARM64 ZIP）安装，或在原生 ARM64 Node.js 下运行 `npm install -g codewhale`，或直接下载 `codewhale-windows-arm64.zip`——所有这些路径安装的都是原生 ARM64 二进制。
+* **仅 x64。** 已发布的清单没有 ARM64 安装包。在 Windows ARM64 上，请在原生 ARM64 Node.js 下运行 `npm install -g codewhale`，或从 GitHub Releases 下载 `codewhale-windows-arm64.zip`。
+* **仅安装 `codewhale`。** winget 不安装简短别名 `codew`；请使用 `codewhale`。
+* 本仓库中的清单（`packaging/winget/`）不是 winget 实际提供的清单；见 [`packaging/winget/README.md`](../../packaging/winget/README.md)。
 
 #### Windows NSIS 安装器
 

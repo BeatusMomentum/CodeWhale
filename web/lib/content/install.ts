@@ -5,9 +5,10 @@
 export const INSTALL_COMMANDS = {
   shell: "curl -fsSL https://codewhale.net/install.sh | sh",
   npm: "npm install -g codewhale",
-  // Scoop's main bucket carries `codewhale` (checked 2026-10-04; it can lag a
-  // release). There is no winget manifest yet, so none is advertised.
-  windows: "scoop install codewhale",
+  // winget-pkgs publishes `HunterBown.CodeWhale` (portable x64, `codewhale`
+  // command; checked 2026-10-04, latest 0.10.0). Scoop and the GitHub Release
+  // installer are the alternatives in the install guide.
+  windows: "winget install HunterBown.CodeWhale",
 } as const;
 
 export const INSTALL_COPY = {

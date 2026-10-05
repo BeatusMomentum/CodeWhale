@@ -43,8 +43,7 @@ Upgrade any time with `codewhale update`.
 <summary><b>Windows, npm, Cargo, and other routes</b></summary>
 
 ```bash
-winget install Hmbown.CodeWhale     # Windows (or the installer from GitHub Releases)
-scoop install codewhale             # Windows, Scoop main bucket (may lag a release)
+winget install HunterBown.CodeWhale  # Windows x64 (or Scoop, or the installer from GitHub Releases)
 npm install -g codewhale            # wraps the same release binaries
 cargo install codewhale-cli --locked  # build from crates.io
 ```
