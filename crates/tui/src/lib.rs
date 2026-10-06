@@ -1544,7 +1544,8 @@ enum McpCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Connect to MCP servers and report status
+    /// Connect to MCP servers and report status (does not attach to a
+    /// running session)
     Connect {
         /// Optional server name to connect to
         #[arg(value_name = "SERVER")]
@@ -11578,6 +11579,40 @@ fn mcp_server_listing(command: Option<&str>, args: &[String], url: Option<&str>)
     }
 }
 
+/// Printed after `mcp connect` and `mcp validate` succeed. docs/MCP.md
+/// § Connection Lifecycle already states that these commands inspect their
+/// own process's pool and never attach transports to a running TUI or exec
+/// session; the success line alone reads as a real fix for the running
+/// session otherwise (issue #6828).
+const MCP_OWN_PROCESS_NOTE: [&str; 2] = [
+    "Note: this command ran in its own process; it does not attach to a running TUI or exec session.",
+    "In a running session, use in-session discovery: search for the server name or an mcp_<server>_ tool name, or call one of its tools directly.",
+];
+
+fn print_mcp_own_process_note() {
+    for line in MCP_OWN_PROCESS_NOTE {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod mcp_own_process_note_tests {
+    use super::MCP_OWN_PROCESS_NOTE;
+
+    #[test]
+    fn mcp_own_process_note_states_the_session_boundary_and_recovery() {
+        let note = MCP_OWN_PROCESS_NOTE.join("\n");
+        assert!(
+            note.contains("own process") && note.contains("does not attach"),
+            "the connect/validate note must name the process boundary: {note}"
+        );
+        assert!(
+            note.contains("search for the server name"),
+            "the note must point at in-session discovery: {note}"
+        );
+    }
+}
+
 async fn run_mcp_command(
     config: &Config,
     workspace: &Path,
@@ -11676,10 +11711,12 @@ async fn run_mcp_command(
                     return Err(err);
                 }
                 println!("Connected to MCP server: {name}");
+                print_mcp_own_process_note();
             } else {
                 let errors = pool.connect_all().await;
                 if errors.is_empty() {
                     println!("Connected to all configured MCP servers.");
+                    print_mcp_own_process_note();
                 } else {
                     for (name, err) in errors {
                         eprintln!("Failed to connect {name}: {err:#}");
@@ -11884,6 +11921,7 @@ async fn run_mcp_command(
             let errors = pool.connect_all().await;
             if errors.is_empty() {
                 println!("MCP config is valid. All enabled servers connected.");
+                print_mcp_own_process_note();
                 return Ok(());
             }
             eprintln!("MCP validation failed:");
