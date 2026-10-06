@@ -3769,8 +3769,8 @@ impl CodewhaleClient {
             .timeout(NON_STREAMING_HTTP_TIMEOUT);
         let request = match self.authorize_plugin_request(request).await {
             Ok(request) => request,
-            Err(error) => {
-                self.mark_request_failure(&format!("probe authorization failed: {error}"))
+            Err(_) => {
+                self.mark_request_failure("probe authorization failed")
                     .await;
                 return;
             }

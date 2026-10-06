@@ -938,12 +938,21 @@ fn oauth_endpoint_url(raw: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-fn oauth_http_client(purpose: &str) -> Result<reqwest::blocking::Client> {
-    crate::tls::reqwest_blocking_client_builder()
+fn oauth_http_client(endpoint: &reqwest::Url, purpose: &str) -> Result<reqwest::blocking::Client> {
+    let builder = crate::tls::reqwest_blocking_client_builder()
         // An issuer-approved endpoint cannot delegate credential-bearing forms
         // to a redirect destination, including HTTPS-to-HTTP downgrades.
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(OAUTH_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(OAUTH_REQUEST_TIMEOUT_SECS));
+    // Every caller admits this URL through oauth_endpoint_url. Its HTTP
+    // exception authorizes only a local exchange, never forwarding the form
+    // through an ambient system or environment proxy.
+    let builder = if endpoint.scheme() == "http" {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .build()
         .with_context(|| format!("Failed to build OAuth {purpose} client"))
 }
@@ -953,23 +962,6 @@ fn parse_oauth_json<T: serde::de::DeserializeOwned>(
     operation: &str,
 ) -> Result<(reqwest::StatusCode, T)> {
     let status = response.status();
-    // Join every content-type value: some test doubles stack a second one
-    // next to the body's implicit type, and the diagnostic must name what
-    // the server actually sent, not whichever header won the map lookup.
-    let content_type = {
-        let joined = response
-            .headers()
-            .get_all(reqwest::header::CONTENT_TYPE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if joined.is_empty() {
-            "missing".to_string()
-        } else {
-            joined
-        }
-    };
     let mut reader = response.take(OAUTH_RESPONSE_BODY_LIMIT + 1);
     let mut body = Vec::new();
     reader
@@ -985,9 +977,7 @@ fn parse_oauth_json<T: serde::de::DeserializeOwned>(
         } else {
             ""
         };
-        anyhow::anyhow!(
-            "{operation} returned HTTP {status} with content type {content_type}; expected JSON{limit}"
-        )
+        anyhow::anyhow!("{operation} returned HTTP {status}; expected JSON{limit}")
     })?;
     Ok((status, parsed))
 }
@@ -1079,7 +1069,7 @@ fn discover_oauth_endpoints(params: &OAuthProviderParams, issuer: &str) -> Resul
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     ))?;
-    let client = oauth_http_client("OIDC discovery")?;
+    let client = oauth_http_client(&discovery_url, "OIDC discovery")?;
     #[cfg(test)]
     crate::external_credentials::record_oauth_network();
     let response = client
@@ -1176,7 +1166,7 @@ fn request_device_grant(
     scopes: &str,
 ) -> Result<DeviceGrantResponse> {
     let device_authorization_endpoint = oauth_endpoint_url(device_authorization_endpoint)?;
-    let client = oauth_http_client("device-code")?;
+    let client = oauth_http_client(&device_authorization_endpoint, "device-code")?;
     let params = [("client_id", client_id), ("scope", scopes)];
     #[cfg(test)]
     crate::external_credentials::record_oauth_network();
@@ -1218,7 +1208,7 @@ fn poll_device_grant(
 ) -> Result<codewhale_config::device_code::DevicePollOutcome<OAuthTokenMaterial>> {
     use codewhale_config::device_code::DevicePollOutcome;
     let token_endpoint = oauth_endpoint_url(token_endpoint)?;
-    let client = oauth_http_client("device-code poll")?;
+    let client = oauth_http_client(&token_endpoint, "device-code poll")?;
     let params = [
         ("client_id", client_id),
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -1480,8 +1470,10 @@ impl OAuthFormClient for ReqwestOAuthFormClient {
             issuer == CHATGPT_OAUTH_ISSUER,
             "ChatGPT revocation issuer is invalid"
         );
-        let response = oauth_http_client("revocation discovery")?
-            .get(format!("{issuer}/.well-known/openid-configuration"))
+        let discovery_url =
+            oauth_endpoint_url(&format!("{issuer}/.well-known/openid-configuration"))?;
+        let response = oauth_http_client(&discovery_url, "revocation discovery")?
+            .get(discovery_url)
             .send()
             .context("ChatGPT revocation discovery failed")?;
         let (status, document): (_, Value) =
@@ -1507,7 +1499,7 @@ impl OAuthFormClient for ReqwestOAuthFormClient {
         let url = oauth_endpoint_url(url)?;
         #[cfg(test)]
         crate::external_credentials::record_oauth_network();
-        let client = oauth_http_client("form")?;
+        let client = oauth_http_client(&url, "form")?;
         let response = client
             .post(url)
             .form(form)
@@ -2428,7 +2420,7 @@ fn fetch_chatgpt_jwks(issuer: &str) -> Result<JwkSet> {
         "{}/.well-known/jwks.json",
         issuer.trim_end_matches('/')
     ))?;
-    let response = oauth_http_client("identity verification")?
+    let response = oauth_http_client(&url, "identity verification")?
         .get(url)
         .send()
         .context("ChatGPT identity verification keys could not be retrieved")?;
@@ -4432,8 +4424,9 @@ fn plugin_token_response(
     form: &[(&str, &str)],
     previous_refresh: Option<String>,
 ) -> Result<PluginOAuthTokens> {
-    let response = oauth_http_client("plugin token exchange")?
-        .post(&descriptor.token_endpoint)
+    let endpoint = oauth_endpoint_url(&descriptor.token_endpoint)?;
+    let response = oauth_http_client(&endpoint, "plugin token exchange")?
+        .post(endpoint)
         .form(form)
         .send()?;
     let (status, response): (_, PluginTokenResponse) =
@@ -5201,6 +5194,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oauth_loopback_forms_bypass_ambient_proxies() {
+        const PROBE_ENDPOINT: &str = "CODEWHALE_TEST_OAUTH_PROXY_ENDPOINT";
+        if let Ok(endpoint) = std::env::var(PROBE_ENDPOINT) {
+            let (status, _) = ReqwestOAuthFormClient
+                .post_form(&endpoint, &[("refresh_token", "synthetic-refresh")])
+                .expect("local OAuth form remains usable with an ambient proxy");
+            assert_eq!(status, 200);
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use wiremock::matchers::{body_string_contains, method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            let issuer = MockServer::start().await;
+            let proxy = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("refresh_token=synthetic-refresh"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&issuer)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(502))
+                .expect(0)
+                .mount(&proxy)
+                .await;
+            // A fresh process gives reqwest an uncontaminated proxy cache and
+            // keeps ambient proxy changes out of the shared test process.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "oauth::tests::oauth_loopback_forms_bypass_ambient_proxies",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_ENDPOINT, format!("{}/token", issuer.uri()))
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy");
+            for variable in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                child.env(variable, proxy.uri());
+            }
+            let output = tokio::task::spawn_blocking(move || child.output().unwrap())
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(issuer.received_requests().await.unwrap().len(), 1);
+            assert!(proxy.received_requests().await.unwrap().is_empty());
+        });
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_transports_never_forward_forms_to_redirect_destinations() {
         use wiremock::matchers::{method, path};
@@ -5620,21 +5680,21 @@ mod tests {
         assert!(message.contains("HTTP 400"), "{message}");
     }
 
-    /// Non-JSON answers name the content type, never the body.
+    /// Non-JSON answers disclose neither response metadata nor the body.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn device_transport_reports_non_json_without_echoing_body() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        // set_body_bytes carries no implicit content type, so the inserted
-        // text/html is the only one on the wire (set_body_string would
-        // stack text/plain next to it and the diagnostic would name both).
         Mock::given(method("POST"))
             .and(path("/oauth2/device-code"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes("<html>sentinel-body-bytes</html>".as_bytes())
-                    .insert_header("content-type", "text/html"),
+                    .insert_header(
+                        "content-type",
+                        "text/html; credential=sentinel-header-bytes",
+                    ),
             )
             .expect(1)
             .mount(&server)
@@ -5644,7 +5704,10 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes("<html>sentinel-body-bytes</html>".as_bytes())
-                    .insert_header("content-type", "text/html"),
+                    .insert_header(
+                        "content-type",
+                        "text/html; credential=sentinel-header-bytes",
+                    ),
             )
             .expect(1)
             .mount(&server)
@@ -5670,7 +5733,9 @@ mod tests {
             panic!("non-JSON poll must fail");
         };
         for message in [format!("{grant_error:#}"), format!("{poll_error:#}")] {
-            assert!(message.contains("text/html"), "{message}");
+            assert!(message.contains("HTTP 200"), "{message}");
+            assert!(message.contains("expected JSON"), "{message}");
+            assert!(!message.contains("sentinel-header-bytes"), "{message}");
             assert!(!message.contains("sentinel-body-bytes"), "{message}");
         }
     }
@@ -9329,35 +9394,54 @@ mod plugin_oauth_tests {
     async fn plugin_oauth_failed_refresh_preserves_secret_without_exposing_response() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/token"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error":"invalid_grant", "error_description":"secret-response-material"})))
-            .expect(1).mount(&server).await;
-        let mut config = descriptor();
-        config.issuer = server.uri();
-        config.authorization_endpoint = format!("{}/authorize", server.uri());
-        config.token_endpoint = format!("{}/token", server.uri());
-        let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
-            codewhale_secrets::InMemoryKeyringStore::default(),
-        ));
-        let raw = serde_json::to_string(&PluginOAuthTokens {
-            access_token: "still-valid".into(),
-            refresh_token: Some("refresh".into()),
-            expires_at: (now_unix_secs().unwrap() as u64).saturating_add(30),
-        })
-        .unwrap();
-        secrets.set("denied", &raw).unwrap();
-        let (error, unchanged) = tokio::task::spawn_blocking(move || {
-            let error = plugin_oauth_access_token_with_store("denied", &config, false, &secrets)
-                .unwrap_err();
-            (error.to_string(), secrets.get("denied").unwrap().unwrap())
-        })
-        .await
-        .unwrap();
-        assert!(error.contains("HTTP 400"));
-        assert!(!error.contains("secret-response-material"));
-        assert_eq!(unchanged, raw);
-        server.verify().await;
+        let responses = [
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "secret-response-material"
+            })),
+            ResponseTemplate::new(400)
+                .set_body_bytes(b"secret-response-material")
+                .insert_header(
+                    "content-type",
+                    "text/html; credential=secret-header-material",
+                ),
+        ];
+        for response in responses {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut config = descriptor();
+            config.issuer = server.uri();
+            config.authorization_endpoint = format!("{}/authorize", server.uri());
+            config.token_endpoint = format!("{}/token", server.uri());
+            let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
+                codewhale_secrets::InMemoryKeyringStore::default(),
+            ));
+            let raw = serde_json::to_string(&PluginOAuthTokens {
+                access_token: "still-valid".into(),
+                refresh_token: Some("refresh".into()),
+                expires_at: (now_unix_secs().unwrap() as u64).saturating_add(30),
+            })
+            .unwrap();
+            secrets.set("denied", &raw).unwrap();
+            let (error, unchanged) = tokio::task::spawn_blocking(move || {
+                let error =
+                    plugin_oauth_access_token_with_store("denied", &config, false, &secrets)
+                        .unwrap_err();
+                (error.to_string(), secrets.get("denied").unwrap().unwrap())
+            })
+            .await
+            .unwrap();
+            assert!(error.contains("HTTP 400"));
+            assert!(!error.contains("secret-response-material"));
+            assert!(!error.contains("secret-header-material"));
+            assert_eq!(unchanged, raw);
+            server.verify().await;
+        }
     }
     #[test]
     fn plugin_oauth_reviewed_provider_real_client_refresh_chat_catalog_and_revocation() {

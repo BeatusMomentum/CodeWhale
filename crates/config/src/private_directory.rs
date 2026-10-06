@@ -1304,9 +1304,11 @@ impl PrivateDirectory {
             )
         };
         #[cfg(target_os = "linux")]
+        // Use the kernel syscall because musl need not export a renameat2 wrapper.
         // SAFETY: same retained directory; NOREPLACE is required, never emulated by a check.
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 self.directory_handle.as_raw_fd(),
                 from.as_ptr(),
                 self.directory_handle.as_raw_fd(),
@@ -1569,6 +1571,34 @@ mod tests {
         assert!(!parent.directory.join("old.sock").exists());
         assert!(path.exists());
         drop((original, replacement));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn endpoint_move_refuses_to_replace_existing_socket() {
+        let root = root();
+        let parent = PrivateDirectory::admit(&root.path().join("run")).unwrap();
+        let original = UnixListener::bind(parent.directory.join("owner.sock")).unwrap();
+        let destination = UnixListener::bind(parent.directory.join("retired.sock")).unwrap();
+        let original_identity = parent.socket_identity("owner.sock").unwrap().unwrap();
+        let destination_identity = parent.socket_identity("retired.sock").unwrap().unwrap();
+
+        let error = parent
+            .move_socket_no_replace("owner.sock", "retired.sock")
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            parent.socket_identity("owner.sock").unwrap(),
+            Some(original_identity)
+        );
+        assert_eq!(
+            parent.socket_identity("retired.sock").unwrap(),
+            Some(destination_identity)
+        );
+        drop((original, destination));
     }
 
     #[test]

@@ -639,6 +639,9 @@ mod tests {
     /// request, a Python block, or an event send within the current round.
     #[tokio::test]
     async fn wall_clock_deadline_interrupts_pending_work_and_keeps_partial_result() {
+        let _home = crate::test_support::SealedHome::new();
+        use crate::dependencies::ExternalTool as _;
+        assert!(crate::dependencies::Python::resolve().is_some());
         for pending_model in [true, false] {
             let partial = if pending_model {
                 "```repl\nprint(_os.environ['RLM_CONTEXT_FILE'])\n```"
@@ -650,27 +653,37 @@ mod tests {
             let client = Arc::new(PendingAfterResponses(mock, 1));
             let (tx, mut rx) = mpsc::channel(32);
             let usage = RlmUsageAccumulator::new();
+            // Admission reads configuration and constructs the captured route.
+            // It is fixture setup, before this invocation's one-second budget.
+            let caller =
+                crate::core::engine::tests::rlm_host::caller_for(client.clone(), "root-model");
 
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                run_admitted_fixture(
-                    client.clone(),
-                    "root-model".to_string(),
-                    "long context".to_string(),
-                    None,
-                    "child-model".to_string(),
-                    tx,
-                    0,
-                    usage.clone(),
-                    tokio::time::Instant::now() + Duration::from_secs(1),
-                    Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
-                ),
+                caller.dispatch(crate::core::engine::rlm_host::RlmInvocation {
+                    prompt: "long context".to_string(),
+                    mode: crate::core::engine::rlm_host::RlmMode::Recursive { depth_remaining: 0 },
+                    max_tokens: None,
+                    task_instructions: None,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                    gate: Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
+                    events: Some(tx),
+                    usage: usage.clone(),
+                }),
             )
             .await
             .expect("the turn deadline must interrupt in-flight work");
 
             assert_eq!(result.termination, RlmTermination::Error);
-            assert_eq!(result.answer, partial);
+            assert_eq!(
+                result.answer,
+                partial,
+                "error={:?}, iterations={}, calls={}, trace={:?}",
+                result.error,
+                result.iterations,
+                client.0.call_count(),
+                result.trace
+            );
             assert_eq!(result.iterations, if pending_model { 2 } else { 1 });
             assert!(
                 result

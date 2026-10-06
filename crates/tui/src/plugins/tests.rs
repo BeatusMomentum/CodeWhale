@@ -1058,6 +1058,7 @@ fn write_dsh_package(root: &Path, url: &str) -> PathBuf {
 #[test]
 fn dsh_packages_import_through_the_reviewed_install_and_update_flow() {
     let tmp = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let config = config(tmp.path());
     let network = allow_all_network();
     let package = write_dsh_package(tmp.path(), "https://docs.example.invalid/mcp");
