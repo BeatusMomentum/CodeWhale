@@ -9361,6 +9361,58 @@ async fn thread_receipt_routes_require_auth_and_return_the_receipt_shape() -> Re
     Ok(())
 }
 
+/// The four canonical thread-history controls mutate or inspect shared store
+/// state, so they sit behind the same bearer + workspace-scope middleware as
+/// every other `/v1` route: anonymous and wrong-token posts are refused before
+/// the handler runs. Authorized coverage lives in
+/// `runtime_store_convergence.rs`.
+#[tokio::test]
+async fn thread_history_operation_routes_require_auth() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-history-auth-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let token = "history-auth-test-token".to_string();
+    let Some((addr, _threads, handle)) =
+        spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    for path in [
+        "/v1/thread-history/operations/lookup",
+        "/v1/thread-history/operations/recover",
+        "/v1/thread-history/mutate",
+        "/v1/thread-history/import",
+    ] {
+        let anonymous = client
+            .post(format!("http://{addr}{path}"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let wrong = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth("not-the-runtime-token")
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{path}");
+        // The token gate admits the request; the handler then rejects the
+        // empty body itself, which is the same 4xx the route gave when these
+        // were reachable without auth — anything but 401 proves we reached it.
+        let authorized = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(&token)
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
 /// `GET /v1/approvals` serves the account-wide approval history behind the
 /// approvals log: decided rows carry their outcome + decision time, pending
 /// asks read "pending" with no decision time, newest ask first. A corrupt

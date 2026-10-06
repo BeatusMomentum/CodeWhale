@@ -2326,6 +2326,22 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(thread_history::snapshot_thread_history),
         )
         .route(
+            "/v1/thread-history/operations/lookup",
+            post(thread_history::lookup_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/operations/recover",
+            post(thread_history::recover_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/mutate",
+            post(thread_history::mutate_thread_history),
+        )
+        .route(
+            "/v1/thread-history/import",
+            post(thread_history::import_thread_history),
+        )
+        .route(
             "/v1/threads/{id}/jobs",
             get(jobs::list_thread_jobs).post(jobs::create_thread_job),
         )
@@ -2644,22 +2660,9 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/health", get(health))
         .route("/mobile", get(mobile_page))
         .route("/mobile/", get(mobile_page))
-        .route(
-            "/v1/thread-history/operations/lookup",
-            post(thread_history::lookup_thread_history_operation),
-        )
-        .route(
-            "/v1/thread-history/operations/recover",
-            post(thread_history::recover_thread_history_operation),
-        )
-        .route(
-            "/v1/thread-history/mutate",
-            post(thread_history::mutate_thread_history),
-        )
-        .route(
-            "/v1/thread-history/import",
-            post(thread_history::import_thread_history),
-        )
+        // Intentionally unauthenticated: loopback clients discover the
+        // listener here. The response already redacts account detail for
+        // unauthorized requests; it never mutates state.
         .route("/v1/runtime/info", get(runtime_info))
         // Authenticates per handler: the display WS also takes a single-use
         // ticket, and client-token minting is master-token only.
