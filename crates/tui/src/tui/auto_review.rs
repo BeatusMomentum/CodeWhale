@@ -1265,7 +1265,9 @@ fn ps_var_name(stmt: &str, dollar: usize) -> Option<(&str, usize)> {
 
 fn ps_var_name_is_valid(name: &str) -> bool {
     let mut chars = name.chars();
-    chars.next().is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
@@ -1311,7 +1313,9 @@ fn pid_var_use_is_bounded(value: &str, proofs: &HashMap<String, PidVarSource>) -
         return false;
     };
     match proofs.get(&name.to_ascii_lowercase()) {
-        Some(PidVarSource::PassThruProcess) => prop.is_some_and(|prop| prop.eq_ignore_ascii_case("id")),
+        Some(PidVarSource::PassThruProcess) => {
+            prop.is_some_and(|prop| prop.eq_ignore_ascii_case("id"))
+        }
         Some(_) => prop.is_none(),
         None => false,
     }
@@ -1374,9 +1378,11 @@ fn windows_session_runtime_risk_scoped(
         };
         invocations.extend(windows_paths);
     }
-    let pid_vars = fresh_shell
-        .then(|| pid_var_proofs(command))
-        .unwrap_or_default();
+    let pid_vars = if fresh_shell {
+        pid_var_proofs(command)
+    } else {
+        HashMap::new()
+    };
     let bounded_pid_selector = |args: &[String]| {
         let Some(first) = args.first() else {
             return false;
@@ -1477,8 +1483,7 @@ fn windows_session_runtime_risk_scoped(
                         .position(|arg| ps_parameter(arg, "-id"))
                         .is_none_or(|index| match args[index].split_once(':') {
                             Some((_, value)) => {
-                                !ps_literal_pids(value)
-                                    && !pid_var_use_is_bounded(value, &pid_vars)
+                                !ps_literal_pids(value) && !pid_var_use_is_bounded(value, &pid_vars)
                             }
                             None => !bounded_pid_selector(&args[index + 1..]),
                         })
