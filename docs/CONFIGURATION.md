@@ -137,15 +137,15 @@ Each repo can carry two distinct, complementary files:
   additionally **mechanically enforced** in the tool gate. See
   [Enforced repo-law invariants](#enforced-repo-law-invariants) below.
 
-  This is the **repo-local law** layer in Codewhale's hierarchy: *bundled global
-  Constitution* → *user-global constitution* (`$CODEWHALE_HOME/constitution.json`,
-  rendered as prose) → *repo constitution* (`.codewhale/constitution.json`, this
-  file) → *AGENTS/project instructions* → *memory and handoffs* → *current
-  request and live evidence for the active turn*. Runtime policy
-  (permissions/sandbox/cost limits enforced in code) is separate from all of
-  these prompt layers. The repo constitution gives project decision rules; it
-  does not replace the bundled Constitution, the user-global constitution, or
-  the current user request.
+  This is the **repo-local law** layer. When guidance conflicts, the
+  **Whose word wins** section of the effective base constitution owns the
+  ordering; the bundled source is
+  [`BASE_PROMPT`](../crates/tui/src/prompts/text.rs). Use `/constitution base`
+  to inspect the effective base, including any opted-in expert override.
+  The order in which these files are described or assembled is not an
+  authority ranking. Runtime policy (permissions, sandbox and cost limits
+  enforced in code) is separate from prompt guidance; editing a constitution
+  does not grant permissions.
 
 > **`WHALE.md` is deprecated.** It overlapped confusingly with `AGENTS.md`.
 > Codewhale no longer reads `WHALE.md` as project or global context. If one is

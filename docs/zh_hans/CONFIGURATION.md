@@ -77,7 +77,7 @@ Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持�
 
   每个 `protected_invariants` 条目可以是普通字符串(建议性散文，历史形态)，也可以是携带路径 glob 的对象，后者会在工具门禁中额外被**机械强制执行**。见下文[强制执行的仓库保护规则](#强制执行的仓库保护规则)。
 
-  这是 Codewhale 层级中的**仓库本地宪章**层：*内置全局宪章* → *用户全局宪章*(`$CODEWHALE_HOME/constitution.json`，渲染为散文)→ *仓库宪章*(`.codewhale/constitution.json`，即本文件)→ *AGENTS/项目指令* → *记忆与交接* → *当前回合的当前请求与实时证据*。运行时策略(在代码中强制执行的权限/沙箱/成本上限)与所有这些提示层是分离的。仓库宪章给出项目决策规则；它不取代内置宪章、用户全局宪章或当前用户请求。
+  这是**仓库本地宪章**层。指引发生冲突时，以当前生效的基础宪章中 **Whose word wins** 一节为准；内置版本的源代码位于 [`BASE_PROMPT`](../../crates/tui/src/prompts/text.rs)。使用 `/constitution base` 可查看实际生效的基础提示词，包括明确启用的专家覆盖版本。这里介绍文件的顺序、以及提示词的组装顺序，都不代表权威排序。运行时策略（代码强制执行的权限、沙箱和成本上限）独立于提示词指引；编辑宪章不会授予权限。
 
 > **`WHALE.md` 已弃用。** 它与 `AGENTS.md` 混淆重叠。Codewhale 不再把 `WHALE.md` 作为项目或全局上下文读取。如果存在，setup/上下文诊断会报告它被忽略，以便你迁移它。把普通指令移到 `AGENTS.md`，把 Codewhale 特有的权威策略移到 `.codewhale/constitution.json`。个人常驻指引属于 `/constitution` / `$CODEWHALE_HOME/constitution.json`。(随模型提示一起提供的全局 Codewhale 宪章是另一回事，不受影响。)
 
