@@ -13757,7 +13757,7 @@ async function retryWindowsSharing(operation, beforeRetry) {
       return await operation();
     } catch (error) {
       if (process.platform !== "win32" || retry >= 10 || !["EACCES", "EBUSY", "EPERM"].includes(fsCode(error) ?? "")) throw error;
-      await delay2(50);
+      await delay2((retry + 1) * 50);
     }
   }
 }
@@ -13861,10 +13861,9 @@ function createStorage({ dataDir, isActive, onWarning }) {
       file = void 0;
       await retryWindowsSharing(async () => {
         active();
-        await rename2(temporary, join(directory2, name));
-      }, async () => {
+        await readRecordOnce(directory2, name);
         active();
-        await readRecord(directory2, name);
+        await rename2(temporary, join(directory2, name));
       });
       published = true;
       await syncDirectory(directory2);
