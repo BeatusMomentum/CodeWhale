@@ -6096,6 +6096,58 @@ fn spawn_limits_accept_whole_number_floats_and_still_refuse_fractions() {
     }
 }
 
+// The wait surfaces block the turn, so the model-facing text must disclose
+// the bounded block (default 30s, max 120s) and the timed_out receipt shape;
+// an undisclosed finite block reads as a hang when nothing settles.
+#[test]
+fn wait_schema_text_discloses_timeout_bound_and_timed_out_receipt() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
+    let agent_schema = AgentTool::new(manager.clone(), stub_runtime()).input_schema();
+    let until = schema_property_description(&agent_schema, "until");
+    // The advertised numbers are tied to the runtime constants so a drift in
+    // either direction (constant change, copy change) turns the other red.
+    assert!(
+        until.contains(&format!(
+            "default {}s, max {}s",
+            SUBAGENT_WAIT_DEFAULT_TIMEOUT_SECS, SUBAGENT_WAIT_MAX_TIMEOUT_SECS
+        )) && until.contains("timed_out"),
+        "agent(action=wait) until description must disclose the runtime \
+         timeout bound and the timed_out receipt:\n{until}"
+    );
+
+    let wait_tool = AgentsWaitTool::new(manager);
+    let wait_description = wait_tool.description();
+    assert!(
+        wait_description.contains(&format!(
+            "timeout_secs (default {}, max {})",
+            coord::COORD_WAIT_DEFAULT_TIMEOUT_SECS,
+            coord::COORD_WAIT_MAX_TIMEOUT_SECS
+        )) && wait_description.contains("timed_out=true"),
+        "agents/wait description must disclose the runtime timeout bound and \
+         the timed_out receipt:\n{wait_description}"
+    );
+}
+
+// The two wait faces advertise from two independent constant sets, so each
+// face's own pin can stay green while the surfaces drift numerically apart;
+// this cross-assertion closes that gap.
+#[test]
+fn wait_bound_constants_agree_across_both_wait_faces() {
+    assert_eq!(
+        SUBAGENT_WAIT_DEFAULT_TIMEOUT_SECS,
+        coord::COORD_WAIT_DEFAULT_TIMEOUT_SECS,
+        "the agent broadcast face and the agents/wait face must advertise the \
+         same default timeout"
+    );
+    assert_eq!(
+        SUBAGENT_WAIT_MAX_TIMEOUT_SECS,
+        coord::COORD_WAIT_MAX_TIMEOUT_SECS,
+        "the agent broadcast face and the agents/wait face must advertise the \
+         same maximum timeout"
+    );
+}
+
 #[test]
 fn agent_tool_unadvertised_fields_remain_parse_accepted() {
     // #5324 compat: the fields removed from the advertised schema must stay
@@ -22013,7 +22065,12 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // Re-measured 2026-10-05 at 90,121B on macOS, +519B: the model-facing tool
 // description rewrites (goal, file read/write/edit, web search/fetch,
 // workflow, request_user_input). The static prompt bytes are unchanged.
-const PARENT_SURFACE_BYTE_CEILING: usize = 90_121;
+// Linux measured 13B above macOS last time, so the ceiling carries that
+// margin until a hosted Linux run re-measures it.
+// The wait-bound disclosure (#6850) adds exactly 222 UTF-8 bytes to the
+// agent schema on top of the rewrites; the runtime measurement below still
+// detects unrelated growth.
+const PARENT_SURFACE_BYTE_CEILING: usize = 90_343;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {

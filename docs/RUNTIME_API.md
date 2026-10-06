@@ -2482,7 +2482,12 @@ approval capability or assume it is unique across threads.
 The thread event stream forwards these payloads intact. The compatibility turn
 stream carries `approval_id`, its `id` alias and `tool_call_id`; the pending
 snapshot carries the same capability and correlator so reconnecting clients can
-attach an approval prompt to its tool row.
+attach an approval prompt to its tool row. Resolutions carry their resolution
+flags through that projection too: `timeout: true` marks the deny produced when
+the configured decision budget expires, and `cancelled: true` marks a deny
+forced by a turn interrupt or turn teardown where no user selection
+was made — clients should clear the pending prompt rather than report a
+refusal.
 
 ## Security boundary
 
