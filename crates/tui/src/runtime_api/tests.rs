@@ -18229,6 +18229,7 @@ async fn plugin_api_404s_for_unknown_selector() -> Result<()> {
 
 #[tokio::test]
 async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
+    let _home = crate::test_support::SealedHome::new();
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
     let workspace = tmp.path().join("ws");

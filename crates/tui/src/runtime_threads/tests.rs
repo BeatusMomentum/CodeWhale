@@ -19791,6 +19791,37 @@ mod runtime_image_inputs {
             };
             assert_eq!(images, request.images);
             assert_eq!(turn.schema_version, IMAGE_RUNTIME_SCHEMA_VERSION);
+            // The next fork shares this workspace. Finish the mock normally
+            // and observe its durable settlement before restoring that case.
+            for event in [
+                EngineEvent::TurnStarted {
+                    turn_id: turn.id.clone(),
+                    created_at: Utc::now(),
+                    route: None,
+                    submission_id: None,
+                },
+                EngineEvent::MessageStarted { index: 0 },
+                EngineEvent::MessageDelta {
+                    index: 0,
+                    content: "stored image fixture response".into(),
+                },
+                EngineEvent::MessageComplete { index: 0 },
+                EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                },
+            ] {
+                harness.tx_event.send(event).await?;
+            }
+            assert_eq!(
+                wait_for_terminal_turn(&manager, &turn.id).await?.status,
+                RuntimeTurnStatus::Completed
+            );
         }
         Ok(())
     }
