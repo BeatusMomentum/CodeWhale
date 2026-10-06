@@ -9181,6 +9181,11 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                     "remember": payload.get("remember"),
                     "auto": payload.get("auto"),
                     "timeout": payload.get("timeout"),
+                    // Set when the decision was forced by a turn interrupt
+                    // or turn teardown: no user selection was made,
+                    // so clients must clear the pending prompt instead of
+                    // reporting a refusal.
+                    "cancelled": payload.get("cancelled"),
                 }),
             ))
         }
