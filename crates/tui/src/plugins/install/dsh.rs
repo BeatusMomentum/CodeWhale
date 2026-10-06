@@ -2181,6 +2181,7 @@ mod shell_hook_import_tests {
     use super::*;
     #[test]
     fn raw_mixed_preset_import_keeps_mcp_and_skills_selected_without_global_duplicates() {
+        let _home = crate::test_support::SealedHome::new();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir_all(source.join("presets/a")).unwrap();
@@ -2244,6 +2245,7 @@ mod shell_hook_import_tests {
 
     #[test]
     fn native_shell_bridge_import_seals_assets_without_executing_commands() {
+        let _home = crate::test_support::SealedHome::new();
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("bundle");
         fs::create_dir(&bundle).unwrap();
