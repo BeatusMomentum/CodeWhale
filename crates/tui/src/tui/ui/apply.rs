@@ -1463,23 +1463,29 @@ async fn apply_conversation_undo(
     Ok(())
 }
 
-pub(crate) async fn apply_command_result(
-    terminal: &mut AppTerminal,
-    app: &mut App,
-    engine_handle: &mut EngineHandle,
-    task_manager: &SharedTaskManager,
-    config: &mut Config,
+// The event loop awaits this dispatcher at several call sites. In debug
+// builds, embedding its entire state machine at each site gives the caller
+// separate large stack slots even though only one action runs at a time.
+// Construct it here so callers carry one pointer, as modal dispatch already does.
+pub(crate) fn apply_command_result<'a>(
+    terminal: &'a mut AppTerminal,
+    app: &'a mut App,
+    engine_handle: &'a mut EngineHandle,
+    task_manager: &'a SharedTaskManager,
+    config: &'a mut Config,
     result: commands::CommandResult,
-) -> Result<bool> {
-    let outcome =
-        apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
-            .await;
-    // A save the command made may have moved legacy top-level `base_url` /
-    // `api_key` into their provider tables (#6394); say so once.
-    for notice in codewhale_config::legacy_root::take_notices() {
-        app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
-    }
-    outcome
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + 'a>> {
+    Box::pin(async move {
+        let outcome =
+            apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
+                .await;
+        // A save the command made may have moved legacy top-level `base_url` /
+        // `api_key` into their provider tables (#6394); say so once.
+        for notice in codewhale_config::legacy_root::take_notices() {
+            app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
+        }
+        outcome
+    })
 }
 
 async fn apply_command_result_inner(
@@ -2466,6 +2472,14 @@ async fn apply_command_result_inner(
             AppAction::StartChatgptRevoke => {
                 run_chatgpt_revoke_from_tui(app, config).await;
             }
+            AppAction::StartOrcarouterPkceLogin => {
+                let _switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config)
+                        .await?;
+            }
+            AppAction::StartOrcarouterRevoke => {
+                run_orcarouter_revoke_from_tui(app, config).await;
+            }
             AppAction::SetScreenMode(mode) => {
                 // The terminal transition is the only fallible part; a failed
                 // probe leaves the previous screen live and says why.
@@ -3111,20 +3125,71 @@ pub(crate) fn apply_hotbar_setup_saved(
     app.needs_redraw = true;
 }
 
-pub(crate) fn settle_user_input_request(app: &mut App, tool_id: &str) {
+pub(crate) fn settle_user_input_request(app: &mut App, tool_id: &str) -> bool {
     app.retire_action_notices(Some(tool_id));
-    if app
+    let removed_view = app.view_stack.remove_user_input_by_id(tool_id);
+    let matched = app
         .pending_user_input_prompt
         .as_ref()
-        .is_some_and(|(id, _)| id == tool_id)
-    {
+        .is_some_and(|(id, _)| id == tool_id);
+    if matched {
         app.pending_user_input_prompt = None;
+    }
+    app.needs_redraw |= removed_view || matched;
+    matched
+}
+
+pub(crate) fn settle_pending_human_requests(app: &mut App) {
+    if let Some((id, _)) = app.pending_user_input_prompt.as_ref() {
+        let id = id.clone();
+        settle_user_input_request(app, &id);
+    }
+    // A completed/cancelled parent turn cannot still await an approval.
+    // Children own their separate lifecycle and may legitimately remain live.
+    for id in app.view_stack.tool_decision_request_ids() {
+        if !crate::tools::subagent::SubAgentManager::is_child_approval_id(&id) {
+            crate::tui::pending_requests::retire(app, &id);
+            app.retire_action_notices(Some(&id));
+        }
+    }
+}
+
+/// The Engine's terminal tool event retires the exact request even when its
+/// presentation is filtered after a local cancel. An outer Code Mode call's
+/// completion cannot settle a different, inner request id.
+pub(crate) fn observe_human_request_settlement(app: &mut App, event: &EngineEvent) {
+    match event {
+        EngineEvent::ToolCallComplete { id, .. } => {
+            settle_user_input_request(app, id);
+            crate::tui::pending_requests::retire(app, id);
+        }
+        EngineEvent::TurnComplete { .. }
+            if !(app.suppress_stream_events_until_turn_complete && app.is_loading) =>
+        {
+            settle_pending_human_requests(app);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn note_human_decision_delivered(app: &mut App, tool_id: &str) {
+    if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
+        && !app.suppress_stream_events_until_turn_complete
+        && !crate::tui::pending_requests::is_foreign_child_request(app, tool_id)
+    {
+        // The reply resumes Engine work before its next event reaches this
+        // frame. Give that work its own inactivity window after a long wait.
+        app.turn_last_activity_at = Some(Instant::now());
     }
 }
 
 pub(crate) fn apply_user_input_submission_result(app: &mut App, tool_id: &str, result: Result<()>) {
     match result {
-        Ok(()) => settle_user_input_request(app, tool_id),
+        Ok(()) => {
+            if settle_user_input_request(app, tool_id) {
+                note_human_decision_delivered(app, tool_id);
+            }
+        }
         Err(error) => {
             tracing::warn!(tool_id, error = %error, "user input submit failed");
             if let Some((id, request)) = app
@@ -3200,6 +3265,7 @@ pub(crate) async fn apply_approval_decision(
                 .await
                 .is_ok()
             {
+                note_human_decision_delivered(app, &event.tool_id);
                 app.retire_action_notices(Some(&event.tool_id));
             }
         }
@@ -3224,6 +3290,7 @@ pub(crate) async fn apply_approval_decision(
                 engine_handle.deny_tool_call(event.tool_id.clone()).await
             };
             if denied.is_ok() {
+                note_human_decision_delivered(app, &event.tool_id);
                 app.retire_action_notices(Some(&event.tool_id));
             }
         }
@@ -4092,6 +4159,42 @@ pub(crate) async fn run_chatgpt_revoke_from_tui(app: &mut App, config: &mut Conf
         (Err(err), Ok(())) => format!("ChatGPT revoke failed: {err:#}"),
         (Err(err), Err(live_err)) => format!(
             "ChatGPT revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
+        ),
+    };
+    app.add_message(HistoryCell::System {
+        content: message.clone(),
+    });
+    app.status_message = Some(message);
+    app.needs_redraw = true;
+}
+
+/// `/auth orcarouter-revoke`. OrcaRouter mints a durable API key with no remote
+/// revocation endpoint this client owns, so revoke is local-only: clear the
+/// `orcarouter` secret-store slot, the route's saved key, and the in-memory
+/// override. Re-authenticating is a fresh PKCE sign-in or a freshly pasted key.
+pub(crate) async fn run_orcarouter_revoke_from_tui(app: &mut App, config: &mut Config) {
+    let provider = ProviderKind::Orcarouter;
+    let provider_name = provider.as_str().to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::config::clear_active_provider_api_key(&provider_name)
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("OrcaRouter revoke task was lost: {err}"))
+    .and_then(|result| result);
+    let live_clear = match config.builtin_provider_identity(provider) {
+        Ok(identity) => config
+            .set_provider_api_key_override(&identity, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string())),
+        Err(err) => Err(anyhow::anyhow!(err)),
+    };
+    let message = match (outcome, live_clear) {
+        (Ok(()), Ok(())) => "Removed Codewhale's saved OrcaRouter credential.".to_string(),
+        (Ok(()), Err(err)) => {
+            format!("OrcaRouter credential removed; the live route could not be refreshed: {err:#}")
+        }
+        (Err(err), Ok(())) => format!("OrcaRouter revoke failed: {err:#}"),
+        (Err(err), Err(live_err)) => format!(
+            "OrcaRouter revoke failed: {err:#}. The live route could not be refreshed: {live_err:#}"
         ),
     };
     app.add_message(HistoryCell::System {

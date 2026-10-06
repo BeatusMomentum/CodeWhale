@@ -4452,13 +4452,13 @@ fn selection_to_text_copies_rendered_transcript_block() {
 
     // The same stored body becomes selectable when the reader expands it.
     // This distinguishes correct folding from losing reasoning altogether.
-    app.thinking_folds.insert(2, ThinkingFold::Expanded);
+    app.cell_folds.insert(2, TranscriptFold::Expanded);
     app.viewport.transcript_cache.ensure_split(
         &[&app.history],
         &app.history_revisions,
         80,
         app.transcript_render_options(),
-        &app.thinking_folds,
+        &app.cell_folds,
         None,
         None,
     );
@@ -6665,12 +6665,15 @@ fn running_exec_cell() -> HistoryCell {
 }
 
 #[test]
-fn completed_answer_clears_stale_reasoning_expand_hint() {
+fn completed_answer_space_round_trip_keeps_its_owner_and_clears_reasoning_hint() {
     let mut app = create_test_app();
     app.history = vec![
         long_reasoning("reasoning", false),
         HistoryCell::Assistant {
-            content: "The answer is complete.".to_string(),
+            content: (1..=8)
+                .map(|line| format!("answer line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             streaming: false,
         },
     ];
@@ -6688,7 +6691,136 @@ fn completed_answer_clears_stale_reasoning_expand_hint() {
         "a reasoning cell must not advertise Space while cell 1 owns the key: {surface}"
     );
     assert!(handle_transcript_space(&mut app));
-    assert!(app.collapsed_cells.contains(&1));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Collapsed));
+    assert!(app.collapsed_cells.is_empty());
+    let folded = render_underwater_test_app(&mut app, 100, 32);
+    assert!(folded.contains("answer line 01"), "{folded}");
+    assert!(!folded.contains("answer line 08"), "{folded}");
+    assert!(folded.contains("Space:expand"), "{folded}");
+    assert_eq!(
+        app.viewport
+            .transcript_cache
+            .fold_action_target()
+            .map(|target| target.owner.cell_index),
+        Some(1)
+    );
+
+    // Hiding reasoning must not disable an ordinary answer's expand control.
+    app.show_thinking = false;
+    let _ = render_underwater_test_app(&mut app, 100, 32);
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert!(!app.cell_folds.contains_key(&0));
+    assert!(
+        !handle_transcript_space(&mut app),
+        "a rendered action is single-use"
+    );
+    let expanded = render_underwater_test_app(&mut app, 100, 32);
+    assert!(expanded.contains("answer line 08"), "{expanded}");
+    assert!(!expanded.contains("Space:expand"), "{expanded}");
+    assert!(app.collapsed_cells.is_empty());
+    let HistoryCell::Assistant { content, .. } = &app.history[1] else {
+        panic!("answer retained");
+    };
+    assert!(content.contains("answer line 08"));
+}
+
+#[test]
+fn answer_fold_survives_hidden_index_mapping_and_keeps_copy_boundaries() {
+    use crate::tui::mouse_ui::apply_context_menu_action;
+    use crate::tui::views::ContextMenuAction;
+
+    let mut app = create_test_app();
+    app.history = vec![
+        HistoryCell::User {
+            content: "EXPLICITLY_HIDDEN".into(),
+        },
+        HistoryCell::Assistant {
+            content: "preview_word ".repeat(120),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: "NEXT_MESSAGE".into(),
+            streaming: false,
+        },
+    ];
+    app.resync_history_revisions();
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 0 });
+    let full = render_underwater_test_app(&mut app, 60, 32);
+    assert!(!full.contains("EXPLICITLY_HIDDEN"));
+    assert_eq!(app.collapsed_cell_map, vec![1, 2]);
+    select_original_cell(&mut app, 1);
+    let middle = TranscriptSelectionPoint {
+        line_index: app.viewport.transcript_selection.anchor.unwrap().line_index + 8,
+        column: 5,
+    };
+    app.viewport.transcript_selection.anchor = Some(middle);
+    app.viewport.transcript_selection.head = Some(middle);
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(handle_transcript_space(&mut app));
+    let folded = render_underwater_test_app(&mut app, 60, 32);
+    assert!(folded.contains("Space:expand"), "{folded}");
+    assert_eq!(app.collapsed_cell_map, vec![1, 2]);
+    assert_eq!(
+        app.transcript_action_owner().map(|owner| owner.cell_index),
+        Some(1)
+    );
+    assert!(
+        handle_transcript_space(&mut app),
+        "second Space needs no reselection"
+    );
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert!(
+        !app.cell_folds.contains_key(&2),
+        "newer answer stays untouched"
+    );
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(handle_transcript_space(&mut app));
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 0,
+        column: 0,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: app
+            .viewport
+            .transcript_cache
+            .total_lines()
+            .saturating_sub(1),
+        column: 60,
+    });
+    let copied = selection_to_text(&app).expect("folded selection");
+    let next = copied
+        .lines()
+        .find(|line| line.contains("NEXT_MESSAGE"))
+        .expect("next message retained");
+    assert!(
+        !next.contains("preview_word"),
+        "truncation must not join separate messages: {copied}"
+    );
+    assert!(
+        !copied.contains("Space:") && !copied.contains('…'),
+        "control row is not body: {copied}"
+    );
+
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 1 });
+    let hidden = render_underwater_test_app(&mut app, 60, 32);
+    assert!(
+        !hidden.contains("preview_word"),
+        "explicit Hide removes the preview too"
+    );
+    assert_eq!(app.collapsed_cell_map, vec![2]);
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::ShowCell { cell_index: 1 });
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert_eq!(app.collapsed_cell_map, vec![1, 2]);
+    select_original_cell(&mut app, 1);
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert_eq!(app.collapsed_cells, HashSet::from([0]));
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::ShowAllHidden);
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(app.collapsed_cells.is_empty());
 }
 
 #[test]
@@ -6722,14 +6854,14 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
     );
     assert!(handle_transcript_space(&mut app));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Expanded),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Expanded),
         "Space on a collapsed cell records an explicit expand"
     );
     assert!(!handle_transcript_space(&mut app));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Expanded),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Expanded),
         "rendered action is single-use"
     );
 
@@ -6738,20 +6870,20 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
     assert!(!expanded.contains("Space:expand"));
     assert!(!expanded.contains("Space:collapse"));
     assert_eq!(
-        app.viewport.transcript_cache.reasoning_action_target(),
-        Some(crate::tui::history::ReasoningActionTarget {
+        app.viewport.transcript_cache.fold_action_target(),
+        Some(crate::tui::history::CellFoldActionTarget {
             owner: crate::tui::history::TranscriptActionOwner {
                 cell_index: 0,
                 identity_epoch: app.transcript_identity_epoch,
             },
-            action: crate::tui::history::ReasoningAction::Collapse,
+            action: crate::tui::history::CellFoldAction::Collapse,
         })
     );
 
     app.history[0] = oversized_reasoning("selected", false);
     app.bump_history_cell(0);
     let _ = render_underwater_test_app(&mut app, 100, 32);
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
     assert!(
         app.viewport
             .transcript_cache
@@ -6763,8 +6895,8 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
 
     assert!(handle_transcript_space(&mut app));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Collapsed),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Collapsed),
         "Space on an expanded cell records an explicit collapse"
     );
     let collapsed_again = render_underwater_test_app(&mut app, 100, 32);
@@ -6773,14 +6905,14 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
 
 #[test]
 fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
-    use crate::tui::history::ReasoningAction;
+    use crate::tui::history::CellFoldAction;
 
     for verbose in [false, true] {
         for default_expanded in [false, true] {
             for initial_fold in [
                 None,
-                Some(ThinkingFold::Expanded),
-                Some(ThinkingFold::Collapsed),
+                Some(TranscriptFold::Expanded),
+                Some(TranscriptFold::Collapsed),
             ] {
                 let mut app = create_test_app();
                 app.verbose_transcript = verbose;
@@ -6788,7 +6920,7 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                 app.thinking_preview_lines = 4;
                 app.history = vec![oversized_reasoning("baseline", false)];
                 if let Some(fold) = initial_fold {
-                    app.thinking_folds.insert(0, fold);
+                    app.cell_folds.insert(0, fold);
                 }
                 app.resync_history_revisions();
                 // Keep a long body so expanded and collapsed states are
@@ -6797,8 +6929,8 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                 select_original_cell(&mut app, 0);
 
                 let initially_expanded = match initial_fold {
-                    Some(ThinkingFold::Expanded) => true,
-                    Some(ThinkingFold::Collapsed) => false,
+                    Some(TranscriptFold::Expanded) => true,
+                    Some(TranscriptFold::Collapsed) => false,
                     None => verbose || default_expanded,
                 };
                 for (step, expanded) in
@@ -6823,15 +6955,15 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                     let target = app
                         .viewport
                         .transcript_cache
-                        .reasoning_action_target()
+                        .fold_action_target()
                         .expect("selected reasoning has a rendered action");
                     assert_eq!(target.owner.cell_index, 0);
                     assert_eq!(
                         target.action,
                         if expanded {
-                            ReasoningAction::Collapse
+                            CellFoldAction::Collapse
                         } else {
-                            ReasoningAction::Expand
+                            CellFoldAction::Expand
                         }
                     );
                     if step < 2 {
@@ -6841,11 +6973,11 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                 // Two toggles land back on the state the cell started in —
                 // now recorded outright rather than inferred from a baseline.
                 assert_eq!(
-                    app.thinking_folds.get(&0),
+                    app.cell_folds.get(&0),
                     Some(&if initially_expanded {
-                        ThinkingFold::Expanded
+                        TranscriptFold::Expanded
                     } else {
-                        ThinkingFold::Collapsed
+                        TranscriptFold::Collapsed
                     }),
                 );
             }
@@ -6954,7 +7086,7 @@ fn mouse_selection_redraws_and_retargets_reasoning_with_unchanged_revisions() {
     let _ = render_underwater_test_app(&mut app, 100, 32);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -6987,8 +7119,16 @@ fn mouse_up_preserves_the_single_click_action_and_detail_owner() {
     assert_eq!(detail_target_cell_index(&app), Some(0));
     let _ = render_underwater_test_app(&mut app, 100, 32);
     assert!(handle_transcript_space(&mut app));
-    assert!(app.collapsed_cells.contains(&0));
-    assert!(!app.collapsed_cells.contains(&1));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Collapsed));
+    assert!(!app.cell_folds.contains_key(&1));
+    assert!(app.collapsed_cells.is_empty());
+    let _ = render_underwater_test_app(&mut app, 100, 32);
+    assert_eq!(
+        app.transcript_action_owner().map(|owner| owner.cell_index),
+        Some(0)
+    );
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -7030,13 +7170,13 @@ fn calm1_reasoning_frames_keep_fixed_budgets_and_explicit_expansion() {
             app.history = vec![reasoning_with_lines("fixture", 20, streaming)];
             app.resync_history_revisions();
             if expanded {
-                app.thinking_folds.insert(0, ThinkingFold::Expanded);
+                app.cell_folds.insert(0, TranscriptFold::Expanded);
             }
             let surface = render_underwater_test_app(&mut app, width, height);
             let rows = app.viewport.last_transcript_total;
             if expanded {
                 assert!(rows >= 21);
-                assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+                assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
                 assert!(surface.contains("fixture line 20"), "{surface}");
             } else {
                 assert_eq!(rows, if streaming { 4 } else { 1 }, "{surface}");
@@ -7070,7 +7210,7 @@ fn advertised_reasoning_space_dispatches_after_first_char_paste_hold() {
     let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
     assert!(handle_plain_key_before_composer(&mut app, &space, now));
     assert!(
-        app.thinking_folds.is_empty(),
+        app.cell_folds.is_empty(),
         "Space remains ambiguous until the first-character hold expires"
     );
     assert!(app.input.is_empty(), "Space must not enter the composer");
@@ -7083,8 +7223,8 @@ fn advertised_reasoning_space_dispatches_after_first_char_paste_hold() {
         now + crate::tui::paste_burst::PasteBurst::recommended_flush_delay()
     ));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Expanded),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Expanded),
         "a lone Space must dispatch the rendered transcript action after the hold"
     );
     assert!(
@@ -7124,7 +7264,7 @@ fn raw_paste_beginning_with_space_preserves_payload_over_reasoning_action() {
         now + Duration::from_millis(1),
     ));
     assert!(
-        app.thinking_folds.is_empty(),
+        app.cell_folds.is_empty(),
         "a leading-space raw paste must not trigger transcript actions"
     );
     assert!(flush_paste_burst_before_composer(
@@ -7213,7 +7353,7 @@ fn active_raw_paste_keeps_space_as_payload_over_reasoning_action() {
         now + Duration::from_millis(1),
     ));
     assert!(
-        app.thinking_folds.is_empty(),
+        app.cell_folds.is_empty(),
         "an in-flight raw paste must not trigger transcript actions"
     );
     assert!(app.flush_paste_burst_if_due(
@@ -7367,7 +7507,7 @@ fn active_streaming_reasoning_keeps_its_visible_owner_across_a_delta() {
     assert_ne!(app.history_version, rendered_version);
     assert_eq!(app.transcript_identity_epoch, rendered_epoch);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&1), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -7390,7 +7530,7 @@ fn interrupted_active_reasoning_remains_actionable_after_flush() {
     assert!(app.active_cell.is_none());
     assert_eq!(app.transcript_identity_epoch, epoch);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
     let _ = render_underwater_test_app(&mut app, 60, 16);
 }
 
@@ -7426,7 +7566,7 @@ fn pending_scroll_retargets_reasoning_in_the_same_frame() {
     assert_eq!(
         app.viewport
             .transcript_cache
-            .reasoning_action_target()
+            .fold_action_target()
             .map(|target| target.owner.cell_index),
         Some(0)
     );
@@ -7458,7 +7598,7 @@ fn visible_older_reasoning_owns_space_over_a_newer_offscreen_tool() {
     );
     assert_eq!(detail_target_cell_index(&app), Some(1));
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
     assert!(!app.collapsed_cells.contains(&1) && app.expanded_tool_runs.is_empty());
 }
 
@@ -7474,21 +7614,16 @@ fn hidden_reasoning_is_unhidden_instead_of_folded() {
     app.collapsed_cells.insert(0);
     assert!(handle_transcript_space(&mut app));
     assert!(!app.collapsed_cells.contains(&0));
-    assert!(!app.thinking_folds.contains_key(&0));
+    assert!(!app.cell_folds.contains_key(&0));
 
     app.collapsed_cells.insert(0);
     let surface = render_underwater_test_app(&mut app, 60, 16);
     assert!(!surface.contains("Space:expand"));
-    assert!(
-        app.viewport
-            .transcript_cache
-            .reasoning_action_target()
-            .is_none()
-    );
+    assert!(app.viewport.transcript_cache.fold_action_target().is_none());
 
     assert!(handle_transcript_space(&mut app));
     assert!(!app.collapsed_cells.contains(&0));
-    assert!(!app.thinking_folds.contains_key(&0));
+    assert!(!app.cell_folds.contains_key(&0));
     let visible = render_underwater_test_app(&mut app, 60, 16);
     assert!(visible.contains("Space:expand"));
 }
@@ -7504,11 +7639,11 @@ fn stale_rendered_reasoning_owner_cannot_toggle_replacement() {
     app.push_history_cell(long_reasoning("replacement", false));
     assert_ne!(app.transcript_identity_epoch, rendered_epoch);
     assert!(!handle_transcript_space(&mut app));
-    assert!(app.thinking_folds.is_empty());
+    assert!(app.cell_folds.is_empty());
 
     let _ = render_underwater_test_app(&mut app, 80, 24);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -7526,10 +7661,10 @@ fn pop_and_truncate_prune_index_state_before_replacement() {
     for set in [&mut app.collapsed_cells, &mut app.expanded_tool_runs] {
         set.insert(1);
     }
-    app.thinking_folds.insert(1, ThinkingFold::Expanded);
+    app.cell_folds.insert(1, TranscriptFold::Expanded);
     app.collapsed_cell_map = vec![0, 1];
     app.pop_history();
-    assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
+    assert!(app.collapsed_cells.is_empty() && app.cell_folds.is_empty());
     assert!(app.expanded_tool_runs.is_empty() && app.collapsed_cell_map.is_empty());
     app.push_history_cell(HistoryCell::Assistant {
         content: "after pop".into(),
@@ -7542,14 +7677,14 @@ fn pop_and_truncate_prune_index_state_before_replacement() {
     for set in [&mut app.collapsed_cells, &mut app.expanded_tool_runs] {
         set.insert(1);
     }
-    app.thinking_folds.insert(1, ThinkingFold::Expanded);
+    app.cell_folds.insert(1, TranscriptFold::Expanded);
     app.truncate_history_to(1);
     app.push_history_cell(HistoryCell::Assistant {
         content: "after truncate".into(),
         streaming: false,
     });
     assert!(!handle_transcript_space(&mut app));
-    assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
+    assert!(app.collapsed_cells.is_empty() && app.cell_folds.is_empty());
     assert!(render_underwater_test_app(&mut app, 60, 16).contains("after truncate"));
 }
 
@@ -7566,7 +7701,7 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     .expect("prepare");
     let _ = render_underwater_test_app(&mut app, 60, 16);
     app.collapsed_cells.insert(0);
-    app.thinking_folds.insert(0, ThinkingFold::Expanded);
+    app.cell_folds.insert(0, TranscriptFold::Expanded);
     app.expanded_tool_runs.insert(0);
     app.collapsed_cell_map.push(0);
     let next_revision = app.next_history_revision;
@@ -7579,7 +7714,7 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     // version it had before would let a later cell reuse a key a frame has
     // already seen.
     assert_ne!(app.history_version, version_before_echo);
-    assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
+    assert!(app.collapsed_cells.is_empty() && app.cell_folds.is_empty());
     assert!(app.expanded_tool_runs.is_empty() && app.collapsed_cell_map.is_empty());
     app.push_history_cell(HistoryCell::Assistant {
         content: "replacement".into(),
@@ -7603,7 +7738,7 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
 fn restored_reasoning_and_answer_clear_prior_fold_ownership() {
     let mut app = create_test_app();
     app.push_history_cell(long_reasoning("old session", false));
-    app.thinking_folds.insert(0, ThinkingFold::Expanded);
+    app.cell_folds.insert(0, TranscriptFold::Expanded);
     let _ = render_underwater_test_app(&mut app, 80, 24);
     let old_epoch = app.transcript_identity_epoch;
     let session = saved_session_with_messages(vec![codewhale_models::Message {
@@ -7625,7 +7760,7 @@ fn restored_reasoning_and_answer_clear_prior_fold_ownership() {
     }]);
 
     apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
-    assert!(app.thinking_folds.is_empty());
+    assert!(app.cell_folds.is_empty());
     assert_ne!(app.transcript_identity_epoch, old_epoch);
     assert!(matches!(
         app.history.first(),
@@ -7689,8 +7824,8 @@ fn filtered_selection_toggles_the_original_reasoning_index() {
     let _ = render_underwater_test_app(&mut app, 60, 16);
     assert_eq!(reasoning_hint_cells(&app), vec![1]);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&1), Some(&ThinkingFold::Expanded));
-    assert!(!app.thinking_folds.contains_key(&0));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert!(!app.cell_folds.contains_key(&0));
 }
 
 #[test]
@@ -14652,6 +14787,7 @@ async fn dispatch_non_resume_message_preserves_paused_command_state() {
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content,
             goal_objective,
             ..
@@ -14693,6 +14829,7 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content,
             goal_objective,
             ..
@@ -15718,6 +15855,216 @@ async fn stall_dispatch_task_panic_still_reports_back() {
     );
     assert!(!app.dispatch_in_flight);
     assert_eq!(app.input, "panicking dispatch");
+}
+
+#[test]
+fn turn_liveness_preserves_pending_user_input_beyond_tool_timeout() {
+    // The outstanding request owns the wait independently of its tool cell
+    // or modal presentation. Code Mode currently refuses nested questions.
+    for tool_name in [None, Some("request_user_input"), Some("execute_tools")] {
+        let mut app = create_test_app();
+        let now = Instant::now();
+        let started_at = now - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(3600);
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".into());
+        app.turn_started_at = Some(started_at);
+        app.turn_last_activity_at = Some(started_at);
+        app.pending_user_input_prompt = Some((
+            "question-1".into(),
+            crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        ));
+        app.view_stack.push(UserInputView::new(
+            "question-1",
+            crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        ));
+        // A hidden modal is not an answer or a cancellation. Engine still
+        // owns an indefinite wait; the UI must not manufacture a timeout.
+        app.view_stack.pop();
+        if let Some(name) = tool_name {
+            let mut active = ActiveCell::new();
+            active.push_tool(
+                "question-1",
+                HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                    name: name.into(),
+                    status: ToolStatus::Running,
+                    input_summary: None,
+                    output: None,
+                    prompts: None,
+                    spillover_path: None,
+                    output_summary: None,
+                    is_diff: false,
+                })),
+            );
+            app.active_cell = Some(active);
+        }
+
+        assert!(
+            !reconcile_turn_liveness(&mut app, now, false),
+            "{tool_name:?}"
+        );
+        assert!(app.is_loading);
+        assert!(app.pending_user_input_prompt.is_some());
+        assert!(app.status_toasts.is_empty());
+
+        // Delivery retires the exemption and gives resumed work a fresh
+        // window, even before the next Engine event reaches this frame.
+        apply_user_input_submission_result(&mut app, "question-1", Ok(()));
+        assert!(app.pending_user_input_prompt.is_none());
+        let resumed_at = app.turn_last_activity_at.expect("answer is activity");
+        assert!(resumed_at >= now);
+        assert!(
+            !reconcile_turn_liveness(&mut app, resumed_at, false),
+            "{tool_name:?} recovered before resumed work could run"
+        );
+        let stalled_at = resumed_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1);
+        assert!(
+            reconcile_turn_liveness(&mut app, stalled_at, false),
+            "{tool_name:?}"
+        );
+        assert!(!app.is_loading);
+    }
+}
+
+fn install_pending_question(app: &mut App, id: &str) {
+    let request = crate::tools::user_input::UserInputRequest {
+        questions: Vec::new(),
+    };
+    app.pending_user_input_prompt = Some((id.into(), request.clone()));
+    app.view_stack.push(UserInputView::new(id, request));
+    app.push_status_toast_record(
+        StatusToast::new("Answer question", StatusToastLevel::Warning, None).for_action(id),
+    );
+}
+
+#[test]
+fn user_input_timeout_retires_only_matching_question_even_when_completion_is_filtered() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    install_pending_question(&mut app, "input-timeout");
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "unrelated-approval",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "unrelated-key",
+    )));
+    app.push_status_toast_record(
+        StatusToast::new("Review command", StatusToastLevel::Warning, None)
+            .for_action("unrelated-approval"),
+    );
+    let completion = EngineEvent::ToolCallComplete {
+        id: "input-timeout".into(),
+        model_call: None,
+        name: "request_user_input".into(),
+        result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
+    };
+    assert!(suppress_engine_event_after_local_cancel(&completion));
+    observe_human_request_settlement(&mut app, &completion);
+    assert!(app.pending_user_input_prompt.is_none());
+    assert!(!app.view_stack.contains_kind(ModalKind::UserInput));
+    assert!(app.view_stack.contains_approval_id("unrelated-approval"));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+    assert_eq!(app.status_toasts.len(), 1);
+    assert_eq!(app.status_toasts[0].text, "Review command");
+}
+
+#[test]
+fn user_input_completion_preserves_newer_question_and_dispatch() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    let activity = Instant::now() - Duration::from_secs(30);
+    app.turn_last_activity_at = Some(activity);
+    install_pending_question(&mut app, "input-new");
+    let completion = |id: &str| EngineEvent::ToolCallComplete {
+        id: id.into(),
+        model_call: None,
+        name: "execute_tools".into(),
+        result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
+    };
+    // Neither a previous request nor a wrapping call's different id owns it.
+    observe_human_request_settlement(&mut app, &completion("input-old"));
+    observe_human_request_settlement(&mut app, &completion("outer-call"));
+    apply_user_input_submission_result(&mut app, "input-old", Ok(()));
+    assert_eq!(app.turn_last_activity_at, Some(activity));
+    assert_eq!(
+        app.pending_user_input_prompt
+            .as_ref()
+            .map(|(id, _)| id.as_str()),
+        Some("input-new")
+    );
+    app.suppress_stream_events_until_turn_complete = true;
+    observe_human_request_settlement(
+        &mut app,
+        &EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: crate::core::events::TurnOutcomeStatus::Interrupted,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        },
+    );
+    assert!(app.pending_user_input_prompt.is_some());
+    assert!(app.view_stack.contains_kind(ModalKind::UserInput));
+    assert_eq!(app.status_toasts.len(), 1);
+}
+
+#[test]
+fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
+    for boundary in ["completed", "interrupted", "failed", "cancel", "disconnect"] {
+        let mut app = create_test_app();
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".into());
+        install_pending_question(&mut app, "input-boundary");
+        app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+            "parent-approval",
+            "exec_shell",
+            "Review command",
+            &serde_json::json!({"command": "git status"}),
+            "keep-key",
+        )));
+        match boundary {
+            "cancel" => mark_active_turn_cancelled_locally(&mut app),
+            "disconnect" => assert!(recover_engine_event_disconnect(&mut app)),
+            _ => observe_human_request_settlement(
+                &mut app,
+                &EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: match boundary {
+                        "completed" => crate::core::events::TurnOutcomeStatus::Completed,
+                        "interrupted" => crate::core::events::TurnOutcomeStatus::Interrupted,
+                        _ => crate::core::events::TurnOutcomeStatus::Failed,
+                    },
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                },
+            ),
+        }
+        assert!(app.pending_user_input_prompt.is_none(), "{boundary}");
+        assert!(
+            !app.view_stack.contains_kind(ModalKind::UserInput),
+            "{boundary}"
+        );
+        assert!(
+            !app.view_stack.contains_approval_id("parent-approval"),
+            "{boundary}"
+        );
+        assert!(
+            !app.status_toasts
+                .iter()
+                .any(|toast| toast.text == "Answer question")
+        );
+    }
 }
 
 #[test]
@@ -20947,7 +21294,7 @@ fn open_tool_details_pager_supports_active_virtual_tool_cell() {
         &[1],
         100,
         app.transcript_render_options(),
-        &app.thinking_folds,
+        &app.cell_folds,
         None,
         None,
     );
@@ -24704,14 +25051,38 @@ fn orphan_during_active_keeps_subsequent_completion_routed_correctly() {
     // mid-active, it pushes a real history cell that bumps virtual indices
     // by one. A subsequent legitimate completion must still find its entry.
     let mut app = create_test_app();
+    app.tool_collapse_threshold = 0;
     handle_tool_call_started(
         &mut app,
         "live",
         "exec_shell",
         &serde_json::json!({"command": "ls"}),
     );
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert!(handle_transcript_space(&mut app));
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Collapsed));
+    let rendered_epoch = app.transcript_identity_epoch;
     // Orphan completion arrives FIRST (before live's completion).
     handle_tool_call_complete(&mut app, "ghost", "weird_tool", &ok_result("ghost-out"));
+    assert!(
+        !app.cell_folds.contains_key(&0),
+        "orphan cannot inherit active fold"
+    );
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Collapsed));
+    assert_ne!(app.transcript_identity_epoch, rendered_epoch);
+    assert!(
+        !handle_transcript_space(&mut app),
+        "pre-insertion action cannot target orphan"
+    );
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(
+        app.viewport
+            .transcript_cache
+            .fold_action_target()
+            .map(|target| target.owner.cell_index),
+        Some(1)
+    );
     // Now complete the live tool — it should still mutate the active entry,
     // not silently drop or hit a stale index.
     handle_tool_call_complete(&mut app, "live", "exec_shell", &ok_result("hello"));
@@ -24733,6 +25104,49 @@ fn orphan_during_active_keeps_subsequent_completion_routed_correctly() {
     // Flush settles the active exec into history below the orphan.
     app.flush_active_cell();
     assert_eq!(app.history.len(), 2);
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Collapsed));
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+}
+
+#[test]
+fn mid_turn_history_insert_rebases_hide_without_changing_finalized_choices() {
+    use crate::tui::mouse_ui::apply_context_menu_action;
+    use crate::tui::views::ContextMenuAction;
+
+    let mut app = create_test_app();
+    app.tool_collapse_threshold = 0;
+    app.add_message(HistoryCell::Assistant {
+        content: "finalized answer".into(),
+        streaming: false,
+    });
+    app.cell_folds.insert(0, TranscriptFold::Collapsed);
+    handle_tool_call_started(
+        &mut app,
+        "live",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 1 });
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(app.collapsed_cell_map, vec![0]);
+    handle_tool_call_complete(&mut app, "ghost", "weird_tool", &ok_result("orphan result"));
+    assert_eq!(
+        app.cell_folds,
+        HashMap::from([(0, TranscriptFold::Collapsed)])
+    );
+    assert_eq!(app.collapsed_cells, HashSet::from([2]));
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(
+        app.collapsed_cell_map,
+        vec![0, 1],
+        "orphan remains visible, active Hide follows its row"
+    );
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::ShowCell { cell_index: 2 });
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Collapsed));
 }
 
 #[test]
@@ -27210,11 +27624,13 @@ async fn stale_parent_approval_is_resolved_unavailable_not_dropped() {
             questions: Vec::new(),
         },
     };
-    assert!(resolve_stale_parent_request(&app, &mock.handle, &question).await);
-    assert_eq!(
-        mock.recv_user_input_cancellation().await.as_deref(),
-        Some("stale-question")
+    let handle = mock.handle.clone();
+    let (resolved, canceled) = tokio::join!(
+        resolve_stale_parent_request(&app, &handle, &question),
+        mock.recv_user_input_cancellation(),
     );
+    assert!(resolved);
+    assert_eq!(canceled.as_deref(), Some("stale-question"));
 }
 
 #[tokio::test]
@@ -27825,6 +28241,7 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
     let run = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content: "hello without a key".to_string(),
             images: Vec::new(),
             mode: AppMode::Agent,
@@ -33522,4 +33939,226 @@ fn engine_retry_receipt_projection_keeps_quiet_history_without_internal_status_r
         "Retry recovery: stream recovered after 1 retries".into()
     ));
     assert_eq!(app.history.len(), before + 1);
+}
+
+#[test]
+fn a_foreground_shell_wait_is_one_tool_card_not_also_a_background_job() {
+    use super::task_projection::project_shell_jobs;
+    use crate::tools::shell::ShellStatus;
+    let mut app = create_test_app();
+    app.current_session_id = Some("fg".into());
+    let mut foreground = shell_job("shell_fg", "ls | head -40", ShellStatus::Running, None);
+    foreground.background = false;
+    foreground.finished_at = None;
+    let mut entries = Vec::new();
+    project_shell_jobs(&mut app, &mut entries, std::slice::from_ref(&foreground));
+    assert!(entries.is_empty(), "{entries:?}");
+
+    // Ctrl+B detaches it into /jobs: now it is exactly one background job.
+    foreground.background = true;
+    project_shell_jobs(&mut app, &mut entries, &[foreground]);
+    assert_eq!(entries.len(), 1);
+}
+
+fn human_wait_test_app(running_tool: bool) -> App {
+    let mut app = create_test_app();
+    let started = Instant::now() - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(60);
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    app.turn_started_at = Some(started);
+    app.turn_last_activity_at = Some(started);
+    if running_tool {
+        let mut active = ActiveCell::new();
+        active.push_tool(
+            "human-wait-call",
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "exec_shell".into(),
+                status: ToolStatus::Running,
+                input_summary: None,
+                output: None,
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })),
+        );
+        app.active_cell = Some(active);
+    }
+    app
+}
+
+fn add_human_wait_approval(app: &mut App, id: &str) {
+    push_approval_request_view(
+        app,
+        id,
+        "exec_shell",
+        "Review this command",
+        &serde_json::json!({"command":"pwd"}),
+        "key",
+        "group",
+        None,
+        crate::config::ApprovalDefaultSelection::Deny,
+        None,
+    );
+}
+
+#[test]
+fn turn_liveness_keeps_buried_indefinite_approvals_alive_until_withdrawn() {
+    for running_tool in [false, true] {
+        let mut app = human_wait_test_app(running_tool);
+        add_human_wait_approval(&mut app, "human-wait-call");
+        app.view_stack.push(HelpView::default());
+        assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+        assert!(app.is_loading);
+        assert!(crate::tui::pending_requests::observe_engine_event(
+            &mut app,
+            &EngineEvent::ApprovalWithdrawn {
+                id: "human-wait-call".into()
+            }
+        ));
+        assert!(!app.view_stack.contains_approval_id("human-wait-call"));
+        assert!(reconcile_turn_liveness(&mut app, Instant::now(), false));
+    }
+}
+
+#[test]
+fn turn_liveness_keeps_elevation_alive_and_retires_its_exact_card() {
+    let mut app = human_wait_test_app(true);
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(
+                "human-wait-call",
+                "exec_shell",
+                "denied",
+            ),
+            app.ui_locale,
+        ));
+    app.view_stack.push(HelpView::default());
+    assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+    assert!(crate::tui::pending_requests::observe_engine_event(
+        &mut app,
+        &EngineEvent::ApprovalWithdrawn {
+            id: "human-wait-call".into()
+        }
+    ));
+    assert!(!app.view_stack.contains_kind(ModalKind::Elevation));
+    assert!(reconcile_turn_liveness(&mut app, Instant::now(), false));
+}
+
+#[test]
+fn turn_liveness_scopes_hidden_child_decisions_to_the_current_session() {
+    let id = "agent:child-wait:approval:boot:1";
+    for foreign in [false, true] {
+        let mut app = human_wait_test_app(true);
+        app.current_session_id = Some("current-session".into());
+        app.child_agent_sessions.insert(
+            "child-wait".into(),
+            if foreign {
+                "another-session"
+            } else {
+                "current-session"
+            }
+            .into(),
+        );
+        crate::tui::pending_requests::record(
+            &mut app,
+            id,
+            crate::tui::pending_requests::PendingChildRequest {
+                agent_id: "child-wait".into(),
+                tool_name: "exec_shell".into(),
+                description: "Review child command".into(),
+                input: serde_json::json!({"command":"pwd"}),
+                approval_key: "key".into(),
+                approval_grouping_key: "group".into(),
+                intent_summary: None,
+                requested_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            reconcile_turn_liveness(&mut app, Instant::now(), false),
+            foreign
+        );
+    }
+}
+
+#[test]
+fn human_decision_delivery_gives_work_a_new_window_without_disabling_recovery() {
+    let mut app = human_wait_test_app(true);
+    note_human_decision_delivered(&mut app, "human-wait-call");
+    let activity = app.turn_last_activity_at.expect("reply activity");
+    assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+    assert!(reconcile_turn_liveness(
+        &mut app,
+        activity + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1),
+        false
+    ));
+}
+
+#[test]
+fn human_decision_from_another_session_does_not_refresh_this_turn() {
+    let mut app = human_wait_test_app(true);
+    let before = app.turn_last_activity_at;
+    app.current_session_id = Some("current-session".into());
+    app.child_agent_sessions
+        .insert("child-wait".into(), "another-session".into());
+    note_human_decision_delivered(&mut app, "agent:child-wait:approval:boot:1");
+    assert_eq!(app.turn_last_activity_at, before);
+}
+
+#[test]
+fn child_elevation_footer_tracks_the_visible_decision_without_initial_approval_authority() {
+    let mut app = human_wait_test_app(true);
+    let id = "agent:child-wait:approval:boot:1";
+    crate::tui::pending_requests::record(
+        &mut app,
+        id,
+        crate::tui::pending_requests::PendingChildRequest {
+            agent_id: "child-wait".into(),
+            tool_name: "exec_shell".into(),
+            description: "Review child command".into(),
+            input: serde_json::json!({"command": "pwd"}),
+            approval_key: "key".into(),
+            approval_grouping_key: "group".into(),
+            intent_summary: None,
+            requested_at: Instant::now(),
+        },
+    );
+    assert_eq!(crate::tui::pending_requests::footer_rows(&app).len(), 1);
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(id, "exec_shell", "denied"),
+            app.ui_locale,
+        ));
+    assert_eq!(app.view_stack.top_approval_id(), None);
+    assert!(crate::tui::pending_requests::footer_rows(&app).is_empty());
+    add_human_wait_approval(&mut app, "other-decision");
+    assert_eq!(crate::tui::pending_requests::footer_rows(&app).len(), 1);
+    crate::tui::pending_requests::retire(&mut app, id);
+    assert!(crate::tui::pending_requests::footer_rows(&app).is_empty());
+    assert!(app.view_stack.contains_approval_id("other-decision"));
+}
+
+#[test]
+fn ended_parent_turn_retires_approvals_and_elevations_but_keeps_child_requests() {
+    let mut app = human_wait_test_app(true);
+    add_human_wait_approval(&mut app, "parent-card");
+    add_human_wait_approval(&mut app, "agent:child-wait:approval:boot:1");
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(
+                "parent-elevation",
+                "exec_shell",
+                "denied",
+            ),
+            app.ui_locale,
+        ));
+    assert!(app.view_stack.contains_tool_decision_id("parent-elevation"));
+    assert!(!app.view_stack.contains_approval_id("parent-elevation"));
+    settle_pending_human_requests(&mut app);
+    assert!(!app.view_stack.contains_approval_id("parent-card"));
+    assert!(!app.view_stack.contains_tool_decision_id("parent-elevation"));
+    assert!(
+        app.view_stack
+            .contains_approval_id("agent:child-wait:approval:boot:1")
+    );
 }

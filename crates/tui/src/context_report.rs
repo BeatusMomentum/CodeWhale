@@ -25,7 +25,7 @@ use crate::compaction::{
 use crate::config::Config;
 #[cfg(test)]
 use crate::context_budget::PressureLevel;
-use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
+use crate::prompts::CORE_EXECUTION_PROFILE_PROMPT;
 use crate::route_budget::route_context_window_tokens;
 use crate::tui::app::App;
 use codewhale_config::AppMode;
@@ -464,7 +464,7 @@ fn base_source_entries(
 ) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
         "Bundled constitution, language policy, and output policy",

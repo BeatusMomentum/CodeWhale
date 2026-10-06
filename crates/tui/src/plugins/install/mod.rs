@@ -409,7 +409,11 @@ struct ConvertedDsh {
 /// Parse and convert off the async runtime: conversion reads and copies the
 /// whole package synchronously.
 async fn convert_dsh_off_runtime(package: PathBuf) -> Result<ConvertedDsh> {
+    #[cfg(test)]
+    let env_scope = crate::test_support::env_scope_ticket();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _env_scope = crate::test_support::join_env_scope(env_scope);
         let canonical = package
             .canonicalize()
             .with_context(|| format!("failed to resolve {}", package.display()))?;

@@ -3834,9 +3834,18 @@ fn load_default_policy() -> anyhow::Result<Option<ExecPolicyConfig>> {
     Ok(Some(config))
 }
 
-const FOREGROUND_TIMEOUT_RECOVERY_HINT: &str = "Foreground Bash is for bounded commands. \
-The timed-out process was killed; rerun long work as Bash action=\"run\" background=true, \
-then poll with Bash action=\"wait\" task_id=\"<id>\".";
+/// The last `n` lines of `text`, marking how many were left out.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= n {
+        return text.to_string();
+    }
+    format!(
+        "[{} earlier lines]\n{}",
+        lines.len() - n,
+        lines[lines.len() - n..].join("\n")
+    )
+}
 
 const MACOS_PROVENANCE_HINT: &str = "Docker buildx failed to update its activity file due to a macOS \
 com.apple.provenance restriction. Files created by Docker Desktop's signed process carry a \
@@ -5042,16 +5051,23 @@ async fn execute_foreground_via_background(
             return Ok(snapshot);
         }
 
+        // The foreground budget is how long the turn waits, never how long
+        // the command may live. Past it the process keeps running as a
+        // background job — exactly as Ctrl+B would move it — and the model
+        // gets the output so far plus the job id to wait on, read, or cancel.
+        // Killing here threw away minutes of a build or test run and made the
+        // model start it over.
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let mut manager = context
                 .shell_manager
                 .lock()
                 .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-            let mut result = manager.kill(&task_id)?;
-            manager.acknowledge_foreground_completion(&task_id);
-            result.status = ShellStatus::TimedOut;
+            if let Some(process) = manager.processes.get_mut(&task_id) {
+                process.background = true;
+            }
+            let snapshot = manager.get_output(&task_id, false, 0)?;
             foreground.armed = false;
-            return Ok(result);
+            return Ok(snapshot);
         }
 
         tokio::time::sleep(Duration::from_millis(poll_tick_ms)).await;
@@ -5222,11 +5238,10 @@ const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// `BASH_MAX_TIMEOUT_MS` (~24.8 days), so a command that blocked on an
 /// interactive prompt or a hung network call pinned the turn indefinitely —
 /// the tool row just counted seconds while the model waited. The tool's own
-/// schema already promises `action=run 120000`, and its description already
-/// says foreground is for bounded commands, so honor that: an omitted
-/// timeout takes the advertised default, which lets
-/// `FOREGROUND_TIMEOUT_RECOVERY_HINT` kill the process and tell the model to
-/// rerun with `background=true`.
+/// schema already promises `action=run 120000`, so an omitted timeout takes
+/// that default as the foreground wait. Past it the command moves to the
+/// background (it is never killed for running long) and the model gets its
+/// output so far and task id.
 ///
 /// An explicit `timeout_ms` is still honored up to the full contract ceiling,
 /// and background and interactive runs keep their own lifetimes: their
@@ -5290,10 +5305,14 @@ fn finish_contract_bash_result(
     }
     if result.status == ShellStatus::Running {
         let task_id = result.task_id.as_deref().unwrap_or("unknown");
-        let partial = (!output.is_empty()).then(|| format!("\n\nOutput so far:\n{output}"));
+        let so_far = if output.trim().is_empty() {
+            "(no output yet)".to_string()
+        } else {
+            tail_lines(output.trim(), 20)
+        };
         return Ok(ToolResult::success(format!(
-            "Foreground shell wait moved to /jobs: {task_id}{}\n\nThe command is still running; completion will appear as a runtime event.",
-            partial.as_deref().unwrap_or_default()
+            "Still running after {}s; moved to the background as {task_id} (not killed).\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". It stops when the session ends.",
+            result.duration_ms / 1_000
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
@@ -5338,7 +5357,7 @@ impl ToolSpec for LowercaseBashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
-                "timeout": { "type": "number", "description": "Optional timeout in seconds; when omitted the command is killed after 120 seconds." },
+                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 120 seconds). A command still running then is not killed: it moves to the background and you get its output so far and a task_id. Find task_shell_wait with tool_search to read more or wait for it." },
                 "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
@@ -5460,7 +5479,7 @@ pub(crate) fn readonly_bash_input_schema() -> serde_json::Value {
             "command": { "type": "string", "description": "A classifier-approved read command, or analysis code with read_only=true" },
             "read_only": { "type": "boolean", "description": "Require native filesystem read-only and no-network enforcement for analysis code; unavailable sandboxes fail closed." },
             "cwd": { "type": "string", "description": "Workspace-relative working directory" },
-            "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (1000-600000)" }
+            "timeout_ms": { "type": "integer", "description": "Foreground wait in milliseconds (1000-600000). A command still running then moves to the background; it is not killed." }
         },
         "required": ["command"],
         "additionalProperties": false
@@ -5542,7 +5561,7 @@ impl ToolSpec for BashTool {
                 "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only and no-network execution. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds. The default depends on the action: action=run 120000 (the standalone Bash tool caps it at 600000), action=wait 30000, action=interact 1000. A foreground action=run that omits this is bounded by that default and killed with a background-rerun hint; pass an explicit value for longer foreground work, or background=true. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
+                    "description": "How long to wait, in milliseconds. action=run: how long the turn waits in the foreground (default 120000, max 600000); a command still running then is NOT killed — it moves to the background and you get its output so far and task_id. action=wait 30000, action=interact 1000. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
                 },
                 "background": {
                     "type": "boolean",
@@ -5772,14 +5791,15 @@ impl ToolSpec for BashTool {
                     // A typed denial, so a Fleet worker's no-progress guard
                     // counts it. #6298: an agent has no mode to switch to,
                     // so it gets the same next steps as the other read-only
-                    // gates; only a parent session is pointed at Work mode.
+                    // gates; only a parent session is told the user can
+                    // change modes.
                     let message = if context.owner_agent_id.is_some()
                         || context.tool_authority.is_some()
                     {
                         readonly_refusal(&rejection, readonly_enforced_lane_available(context))
                     } else {
                         format!(
-                            "{rejection}. Use a read-only inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
+                            "{rejection}. This shell admits read-only inspection commands only. The user can change modes with /mode."
                         )
                     };
                     return Err(ToolError::permission_denied(message));
@@ -6387,12 +6407,23 @@ impl ToolSpec for BashTool {
                         "completion is delivered to the model as an internal runtime event and shown in task/status state."
                     };
                     if backgrounded_foreground {
+                        let seconds = result.duration_ms / 1_000;
+                        let so_far = match (result.stdout.trim(), result.stderr.trim()) {
+                            ("", "") => "(no output yet)".to_string(),
+                            (out, "") => tail_lines(out, 20),
+                            ("", err) => format!("STDERR:\n{}", tail_lines(err, 20)),
+                            (out, err) => format!(
+                                "{}\n\nSTDERR:\n{}",
+                                tail_lines(out, 20),
+                                tail_lines(err, 20)
+                            ),
+                        };
                         format!(
-                            "Foreground shell wait moved to /jobs: {task_id_str}\n\nReturns immediately; {completion_contract} Keep working; call Bash action=\"wait\" task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Still running after {seconds}s; moved to the background as {task_id_str} (not killed).\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion. It stops when the session ends."
                         )
                     } else {
                         format!(
-                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call Bash action=\"wait\" task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
                         )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
@@ -6402,7 +6433,7 @@ impl ToolSpec for BashTool {
                     )
                 } else if result.status == ShellStatus::TimedOut {
                     format!(
-                        "Command timed out after {timeout_value_ms}ms; process killed.\n\n{FOREGROUND_TIMEOUT_RECOVERY_HINT}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                        "Command timed out after {timeout_value_ms}ms; process killed.\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
                         result.stdout, result.stderr
                     )
                 } else {
@@ -6494,18 +6525,6 @@ impl ToolSpec for BashTool {
                         json!("runtime_event_and_task_status")
                     };
                     metadata["background_policy"] = json!("nonblocking");
-                }
-                if result.status == ShellStatus::TimedOut && !background && !interactive {
-                    metadata["foreground_timeout_recovery"] = json!({
-                        "process_killed": true,
-                        "hint": FOREGROUND_TIMEOUT_RECOVERY_HINT,
-                        "recommended_tools": ["Bash", "task_shell_start", "task_shell_wait"],
-                        "rerun_as": {"tool": "Bash", "action": "run", "background": true},
-                        "poll_with": [
-                            {"tool": "Bash", "action": "wait"},
-                            {"tool": "task_shell_wait"}
-                        ]
-                    });
                 }
                 if let Some(hint) = network_restricted_hint {
                     metadata["sandbox_network_restricted"] = json!(true);

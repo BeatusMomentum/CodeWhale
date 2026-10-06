@@ -8626,12 +8626,12 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
     let mut first = ChildSurfaceProbe::new(catalog.clone(), &warm);
     let mut second = ChildSurfaceProbe::new(catalog, &[]);
     let first_names = model_tool_names(model_request_tools(&mut first));
-    assert!(!first_names.contains("deferred_0"));
-    assert!(first_names.contains("deferred_8"));
-    assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_8"));
+    assert!(first_names.contains("deferred_0"));
+    assert!(!first_names.contains("deferred_8"));
+    assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_0"));
 
-    first.catalog_mut().retain(|tool| tool.name != "deferred_8");
-    assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_8"));
+    first.catalog_mut().retain(|tool| tool.name != "deferred_0");
+    assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_0"));
     first
         .catalog_mut()
         .push(synthetic_deferred_tool("oversized", 17 * 1024));
@@ -8652,8 +8652,8 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
         .collect::<Vec<_>>();
     let mut byte_surface = ChildSurfaceProbe::new(byte_catalog, &byte_warm);
     let byte_names = model_tool_names(model_request_tools(&mut byte_surface));
-    assert!(!byte_names.contains("bytes_0"));
-    assert!(byte_names.contains("bytes_1") && byte_names.contains("bytes_2"));
+    assert!(byte_names.contains("bytes_0") && byte_names.contains("bytes_1"));
+    assert!(!byte_names.contains("bytes_2"));
 }
 
 #[tokio::test]
@@ -12711,6 +12711,24 @@ fn annotate_child_model_error_adds_actionable_hint() {
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
     );
+
+    // A spent-balance quota refusal names the route too: the operator must
+    // know which account is exhausted. A short-lived rate limit passes
+    // through: retry, not a route change, is the recovery.
+    let quota = annotate_child_model_error(
+        "[quota_exhausted] Provider plan quota exhausted: You have run out of credits.",
+        "kimi-k2",
+        provider,
+        &inherit,
+    );
+    assert!(
+        quota.contains("child-agent model config"),
+        "exhausted balance gets the hint: {quota}"
+    );
+    assert!(quota.contains("kimi-k2"), "names the model: {quota}");
+    let limited =
+        annotate_child_model_error("Rate limited: slow down", "kimi-k2", provider, &inherit);
+    assert_eq!(limited, "Rate limited: slow down");
 }
 
 #[test]
@@ -22043,12 +22061,16 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // lists (D04-11, 46835a2fc; `apply_patch`'s `oneOf` had degraded to three
 // unsatisfiable `{}` branches), and +56B for the finance timeout description
 // now saying the budget is shared with the chart fallback (D03-m3,
-// 7c36620d4). Linux measured 13B above macOS last time, so the ceiling is
-// 88,837B until a hosted Linux run re-measures it.
-// The wait-bound disclosure adds exactly 222 UTF-8 bytes to the agent schema.
-// Preserve the reviewed baseline plus only that intentional copy increase;
-// the runtime measurement below still detects unrelated growth.
-const PARENT_SURFACE_BYTE_CEILING: usize = 89_059;
+// 7c36620d4). Re-measured 2026-10-05 at 89,602B on macOS (9dbc2efe1).
+// Re-measured 2026-10-05 at 90,121B on macOS, +519B: the model-facing tool
+// description rewrites (goal, file read/write/edit, web search/fetch,
+// workflow, request_user_input). The static prompt bytes are unchanged.
+// Linux measured 13B above macOS last time, so the ceiling carries that
+// margin until a hosted Linux run re-measures it.
+// The wait-bound disclosure (#6850) adds exactly 222 UTF-8 bytes to the
+// agent schema on top of the rewrites; the runtime measurement below still
+// detects unrelated growth.
+const PARENT_SURFACE_BYTE_CEILING: usize = 90_343;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {

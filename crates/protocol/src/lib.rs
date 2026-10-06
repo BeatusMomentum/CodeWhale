@@ -1125,3 +1125,8 @@ pub enum EventFrame {
 
 pub mod request;
 pub mod role;
+
+/// Pure provenance data shared by hosts and portable status reports.
+pub mod cloud_facts;
+
+pub mod display;

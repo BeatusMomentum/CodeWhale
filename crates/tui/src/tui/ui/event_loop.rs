@@ -377,8 +377,7 @@ pub(crate) fn surface_goal_persistence_failure(app: &mut App, error: &str) {
 
 /// Apply Space only to the owner stored by the final render pass.
 pub(super) fn handle_transcript_space(app: &mut App) -> bool {
-    let Some((owner, reasoning_target)) = app.viewport.transcript_cache.take_transcript_action()
-    else {
+    let Some((owner, fold_target)) = app.viewport.transcript_cache.take_transcript_action() else {
         return false;
     };
     let idx = owner.cell_index;
@@ -389,28 +388,62 @@ pub(super) fn handle_transcript_space(app: &mut App) -> bool {
         return false;
     };
     let is_thinking = matches!(cell, HistoryCell::Thinking { .. });
-    if let Some(target) = reasoning_target.filter(|_| !app.collapsed_cells.contains(&idx)) {
+    let selected_first_line = app
+        .viewport
+        .transcript_selection
+        .ordered_endpoints()
+        .filter(|(start, _)| {
+            app.viewport
+                .transcript_cache
+                .line_meta()
+                .get(start.line_index)
+                .and_then(|meta| meta.cell_line())
+                .is_some_and(|(rendered, _)| app.original_cell_index_for_rendered(rendered) == idx)
+        })
+        .and_then(|_| {
+            app.viewport
+                .transcript_cache
+                .line_meta()
+                .iter()
+                .position(|meta| {
+                    meta.cell_line().is_some_and(|(rendered, _)| {
+                        app.original_cell_index_for_rendered(rendered) == idx
+                    })
+                })
+        });
+    if let Some(target) = fold_target.filter(|_| !app.collapsed_cells.contains(&idx)) {
         if target.owner != owner {
             return false;
         }
-        if !app.show_thinking || !is_thinking {
+        if is_thinking && !app.show_thinking {
             return false;
         }
         // The rendered action names the state the user is asking for, so
         // record that outright. A relative bit would be re-read as its
         // opposite the next time a display preference changed (#5847).
         let intent = match target.action {
-            ReasoningAction::Expand => ThinkingFold::Expanded,
-            ReasoningAction::Collapse => ThinkingFold::Collapsed,
+            CellFoldAction::Expand => TranscriptFold::Expanded,
+            CellFoldAction::Collapse => TranscriptFold::Collapsed,
         };
-        app.thinking_folds.insert(idx, intent);
+        app.cell_folds.insert(idx, intent);
     } else if app.toggle_tool_run_expansion_at(idx) {
         return true;
     } else if !app.collapsed_cells.remove(&idx) {
         if is_thinking {
             return false;
         }
-        app.collapsed_cells.insert(idx);
+        app.cell_folds.insert(idx, TranscriptFold::Collapsed);
+    }
+    if let Some(line_index) = selected_first_line {
+        // A middle-body row may disappear or become another cell after the
+        // fold. Keep the selected owner at its stable first row (#6876).
+        let point = crate::tui::selection::TranscriptSelectionPoint {
+            line_index,
+            column: 0,
+        };
+        app.viewport.transcript_selection.clear();
+        app.viewport.transcript_selection.anchor = Some(point);
+        app.viewport.transcript_selection.head = Some(point);
     }
     app.mark_history_updated();
     true
@@ -444,7 +477,11 @@ pub(super) fn flush_paste_burst_before_composer(app: &mut App, now: Instant) -> 
     }
     match app.take_paste_burst_flush_if_enabled(now) {
         crate::tui::paste_burst::FlushResult::Paste(text) => {
-            app.insert_str(&text);
+            // Terminals without bracketed paste deliver a dropped file the
+            // same way; attach it exactly as `insert_paste_text` would.
+            if !app.attach_pasted_image_paths(&text) {
+                app.insert_str(&text);
+            }
             true
         }
         crate::tui::paste_burst::FlushResult::Typed(' ')
@@ -2279,6 +2316,7 @@ pub(crate) async fn run_event_loop(
                 let redraw_requested_before_event = received_engine_event;
                 received_engine_event = true;
                 capture_turn_started_metadata(app, &event);
+                observe_human_request_settlement(app, &event);
                 // Child approval bookkeeping runs before every filter: it is
                 // keyed by approval id and agent, not by the active session,
                 // so a withdrawal always retires its card (approvals M1).
@@ -7411,6 +7449,113 @@ pub(crate) async fn run_chatgpt_pkce_login_from_tui(
     };
     app.needs_redraw = true;
     Ok(switched)
+}
+
+/// OrcaRouter PKCE sign-in from the `/auth orcarouter` command and the provider
+/// picker's "Connect with OrcaRouter" option.
+///
+/// The TUI is suspended for the same reason as ChatGPT/Xai sign-in: the flow
+/// prints the consent URL and blocks on a loopback callback, so it must own the
+/// terminal. Unlike those flows it returns an [`crate::oauth::OrcaCredential`] —
+/// a durable API key — which is stored through the ordinary provider credential
+/// path, so the live route ends up identical to the API-key adapter's.
+pub(crate) async fn run_orcarouter_pkce_login_from_tui(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+) -> Result<bool> {
+    pause_terminal(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+    )?;
+    let login_result = tokio::task::spawn_blocking(|| {
+        let inputs = crate::oauth::OrcaLoginInputs::from_env();
+        let mut challenge = crate::oauth::cli_challenge_writer()?;
+        crate::oauth::orcarouter_pkce_login(&inputs, challenge.as_mut())
+    })
+    .await
+    .context("OrcaRouter PKCE login worker failed")
+    .and_then(|result| result);
+    resume_terminal(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+        app.synchronized_output_enabled,
+    )?;
+
+    let mut login_message = "OrcaRouter sign-in complete".to_string();
+    let switched = match login_result {
+        Ok(credential) => {
+            let scope_note = (!credential.scope_satisfies_purpose()).then(|| {
+                format!(
+                    "OrcaRouter granted scope \"{}\" while this client asked for \"{}\"; the narrower grant is reused as-is.",
+                    credential.granted_scope(),
+                    crate::oauth::ORCAROUTER_SCOPE
+                )
+            });
+            match crate::oauth::activate_orcarouter_credential(
+                &credential,
+                app.config_path.as_deref(),
+            ) {
+                Ok(saved) => {
+                    login_message = format!(
+                        "OrcaRouter is ready; stored the key in {}",
+                        saved.describe()
+                    );
+                    if let Some(note) = scope_note {
+                        login_message.push('\n');
+                        login_message.push_str(&note);
+                    }
+                    apply_orcarouter_credential_login(app, engine_handle, config).await
+                }
+                Err(err) => {
+                    let message = format!("OrcaRouter sign-in failed: {err:#}");
+                    app.add_message(HistoryCell::System {
+                        content: message.clone(),
+                    });
+                    app.status_message = Some(message);
+                    false
+                }
+            }
+        }
+        Err(err) => {
+            let message = format!("OrcaRouter sign-in failed: {err:#}");
+            app.add_message(HistoryCell::System {
+                content: message.clone(),
+            });
+            app.status_message = Some(message);
+            false
+        }
+    };
+    app.needs_redraw = true;
+    if switched {
+        app.add_message(HistoryCell::System {
+            content: login_message,
+        });
+    }
+    Ok(switched)
+}
+
+/// Switch the live route onto OrcaRouter after its credential landed, using the
+/// same store the API-key adapter wrote to. The key itself never passes through
+/// here — only the identity.
+async fn apply_orcarouter_credential_login(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+) -> bool {
+    let identity = match config.builtin_provider_identity(ProviderKind::Orcarouter) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            return false;
+        }
+    };
+    switch_provider(app, engine_handle, config, identity, None).await
 }
 
 /// Move held permission receipts into the transcript: those for `tool_id`

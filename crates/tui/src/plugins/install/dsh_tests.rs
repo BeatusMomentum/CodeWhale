@@ -489,6 +489,7 @@ fn manifests_must_declare_contained_patches() {
 
 #[test]
 fn policy_and_dependency_fields_never_widen_activation() {
+    let _home = crate::test_support::SealedHome::new();
     for field in [
         "inject: [approvals]",
         "intercept: {tools: true}",

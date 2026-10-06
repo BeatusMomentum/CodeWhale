@@ -77,12 +77,12 @@ const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
     CoreActionToolFallback {
         name: "write",
         description: "Create or replace workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-mutation authority; switch to Work mode before writing.",
+        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-writing authority; the user can change modes with /mode.",
     },
     CoreActionToolFallback {
         name: "edit",
         description: "Apply exact replacements to workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-mutation authority; switch to Work mode before editing.",
+        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-writing authority; the user can change modes with /mode.",
     },
 ];
 

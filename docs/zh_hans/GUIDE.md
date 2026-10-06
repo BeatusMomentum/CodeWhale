@@ -51,7 +51,8 @@ Windows 用户请选择 [GitHub Releases](https://github.com/codewhale-hq/CodeWh
 [安装与迁移指南](INSTALL.md#recommended-official-github-releases)。Android/Termux 使用专用的
 [预览压缩包或源码构建路径](INSTALL.md#android--termux-arm64)。
 
-当你想要隔离的运行时，也可以用 Docker：
+当你想要隔离的运行时，也可以用 Docker。当前公开发行的镜像版本是 0.10.0；
+要测试当前 `main`，请[从源码构建](DOCKER.md#本地构建)。
 
 ```bash
 docker volume create codewhale-home
@@ -60,7 +61,7 @@ docker run --rm -it \
   -v codewhale-home:/home/codewhale/.codewhale \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/codewhale-hq/codewhale:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 把安装目录加入 PATH 后，从你希望它工作的仓库或目录启动 Codewhale：

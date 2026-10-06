@@ -912,6 +912,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Check portable config policy boundary
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          python3 -B scripts/test_check_command_config_policy_proof.py
+          sh scripts/check-portable-config-policy.sh
       - uses: actions/setup-node@v7
         # The extension-host integration tests spawn the real bundle under
         # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a
@@ -1012,6 +1018,7 @@ jobs:
           if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
           exit "$status"
         env:
+          QA_PTY_DIAGNOSTICS_DIR: ${{ runner.temp }}/pty-failures
           CODEWHALE_EXT_HOST_TESTS: '1'
           CODEWHALE_EXT_HOST_BUN_TESTS: '1'
           # sccache 0.17 panics resolving its config directory under the
@@ -1035,6 +1042,15 @@ jobs:
           # forced 32 MiB lives in spawned binaries, which size their own
           # stacks explicitly and never read this variable.
           RUST_MIN_STACK: '16777216'
+      - name: Retain sealed terminal failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: terminal-failures-${{ runner.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pty-failures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Shared-process workspace qualification
         if: github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
         shell: bash
@@ -1234,7 +1250,9 @@ jobs:
     # The explicit Ubuntu-only qualification has no warm Test macOS leg, so
     # retain these gates on the hosted fallback even when self-hosting is on.
     if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && ((github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice') || !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true'))
-    timeout-minutes: 75
+    # Cold hosted builds consumed 73 minutes before eval could start (F run
+    # 37497498829). Match Test's compile allowance; RSS/eval limits stay intact.
+    timeout-minutes: 165
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7

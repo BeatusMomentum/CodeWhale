@@ -12741,8 +12741,8 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
         "Continue with the check?"
     );
 
-    manager
-        .submit_user_input(
+    let (submitted, delivered) = tokio::join!(
+        manager.submit_user_input(
             &thread.id,
             "input_reload",
             crate::tools::user_input::UserInputResponse {
@@ -12752,9 +12752,11 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
                     value: "Yes".to_string(),
                 }],
             },
-        )
-        .await?;
-    match harness.recv_user_input_submission().await {
+        ),
+        harness.recv_user_input_submission(),
+    );
+    submitted?;
+    match delivered {
         Some((id, response)) => {
             assert_eq!(id, "input_reload");
             assert_eq!(response.answers[0].id, "continue");
@@ -12828,6 +12830,417 @@ async fn unknown_user_input_id_is_not_delivered_to_engine() -> Result<()> {
 }
 
 #[tokio::test]
+async fn user_input_tool_timeout_and_cancel_clear_snapshot_before_turn_end() -> Result<()> {
+    for error in [
+        crate::tools::spec::ToolError::Timeout { seconds: 1 },
+        crate::tools::spec::ToolError::cancelled("turn canceled"),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "ask before continuing work".into(),
+                    ..StartTurnRequest::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(_))
+        ));
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallStarted {
+                id: "input-timeout".into(),
+                model_call: None,
+                name: "request_user_input".into(),
+                input: json!({"questions": []}),
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::UserInputRequired {
+                id: "input-timeout".into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .get_thread_detail(&thread.id)
+                    .await?
+                    .pending_user_inputs
+                    .len()
+                    == 1
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("question was not registered")??;
+
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallComplete {
+                id: "input-timeout".into(),
+                model_call: None,
+                name: "request_user_input".into(),
+                result: Err(error),
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = manager.get_thread_detail(&thread.id).await?;
+                let events = manager.events_since(&thread.id, None)?;
+                if detail.pending_user_inputs.is_empty()
+                    && events.iter().any(|event| {
+                        event.event == "user_input.canceled"
+                            && event.turn_id.as_deref() == Some(turn.id.as_str())
+                            && event.payload.get("input_id").and_then(Value::as_str)
+                                == Some("input-timeout")
+                            && event.payload.get("terminal").and_then(Value::as_bool) == Some(false)
+                    })
+                {
+                    assert!(!events.iter().any(|event| event.event == "turn.completed"));
+                    return Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("completed tool left its question pending")??;
+        assert_eq!(
+            manager.store.load_turn(&turn.id)?.status,
+            RuntimeTurnStatus::InProgress
+        );
+        assert!(
+            !manager
+                .submit_user_input(
+                    &thread.id,
+                    "input-timeout",
+                    crate::tools::user_input::UserInputResponse {
+                        answers: Vec::new()
+                    },
+                )
+                .await?,
+            "an expired question accepted a late answer"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                harness.recv_user_input_cancellation()
+            )
+            .await
+            .is_err(),
+            "a completed waiter must not receive another cancellation"
+        );
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        wait_for_terminal_turn(&manager, &turn.id).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_tool_settlement_preserves_other_request_ids_turns_and_retryable_receipts()
+-> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    for (id, turn_id) in [
+        ("inner-question", "turn-question"),
+        ("new-question", "turn-new"),
+    ] {
+        manager.register_pending_user_input(
+            &thread.id,
+            PendingUserInputRequest {
+                id: id.into(),
+                turn_id: turn_id.into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            },
+        );
+    }
+    // Completing an enclosing execute_tools call is not the inner question's
+    // terminal fact. Neither may a delayed prior-turn event own a reused id.
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "outer-call")
+        .await?;
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-old", "inner-question")
+        .await?;
+    assert_eq!(manager.pending_requests_for_thread(&thread.id).1.len(), 2);
+    assert!(
+        manager
+            .events_since(&thread.id, None)?
+            .iter()
+            .all(|event| event.event != "user_input.canceled")
+    );
+
+    let fault = EventAppendFaultGuard::arm(&thread.id, EventAppendTestFault::AfterSync);
+    let error = manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "inner-question")
+        .await
+        .expect_err("injected append failure must retain the request");
+    drop(fault);
+    assert!(format!("{error:#}").contains("rolled back"));
+    assert_eq!(manager.pending_requests_for_thread(&thread.id).1.len(), 2);
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "inner-question")
+        .await?;
+    let pending = manager.pending_requests_for_thread(&thread.id).1;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "new-question");
+    // Duplicate completion is idempotent and never manufactures a receipt.
+    manager
+        .settle_user_input_for_completed_tool(&thread.id, "turn-question", "inner-question")
+        .await?;
+    assert_eq!(
+        manager
+            .events_since(&thread.id, None)?
+            .iter()
+            .filter(|event| event.event == "user_input.canceled")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_tool_settlement_waits_for_answer_receipt_and_recovers_failed_claim()
+-> Result<()> {
+    for answered in [false, true] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager.register_pending_user_input(
+            &thread.id,
+            PendingUserInputRequest {
+                id: "input-race".into(),
+                turn_id: "turn-race".into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            },
+        );
+        let PendingUserInputClaim::Claimed(request) =
+            manager.claim_pending_user_input(&thread.id, "input-race", None)
+        else {
+            bail!("answer did not own the request");
+        };
+        let settlement =
+            manager.settle_user_input_for_completed_tool(&thread.id, "turn-race", "input-race");
+        tokio::pin!(settlement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut settlement)
+                .await
+                .is_err(),
+            "tool completion must wait for the answer receipt's owner"
+        );
+        if answered {
+            manager
+                .settle_claimed_user_input(
+                    &thread.id,
+                    None,
+                    request,
+                    UserInputTerminalOutcome::Answered(
+                        crate::tools::user_input::UserInputResponse {
+                            answers: Vec::new(),
+                        },
+                    ),
+                )
+                .await?;
+        } else {
+            // The API worker restores its claim after a retryable append
+            // error. The already-completed waiter still needs retirement.
+            manager.restore_pending_user_input_claim(&thread.id, &request);
+        }
+        tokio::time::timeout(Duration::from_secs(2), &mut settlement)
+            .await
+            .context("tool settlement did not follow the answer receipt")??;
+        assert!(manager.pending_requests_for_thread(&thread.id).1.is_empty());
+        let events = manager.events_since(&thread.id, None)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "user_input.canceled")
+                .count(),
+            usize::from(!answered)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "user_input.answered")
+                .count(),
+            usize::from(answered)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_rejected_answer_or_cancel_restores_exact_question_for_retry() -> Result<()> {
+    for cancel in [false, true] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        manager.register_pending_user_input(
+            &thread.id,
+            PendingUserInputRequest {
+                id: "input-rejected".into(),
+                turn_id: "turn-rejected".into(),
+                request: crate::tools::user_input::UserInputRequest {
+                    questions: Vec::new(),
+                },
+            },
+        );
+        let delivery = async {
+            if cancel {
+                manager
+                    .cancel_user_input(&thread.id, "input-rejected")
+                    .await
+            } else {
+                manager
+                    .submit_user_input(
+                        &thread.id,
+                        "input-rejected",
+                        crate::tools::user_input::UserInputResponse {
+                            answers: Vec::new(),
+                        },
+                    )
+                    .await
+            }
+        };
+        let (result, rejected) = tokio::join!(delivery, harness.reject_user_input_decision());
+        assert!(
+            result.is_err(),
+            "Engine rejection cannot report delivery success"
+        );
+        assert_eq!(rejected.as_deref(), Some("input-rejected"));
+        let pending = manager.pending_requests_for_thread(&thread.id).1;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "input-rejected");
+        assert!(manager.events_since(&thread.id, None)?.iter().any(|event| {
+            event.event == "user_input.required" && event.payload.get("delivery_error").is_some()
+        }));
+        let (accepted, consumed) = tokio::join!(
+            manager.submit_user_input(
+                &thread.id,
+                "input-rejected",
+                crate::tools::user_input::UserInputResponse {
+                    answers: Vec::new()
+                }
+            ),
+            harness.recv_user_input_submission(),
+        );
+        assert!(accepted?);
+        assert!(consumed.is_some());
+        assert!(manager.pending_requests_for_thread(&thread.id).1.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_terminal_tool_result_does_not_resurrect_rejected_inflight_answer() -> Result<()>
+{
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager.register_pending_user_input(
+        &thread.id,
+        PendingUserInputRequest {
+            id: "input-expired-race".into(),
+            turn_id: "turn-expired-race".into(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        },
+    );
+    let terminal = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .pending_user_inputs
+                    .lock()
+                    .get(&(thread.id.clone(), "input-expired-race".into()))
+                    .is_some_and(|entry| entry.settling)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        manager
+            .settle_user_input_for_completed_tool(
+                &thread.id,
+                "turn-expired-race",
+                "input-expired-race",
+            )
+            .await
+    };
+    let (submitted, completed, rejected) = tokio::join!(
+        manager.submit_user_input(
+            &thread.id,
+            "input-expired-race",
+            crate::tools::user_input::UserInputResponse {
+                answers: Vec::new()
+            }
+        ),
+        terminal,
+        harness.reject_user_input_decision(),
+    );
+    assert!(submitted.is_err());
+    completed?;
+    assert_eq!(rejected.as_deref(), Some("input-expired-race"));
+    assert!(manager.pending_requests_for_thread(&thread.id).1.is_empty());
+    let events = manager.events_since(&thread.id, None)?;
+    let last = events
+        .iter()
+        .rfind(|event| event.event.starts_with("user_input."))
+        .unwrap();
+    assert_eq!(last.event, "user_input.canceled");
+    assert!(
+        !manager
+            .submit_user_input(
+                &thread.id,
+                "input-expired-race",
+                crate::tools::user_input::UserInputResponse {
+                    answers: Vec::new()
+                }
+            )
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_input_receipt_append_failure_restores_request_without_delivery() -> Result<()> {
     const SECRET: &str = "answer-only-for-engine-after-retry";
     let manager = test_manager(test_runtime_dir())?;
@@ -12879,17 +13292,12 @@ async fn user_input_receipt_append_failure_restores_request_without_delivery() -
         "answer reached the engine before its receipt was durable"
     );
 
-    assert!(
-        manager
-            .submit_user_input(&thread.id, "input_retry", response())
-            .await?,
-        "restored request was not retryable"
+    let (submitted, delivered) = tokio::join!(
+        manager.submit_user_input(&thread.id, "input_retry", response()),
+        harness.recv_user_input_submission(),
     );
-    let (_, delivered) =
-        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
-            .await
-            .context("retried answer did not reach the engine")?
-            .context("retried answer was canceled")?;
+    assert!(submitted?, "restored request was not retryable");
+    let (_, delivered) = delivered.context("retried answer was not consumed")?;
     assert_eq!(delivered.answers[0].value, SECRET);
     let events = manager.events_since(&thread.id, None)?;
     assert_eq!(
@@ -12973,6 +13381,16 @@ async fn user_input_settlement_outlives_canceled_api_future() -> Result<()> {
             .context("detached settlement did not reach the engine")?
             .context("detached settlement was canceled")?;
     assert_eq!(delivered.answers[0].value, SECRET);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager.pending_requests_for_thread(&thread.id).1.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("accepted detached reply did not retire its request")?;
     let detail = manager.get_thread_detail(&thread.id).await?;
     assert!(detail.pending_user_inputs.is_empty());
     let events = manager.events_since(&thread.id, None)?;
@@ -13039,16 +13457,9 @@ async fn terminal_user_input_cancellation_is_durable_before_engine_delivery() ->
         "terminal cancellation reached the engine before durable append"
     );
     drop(emit_guard);
-    settlement
-        .await
-        .context("terminal settlement task panicked")??;
-    assert!(
-        tokio::time::timeout(Duration::from_secs(2), harness.recv_user_input_submission())
-            .await
-            .context("engine did not receive terminal cancellation")?
-            .is_none(),
-        "terminal cancellation delivered a submitted response"
-    );
+    let (settled, delivered) = tokio::join!(settlement, harness.recv_user_input_cancellation());
+    settled.context("terminal settlement task panicked")??;
+    assert_eq!(delivered.as_deref(), Some("input_terminal_order"));
     let events = manager.events_since(&thread.id, None)?;
     let canceled = events
         .iter()
@@ -19380,6 +19791,37 @@ mod runtime_image_inputs {
             };
             assert_eq!(images, request.images);
             assert_eq!(turn.schema_version, IMAGE_RUNTIME_SCHEMA_VERSION);
+            // The next fork shares this workspace. Finish the mock normally
+            // and observe its durable settlement before restoring that case.
+            for event in [
+                EngineEvent::TurnStarted {
+                    turn_id: turn.id.clone(),
+                    created_at: Utc::now(),
+                    route: None,
+                    submission_id: None,
+                },
+                EngineEvent::MessageStarted { index: 0 },
+                EngineEvent::MessageDelta {
+                    index: 0,
+                    content: "stored image fixture response".into(),
+                },
+                EngineEvent::MessageComplete { index: 0 },
+                EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                },
+            ] {
+                harness.tx_event.send(event).await?;
+            }
+            assert_eq!(
+                wait_for_terminal_turn(&manager, &turn.id).await?.status,
+                RuntimeTurnStatus::Completed
+            );
         }
         Ok(())
     }
@@ -22064,9 +22506,9 @@ async fn a_pending_turn_workspace_is_reconciled_on_restart() -> Result<()> {
     Ok(())
 }
 /// #6582: a Runtime API `bash` completion hands the command's exit code and
-/// status to `tool_call_after` and `on_error`, as the TUI does. The runtime
-/// path used to pass `None`; and a failing command, which `bash` reports as a
-/// `ToolError`, reached hooks with no exit code on either surface.
+/// status to `tool_call_after` and `on_error`, as the TUI does. A nonzero
+/// exit is a `ToolError`. A foreground wait that expires is not: the command
+/// moves to the background and stays running, so `on_error` does not fire.
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Result<()> {
@@ -22134,7 +22576,7 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
     let (after, errors) = loop {
         let after = read_lines(&after_log);
         let errors = read_lines(&error_log);
-        if (after.len() >= 4 && errors.len() >= 3) || Instant::now() >= deadline {
+        if (after.len() >= 4 && errors.len() >= 2) || Instant::now() >= deadline {
             break (after, errors);
         }
         sleep(Duration::from_millis(20)).await;
@@ -22145,7 +22587,7 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
             "call-exit-0 0 completed true",
             "call-exit-1 1 failed false",
             "call-exit-127 127 failed false",
-            "call-timeout unset timed_out false",
+            "call-timeout unset running true",
         ]
     );
     assert_eq!(
@@ -22153,7 +22595,6 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
         vec![
             "call-exit-1 1 failed false",
             "call-exit-127 127 failed false",
-            "call-timeout unset timed_out false",
         ]
     );
     Ok(())
@@ -22890,4 +23331,63 @@ fn runtime_transport_retry_counts_default_old_bytes_and_preserve_new_receipts() 
         serde_json::from_value::<RuntimeTurnRequestDiagnostics>(encoded).unwrap(),
         facts
     );
+}
+
+#[tokio::test]
+async fn profile_constitution_runtime_admission_binds_the_complete_snapshot_to_replay() -> Result<()>
+{
+    use codewhale_config::user_constitution::{ProfileConstitution, ProfileConstitutionSnapshot};
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let request = StartTurnRequest {
+        prompt: "Use this profile".into(),
+        operation_key: Some("constitution-once".into()),
+        profile_constitution: Some(ProfileConstitutionSnapshot {
+            account_id: "acct_fixture".into(),
+            revision: 4,
+            constitution: ProfileConstitution {
+                notes: "Exact preference".into(),
+                ..Default::default()
+            },
+        }),
+        ..Default::default()
+    };
+    let turn = manager.start_turn(&thread.id, request.clone()).await?;
+    let Some(Op::SendMessage(spec)) = harness.rx_op.recv().await else {
+        bail!("missing Engine operation");
+    };
+    assert_eq!(spec.profile_constitution, request.profile_constitution);
+    assert_eq!(
+        manager.start_turn(&thread.id, request.clone()).await?.id,
+        turn.id
+    );
+    let mut changed = request.clone();
+    changed
+        .profile_constitution
+        .as_mut()
+        .unwrap()
+        .constitution
+        .notes = "New preference".into();
+    assert!(manager.start_turn(&thread.id, changed).await.is_err());
+    let mut changed = request.clone();
+    changed.profile_constitution = None;
+    assert!(manager.start_turn(&thread.id, changed).await.is_err());
+    assert!(harness.rx_op.try_recv().is_err());
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+    Ok(())
 }

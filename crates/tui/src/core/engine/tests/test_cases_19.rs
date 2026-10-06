@@ -1032,7 +1032,7 @@ async fn turn_wall_clock_budget_stops_the_turn_before_another_model_request() {
         turn_wall_clock: std::time::Duration::ZERO,
         ..deterministic_engine_config(workspace.path())
     };
-    let (mut engine, _handle) =
+    let (mut engine, handle) =
         Engine::new_with_model_client(engine_config, &Config::default(), client);
     let context = crate::tools::ToolContext::new(workspace.path().to_path_buf());
     let registry = crate::tools::ToolRegistry::new(context);
@@ -1056,6 +1056,30 @@ async fn turn_wall_clock_budget_stops_the_turn_before_another_model_request() {
         0,
         "no billable request may be authorized once the budget is spent"
     );
+
+    // #6843: the stop also posts the one error card, so the TUI does not add
+    // its own amber warning. It is a budget error that leaves the session
+    // online (recoverable), not a warning and not an offline-flipping fault.
+    let mut cards = Vec::new();
+    {
+        let mut rx = handle.rx_event.write().await;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Error { envelope, .. } = event {
+                cards.push(envelope);
+            }
+        }
+    }
+    assert_eq!(cards.len(), 1, "one error card: {cards:?}");
+    assert_eq!(
+        cards[0].category,
+        crate::error_taxonomy::ErrorCategory::Budget
+    );
+    assert_eq!(
+        cards[0].severity,
+        crate::error_taxonomy::ErrorSeverity::Error
+    );
+    assert!(cards[0].recoverable, "a spent budget must not flip offline");
+    assert!(cards[0].message.contains("wall-clock budget exhausted"));
 }
 
 /// R1: the wall-clock budget is overridable — a generous budget lets the same

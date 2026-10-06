@@ -19,7 +19,7 @@ var __export = (target, all) => {
 var define_BUILTIN_MODULE_DIGESTS_default;
 var init_define_BUILTIN_MODULE_DIGESTS = __esm({
   "<define:__BUILTIN_MODULE_DIGESTS__>"() {
-    define_BUILTIN_MODULE_DIGESTS_default = { harness: "bf685db5e808ab708ec698e1bc038d173db59f2facb6907fdbd689f336123f8f", mcp: "d5eb38941113934f9768e90ab3f1db021b93980e41be5cdf8836489b7f233b55" };
+    define_BUILTIN_MODULE_DIGESTS_default = { harness: "114addde4e6e70ade28a38fe2c1fa0b521729ab9aaa58273c77f33b2a1b608ae", mcp: "d5eb38941113934f9768e90ab3f1db021b93980e41be5cdf8836489b7f233b55" };
   }
 });
 
@@ -13757,7 +13757,7 @@ async function retryWindowsSharing(operation, beforeRetry) {
       return await operation();
     } catch (error) {
       if (process.platform !== "win32" || retry >= 10 || !["EACCES", "EBUSY", "EPERM"].includes(fsCode(error) ?? "")) throw error;
-      await delay2(50);
+      await delay2((retry + 1) * 50);
     }
   }
 }
@@ -13861,10 +13861,9 @@ function createStorage({ dataDir, isActive, onWarning }) {
       file = void 0;
       await retryWindowsSharing(async () => {
         active();
-        await rename2(temporary, join(directory2, name));
-      }, async () => {
+        await readRecordOnce(directory2, name);
         active();
-        await readRecord(directory2, name);
+        await rename2(temporary, join(directory2, name));
       });
       published = true;
       await syncDirectory(directory2);

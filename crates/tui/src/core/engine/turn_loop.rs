@@ -152,6 +152,10 @@ struct StreamOutcome {
     first_token_at: Option<Instant>,
     request_dispatched_at: Instant,
     stream_error: Option<String>,
+    /// Envelope of a retryable provider error frame (#6795), held back so a
+    /// retry that succeeds leaves no error card. Posted by the caller when the
+    /// request is not re-issued.
+    frame_error: Option<ErrorEnvelope>,
 }
 
 pub(super) fn initial_stream_error_user_message(
@@ -930,6 +934,47 @@ impl Engine {
                 self.turn_wall_clock.spent().as_secs(),
                 self.turn_wall_clock.budget().as_secs(),
             )
+        })
+    }
+
+    /// Post the retryable error frame `process_stream` held back (#6795), once,
+    /// for a turn that ends without re-issuing the request. Every return that
+    /// ends the turn between the stream and the retry decision calls this, so
+    /// no exit leaves the TUI to synthesize its own amber warning instead.
+    ///
+    /// Boxed so the several call sites embed a pointer, not this future, in
+    /// the already very large model-step state machine (a debug-build test
+    /// thread has a 2 MiB stack).
+    pub(super) fn post_held_frame_error<'a>(
+        &'a self,
+        frame_error: &'a Option<ErrorEnvelope>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(envelope) = frame_error {
+                let _ = self.send_stream_event(Event::error(envelope.clone())).await;
+            }
+        })
+    }
+
+    /// Tell the transcript why a turn stopped on one of Codewhale's own
+    /// ceilings (step count, wall clock). Without an error event the TUI adds
+    /// its own hard-coded amber warning for a failed turn (#6843); this card
+    /// is a budget error that leaves the session online. A child run reports
+    /// through its parent's receipt, so it posts only the status line.
+    ///
+    /// Boxed for the same reason as [`Self::post_held_frame_error`].
+    pub(super) fn post_turn_budget_stop<'a>(
+        &'a self,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.send_event(Event::status(message)).await;
+            if self.child_host.is_some() {
+                return;
+            }
+            let _ = self
+                .send_event(Event::error(ErrorEnvelope::budget_stop(message)))
+                .await;
         })
     }
 
@@ -1759,7 +1804,7 @@ impl Engine {
 
             if mode_blocks_command_execution(mode, &tool_name) {
                 blocked_error = Some(ToolError::permission_denied(format!(
-                    "'{tool_name}' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
+                    "'{tool_name}' is not available in Plan mode: Plan has no shell or code-execution tools. The user can change modes with /mode."
                 )));
             }
 
@@ -2042,7 +2087,7 @@ impl Engine {
                 && mode_blocks_write_capable_tool(mode, &tool_name, &tool_input, read_only)
             {
                 blocked_error = Some(ToolError::permission_denied(format!(
-                    "'{tool_name}' is not available in Plan mode - switch to Work mode (`/mode work`) to modify files or run write-capable tools."
+                    "'{tool_name}' is not available in Plan mode: Plan has no file-writing or write-capable tools. The user can change modes with /mode."
                 )));
             }
 
@@ -4247,6 +4292,9 @@ impl Engine {
         let mut stream = stream;
         let mut stream_error: Option<String> = None;
         let mut terminal_stream_error = false;
+        // #6795: the envelope of a retryable error frame, posted only if the
+        // retry budget does not re-issue the request.
+        let mut frame_error: Option<ErrorEnvelope> = None;
 
         let mut current_text_raw = String::new();
         let mut current_text_visible = String::new();
@@ -4913,10 +4961,14 @@ impl Engine {
                     // the same typed envelope contract, record it as the
                     // turn's stream error, and stop consuming. Deltas that
                     // arrive after the failure frame are never forwarded.
-                    let message = error
+                    let raw_message = error
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("provider stream error");
+                    // A bare placeholder ("ERROR") says nothing about the
+                    // cause; the transcript states that instead (#6843).
+                    let unreadable = crate::error_taxonomy::unreadable_error_notice(raw_message);
+                    let message = unreadable.as_deref().unwrap_or(raw_message);
                     crate::logging::warn(format!("Provider stream error event: {message}"));
                     // #6795: a gateway can report a transient upstream failure
                     // as an error frame inside a 200. With nothing actionable
@@ -4929,14 +4981,22 @@ impl Engine {
                     // card behind. Auth, invalid-model and every other class
                     // stays terminal on the first frame, as does any frame
                     // after content (replaying would duplicate side effects).
+                    //
+                    // Either way the turn-ending envelope is non-recoverable,
+                    // so its severity is Error. A retryable frame holds it back
+                    // (`frame_error`): the post-loop retry either re-issues the
+                    // request and discards it, or the budget is spent and it is
+                    // posted then, once, so the card never promises a retry the
+                    // engine will not make.
+                    let envelope = ErrorEnvelope::classify(message.to_string(), false);
                     let transient = matches!(
-                        crate::error_taxonomy::classify_error_message(message),
+                        envelope.category,
                         ErrorCategory::Network | ErrorCategory::Timeout
                     );
                     if transient && !any_content_received {
                         stream_errors = stream_errors.saturating_add(1);
+                        frame_error = Some(envelope);
                     } else {
-                        let envelope = ErrorEnvelope::classify(message.to_string(), false);
                         let _ = self.send_stream_event(Event::error(envelope)).await;
                     }
                     stream_error.get_or_insert(message.to_string());
@@ -4997,6 +5057,7 @@ impl Engine {
             first_token_at,
             request_dispatched_at,
             stream_error,
+            frame_error,
         }
     }
 

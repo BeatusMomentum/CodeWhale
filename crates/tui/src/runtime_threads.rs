@@ -313,6 +313,25 @@ fn validated_record_id<'a>(id: &'a str, label: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+/// Longest tool call id this store will look up, in bytes.
+const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+
+/// Whether a **provider's** tool call id can be looked up in the store.
+///
+/// This is deliberately not [`validated_record_id`]. A record id is ours and
+/// minted in a shape we chose; a tool call id is the model endpoint's, echoed
+/// back to us as an opaque string, and it is only ever *compared* — against a
+/// receipt's `tool_call_id` and an item's `tool_use_id` — never used as a
+/// path, a command, or a file name. Real endpoints hand out shapes the record
+/// charset refuses (`call_01_f3d82r…|f8912d4c-…` from one gateway, `toolu_…`
+/// from another), and rejecting those made every command's workspace span
+/// unreadable while looking exactly like "no such call". Only emptiness and
+/// control characters are refused, plus a length bound so a nonsense URL
+/// cannot make the store scan work hard.
+fn usable_provider_call_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_TOOL_CALL_ID_BYTES && !id.chars().any(char::is_control)
+}
+
 fn agent_mail_workspace_id(workspace: &Path) -> Result<String> {
     let canonical = workspace
         .canonicalize()
@@ -4875,6 +4894,10 @@ pub struct UpdateThreadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StartTurnRequest {
+    /// Account-authorized data, rendered only by the Engine for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     /// Narrowing assertion captured by an acknowledged selected frontend.
     /// A mismatch refuses; this field never changes a thread's workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7810,11 +7833,19 @@ impl RuntimeThreadManager {
         );
     }
 
-    fn claim_pending_user_input(&self, thread_id: &str, input_id: &str) -> PendingUserInputClaim {
+    fn claim_pending_user_input(
+        &self,
+        thread_id: &str,
+        input_id: &str,
+        turn_id: Option<&str>,
+    ) -> PendingUserInputClaim {
         let mut pending = self.pending_user_inputs.lock();
         let Some(entry) = pending.get_mut(&(thread_id.to_string(), input_id.to_string())) else {
             return PendingUserInputClaim::Missing;
         };
+        if turn_id.is_some_and(|turn_id| entry.request.turn_id != turn_id) {
+            return PendingUserInputClaim::Missing;
+        }
         if entry.indeterminate {
             return PendingUserInputClaim::Indeterminate;
         }
@@ -8173,7 +8204,7 @@ impl RuntimeThreadManager {
             };
             state.engine.clone()
         };
-        let request = match self.claim_pending_user_input(thread_id, input_id) {
+        let request = match self.claim_pending_user_input(thread_id, input_id, None) {
             PendingUserInputClaim::Claimed(request) => request,
             PendingUserInputClaim::Missing | PendingUserInputClaim::Settling => {
                 return Ok(false);
@@ -8218,7 +8249,7 @@ impl RuntimeThreadManager {
             };
             state.engine.clone()
         };
-        let request = match self.claim_pending_user_input(thread_id, input_id) {
+        let request = match self.claim_pending_user_input(thread_id, input_id, None) {
             PendingUserInputClaim::Claimed(request) => request,
             PendingUserInputClaim::Missing | PendingUserInputClaim::Settling => {
                 return Ok(false);
@@ -8284,30 +8315,106 @@ impl RuntimeThreadManager {
             }
             return Err(error);
         }
-        let settlement_tx = self.finish_pending_user_input_settlement(thread_id, &request);
         drop(_projection);
 
+        let terminal = matches!(
+            &outcome,
+            UserInputTerminalOutcome::Canceled { terminal: true }
+        );
         let delivery_result = match (engine, outcome) {
             (Some(engine), UserInputTerminalOutcome::Answered(response)) => {
                 engine.submit_user_input(&request.id, response).await
             }
             (Some(engine), UserInputTerminalOutcome::Canceled { .. }) => {
-                if let Err(error) = engine.cancel_user_input(&request.id).await {
-                    tracing::debug!(
-                        thread_id,
-                        input_id = %request.id,
-                        "User-input cancellation was durable after engine mailbox closed: {error}"
-                    );
-                }
-                Ok(())
+                engine.cancel_user_input(&request.id).await
             }
             (None, _) => Ok(()),
         };
+        if let Err(error) = delivery_result {
+            if !terminal {
+                // Keep the same claim until Engine's verdict. A simultaneous
+                // ToolCallComplete waits for this owner, then closes it; a
+                // failed delivery alone must not erase an indefinite waiter.
+                let _projection = projection_lock.lock().await;
+                if let Err(receipt_error) = self.emit_event(
+                    thread_id,
+                    Some(&request.turn_id),
+                    None,
+                    "user_input.required",
+                    json!({
+                        "id": &request.id,
+                        "request": &request.request,
+                        "delivery_error": "Engine did not accept the decision. Retry if the question is still pending.",
+                    }),
+                ).await {
+                    if event_append_is_indeterminate(&receipt_error) {
+                        self.mark_pending_user_input_indeterminate(thread_id, &request);
+                    } else {
+                        self.restore_pending_user_input_claim(thread_id, &request);
+                    }
+                    return Err(receipt_error);
+                }
+                self.restore_pending_user_input_claim(thread_id, &request);
+                return Err(error);
+            }
+            // A terminal turn already ended the waiter. Its durable cleanup
+            // remains authoritative even when Engine rejects a late cancel.
+            tracing::debug!(thread_id, input_id = %request.id,
+                "Terminal user-input cancellation was durable after waiter ended: {error}");
+        }
+        let settlement_tx = self.finish_pending_user_input_settlement(thread_id, &request);
         if let Some(settlement_tx) = settlement_tx {
             settlement_tx.send_modify(|epoch| *epoch = epoch.saturating_add(1));
         }
-        delivery_result?;
         Ok(true)
+    }
+
+    async fn settle_user_input_for_completed_tool(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        input_id: &str,
+    ) -> Result<()> {
+        let request = loop {
+            match self.claim_pending_user_input(thread_id, input_id, Some(turn_id)) {
+                PendingUserInputClaim::Claimed(request) => break request,
+                PendingUserInputClaim::Missing => return Ok(()),
+                PendingUserInputClaim::Settling => {
+                    // An API answer/cancel may still fail its durable append
+                    // and restore the request. Wait for that owner, then
+                    // retry rather than leaving the completed waiter pending.
+                    let progress = self
+                        .pending_user_inputs
+                        .lock()
+                        .get(&(thread_id.to_string(), input_id.to_string()))
+                        .filter(|entry| {
+                            entry.request.turn_id == turn_id
+                                && entry.settling
+                                && !entry.indeterminate
+                        })
+                        .map(|entry| entry.settlement_tx.subscribe());
+                    if let Some(mut progress) = progress {
+                        let _ = progress.changed().await;
+                    }
+                }
+                PendingUserInputClaim::Indeterminate => {
+                    bail!(
+                        "User-input request '{input_id}' has an indeterminate terminal receipt; inspect Runtime storage before completing its tool"
+                    );
+                }
+            }
+        };
+        // Engine already ended this waiter (timeout, cancellation or failure).
+        // Reuse durable request settlement without sending a stale decision
+        // back to it. The tool result carries the actual reason it ended.
+        self.settle_claimed_user_input(
+            thread_id,
+            None,
+            request,
+            UserInputTerminalOutcome::Canceled { terminal: false },
+        )
+        .await?;
+        Ok(())
     }
 
     async fn settle_user_inputs_for_terminal_turn(
@@ -8705,6 +8812,7 @@ impl RuntimeThreadManager {
         continuation_index: u32,
     ) -> Result<TurnRecord> {
         let req = StartTurnRequest {
+            profile_constitution: None,
             expected_workspace: None,
             max_output_tokens: None,
             prompt,
@@ -9234,6 +9342,7 @@ impl RuntimeThreadManager {
             .start_turn_with_source(
                 thread_id,
                 StartTurnRequest {
+                    profile_constitution: None,
                     expected_workspace: None,
                     max_output_tokens: None,
                     prompt,
@@ -10548,6 +10657,104 @@ impl RuntimeThreadManager {
         })
         .await
         .context("turn artifact read task failed")?
+    }
+
+    /// The workspace span one tool call of one turn ran in, read from the
+    /// store: the `tool:<call_id>` restore point the call started from and the
+    /// `post-tool:<call_id>` receipt that closed it.
+    ///
+    /// A span exists only for a call that may write. With
+    /// `EngineConfig::record_restore_points` the engine brackets every
+    /// non-read-only call — a file tool, a shell command, a program, a
+    /// write-capable MCP tool — so a shell command's own writes are
+    /// attributable to it. A call the engine judged read-only takes neither
+    /// receipt, and a turn recorded before receipts existed carries none;
+    /// `Ok(None)` says so, and a caller must report that as "not bounded"
+    /// rather than as an empty change list.
+    pub async fn turn_call_span(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<CallWorkspaceSpan>> {
+        let thread = self.get_thread(thread_id).await?;
+        if validated_record_id(turn_id, "turn id").is_err()
+            || !usable_provider_call_id(tool_call_id)
+        {
+            return Ok(None);
+        }
+        let manager = self.clone();
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if !manager.store.turn_path(&turn_id)?.exists() {
+                return Ok(None);
+            }
+            let turn = manager.store.load_turn(&turn_id)?;
+            if turn.thread_id != thread_id {
+                return Ok(None);
+            }
+            let recorded = |kind: crate::snapshot::WorkspaceSnapshotKind| {
+                turn.workspace_snapshots.iter().rfind(|receipt| {
+                    receipt.kind == kind
+                        && receipt.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                })
+            };
+            let pre = recorded(crate::snapshot::WorkspaceSnapshotKind::Tool);
+            let post = recorded(crate::snapshot::WorkspaceSnapshotKind::PostTool);
+            let item = manager.item_for_call(&turn, &tool_call_id)?;
+            // A call the turn recorded no item for is a call this turn never
+            // ran: the caller asked about the wrong turn. A call with an item
+            // but no receipt is the read-only case — known, and bounded by
+            // nothing, which the route reports rather than 404s.
+            if pre.is_none() && post.is_none() && item.is_none() {
+                return Ok(None);
+            }
+            let tool_name = item
+                .as_ref()
+                .and_then(|item| item.metadata.as_ref())
+                .and_then(|metadata| metadata.get("tool_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Ok(Some(CallWorkspaceSpan {
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                item_status: item.as_ref().map(|item| item.status),
+                pre_tool_snapshot_id: pre.map(|receipt| receipt.tree_id.clone()),
+                post_tool_snapshot_id: post.map(|receipt| receipt.tree_id.clone()),
+                thread_workspace: thread.workspace,
+            }))
+        })
+        .await
+        .context("call workspace span read task failed")?
+    }
+
+    /// The turn's item record for one call id, when any item carries it.
+    ///
+    /// `tool_use_id` is the identity the engine also labels the call's
+    /// `tool:<call_id>` restore point with, so this is how a receipt is tied
+    /// back to the tool that ran.
+    fn item_for_call(
+        &self,
+        turn: &TurnRecord,
+        tool_call_id: &str,
+    ) -> Result<Option<TurnItemRecord>> {
+        for item_id in &turn.item_ids {
+            let item = self.store.load_item(item_id)?;
+            if item
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("tool_use_id"))
+                .and_then(Value::as_str)
+                == Some(tool_call_id)
+            {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn get_thread(&self, id: &str) -> Result<ThreadRecord> {
@@ -14026,6 +14233,7 @@ impl RuntimeThreadManager {
         if req.max_output_tokens.is_some() && auto_model {
             bail!("maxOutputTokens requires an exact model; Auto routing is unsupported");
         }
+        if let Some(snapshot) = &req.profile_constitution { snapshot.validate()?; }
         let operation = if let Some(operation_key) = req.operation_key.as_deref() {
             validate_runtime_turn_operation_key(operation_key)?;
             let request_fingerprint = runtime_turn_request_fingerprint(
@@ -14048,6 +14256,13 @@ impl RuntimeThreadManager {
                     "domain": "codewhale:selected-workspace-turn:v1",
                     "historical_fingerprint": request_fingerprint,
                     "expected_workspace": workspace,
+                })).as_bytes())
+            } else { request_fingerprint };
+            let request_fingerprint = if let Some(snapshot) = &req.profile_constitution {
+                crate::hashing::sha256_hex(crate::client::canonical_json(&json!({
+                    "domain": "codewhale:profile-constitution-turn:v1",
+                    "historical_fingerprint": request_fingerprint,
+                    "profile_constitution": snapshot,
                 })).as_bytes())
             } else { request_fingerprint };
             let request_fingerprint=narrowing.request_fingerprint(request_fingerprint);
@@ -14335,6 +14550,7 @@ impl RuntimeThreadManager {
             .get(thread_id)
             .and_then(|state| state.hook_executor.clone());
         let op = Op::SendMessage (TurnSpec {
+            profile_constitution: req.profile_constitution,
             max_output_tokens,
             content: prompt,
             images: req.images,
@@ -15206,7 +15422,7 @@ impl RuntimeThreadManager {
                 subagent_heartbeat_timeout: std::time::Duration::from_secs(
                     cfg.subagent_heartbeat_timeout_secs_for_provider(&route_identity),
                 ),
-                prefer_bwrap: cfg.prefer_bwrap.unwrap_or(false),
+                prefer_bwrap: cfg.prefers_bwrap(),
                 bwrap_extensions: crate::sandbox::BwrapMountExtensions {
                     read_only_roots: cfg.bwrap_ro_roots.clone(),
                     device_roots: cfg.bwrap_dev_roots.clone(),
@@ -16521,6 +16737,8 @@ impl RuntimeThreadManager {
                 EngineEvent::ToolCallComplete {
                     id, name, result, ..
                 } => {
+                    self.settle_user_input_for_completed_tool(&thread_id, &turn_id, &id)
+                        .await?;
                     if let Some(hooks) = thread_hooks.as_deref() {
                         let input = tool_items
                             .get(&id)
@@ -19310,6 +19528,26 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
     }
+}
+
+/// One tool call's workspace span, as the call-change route serves it.
+///
+/// Both tree ids name restore points recorded on the calling turn, so the
+/// thread owns them: the `pre_tool` one is what `file-revert` accepts for
+/// every path the span changed.
+#[derive(Debug, Clone)]
+pub struct CallWorkspaceSpan {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: Option<String>,
+    /// The persisted item owns whether this call is still awaiting settlement.
+    pub item_status: Option<TurnItemLifecycleStatus>,
+    pub pre_tool_snapshot_id: Option<String>,
+    /// `None` while the call is active, or when the closing snapshot failed
+    /// or was gated: the span's changes are then unknown, not empty.
+    pub post_tool_snapshot_id: Option<String>,
+    pub thread_workspace: PathBuf,
 }
 
 /// A turn's artifact references as the Runtime API serves them.

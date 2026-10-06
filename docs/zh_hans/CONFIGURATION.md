@@ -77,7 +77,7 @@ Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持�
 
   每个 `protected_invariants` 条目可以是普通字符串(建议性散文，历史形态)，也可以是携带路径 glob 的对象，后者会在工具门禁中额外被**机械强制执行**。见下文[强制执行的仓库保护规则](#强制执行的仓库保护规则)。
 
-  这是 Codewhale 层级中的**仓库本地宪章**层：*内置全局宪章* → *用户全局宪章*(`$CODEWHALE_HOME/constitution.json`，渲染为散文)→ *仓库宪章*(`.codewhale/constitution.json`，即本文件)→ *AGENTS/项目指令* → *记忆与交接* → *当前回合的当前请求与实时证据*。运行时策略(在代码中强制执行的权限/沙箱/成本上限)与所有这些提示层是分离的。仓库宪章给出项目决策规则；它不取代内置宪章、用户全局宪章或当前用户请求。
+  这是**仓库本地宪章**层。指引发生冲突时，以当前生效的基础宪章中 **Whose word wins** 一节为准；内置版本的源代码位于 [`BASE_PROMPT`](../../crates/tui/src/prompts/text.rs)。使用 `/constitution base` 可查看实际生效的基础提示词，包括明确启用的专家覆盖版本。这里介绍文件的顺序、以及提示词的组装顺序，都不代表权威排序。运行时策略（代码强制执行的权限、沙箱和成本上限）独立于提示词指引；编辑宪章不会授予权限。
 
 > **`WHALE.md` 已弃用。** 它与 `AGENTS.md` 混淆重叠。Codewhale 不再把 `WHALE.md` 作为项目或全局上下文读取。如果存在，setup/上下文诊断会报告它被忽略，以便你迁移它。把普通指令移到 `AGENTS.md`，把 Codewhale 特有的权威策略移到 `.codewhale/constitution.json`。个人常驻指引属于 `/constitution` / `$CODEWHALE_HOME/constitution.json`。(随模型提示一起提供的全局 Codewhale 宪章是另一回事，不受影响。)
 
@@ -1194,7 +1194,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   timeout_seconds = 300
   ```
 
-- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 只在 `prefer_bwrap = true` 且 `/usr/bin/bwrap` 可执行时使用 bubblewrap；没有这一选择加入时，它会报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
+- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 默认在 `/usr/bin/bwrap` 已安装且探测证明它能限制子进程时使用 bubblewrap；`prefer_bwrap = false` 退出并报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
 - 模式准入、hooks、已注册工具的要求、类型化规则、Auto-Review、仓库保护规则、人工审批和执行沙箱之间的跨层关系，定义在[授权顺序](../AUTHORIZATION_ORDER.md)中。
 - **读取拒绝列表。** 每一种沙箱档位——包括 `read-only`——都授予对整个文件系统的读取权限；这些档位的区别在于它们可以*写入*什么，以及能否访问网络。读取拒绝列表会收窄这一点：
   - `sandbox_read_denylist_defaults`（bool，默认 `true`）：应用内置的凭据存储集合——`~/.ssh`、`~/.gnupg`、云凭据目录（`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube` 等）、`~/.netrc`、`~/.npmrc`、`~/.git-credentials`、macOS 钥匙串、浏览器配置文件、Codewhale 自己的机密存储，以及 `.env` 文件（但不包括 `.env.example` 之类）。普通源码、`Cargo.toml`、`~/.gitconfig`、`~/.cargo` 和 `~/.npm` 保持可读，因此构建和测试仍能工作。设为 `false` 可恢复 0.9.12 之前的整盘读取行为。

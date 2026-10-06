@@ -874,7 +874,7 @@ impl App {
             configured_sandbox_mode: config.sandbox_mode.clone(),
             configured_sandbox_network: config.sandbox_network_access,
             sandbox_backend: crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-                config.prefer_bwrap.unwrap_or(false),
+                config.prefers_bwrap(),
             ),
             // #4022: the worker thread is spawned lazily on first submit, so
             // constructing an App never costs a thread.
@@ -1182,7 +1182,7 @@ impl App {
             prefix_drift_count: 0,
             prefix_context_updates: 0,
             collapsed_cells: HashSet::new(),
-            thinking_folds: HashMap::new(),
+            cell_folds: HashMap::new(),
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),

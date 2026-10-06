@@ -1043,6 +1043,47 @@ wire models (for example `deepseek/deepseek-v4-pro` or its own
 `orcarouter/auto` router) pass through verbatim, exactly as they do on the
 OpenRouter provider scope.
 
+#### OrcaRouter credentials: API key or OAuth 2.0 + PKCE
+
+OrcaRouter accepts two credential sources, and both write the same durable
+`sk-orca-…` key to the same `orcarouter` secret-store slot with
+`auth_mode = "api_key"`:
+
+- **API key** — `codewhale auth set --provider orcarouter`, `/provider`, or
+  `ORCAROUTER_API_KEY`. Use this when you already have a key.
+- **Connect with OrcaRouter** — `codewhale auth orcarouter` (CLI) or
+  `/auth orcarouter` (in-session). This runs an OAuth 2.0 authorization-code
+  flow with PKCE (S256) on a loopback redirect. The browser is sent to
+  `GET https://www.orcarouter.ai/auth` with `callback_url`, `code_challenge`,
+  `code_challenge_method=S256`, `state`, `app_name`, and `scope`; the code is
+  exchanged at `POST https://www.orcarouter.ai/api/v1/auth/keys` for a
+  durable API key. There is no client secret and no pre-registered redirect
+  URI; state is compared in constant time before the code is used.
+
+Authentication and inference use different origins: the consent and exchange
+live on `https://www.orcarouter.ai`; models and chat live on
+`https://api.orcarouter.ai/v1`. Neither is derived from the other, and
+`/v1/auth/keys` on the API origin is not the exchange route. Self-hosted
+deployments can override each origin explicitly with `ORCA_AUTH_BASE_URL`
+(auth) and `ORCA_API_BASE_URL`/`ORCAROUTER_BASE_URL` (inference); the explicit
+value wins. Remote origins must be HTTPS; plain HTTP is accepted only on
+loopback.
+
+A PKCE-issued key is a durable API key, **not** a refresh token: Codewhale
+stores it, reuses it across restarts, and never sends a refresh grant. Revoke
+the key on the OrcaRouter console (`/auth orcarouter-revoke` clears the local
+copy) and sign in again to get a new one. A 401 from the relay marks that
+credential generation as needing re-authentication rather than silently
+retrying.
+
+The chat model list is discovered live from `GET https://api.orcarouter.ai/v1/models`
+with the configured key. OrcaRouter publishes `supported_endpoint_types` on
+every row, so the chat selector keeps only rows advertising `openai`,
+`anthropic`, `gemini`, or `openai-response`, and drops image-generation,
+video, and rerank rows instead of guessing from a model name. A row that
+states `architecture.input_modalities` with `image` is image-input capable;
+rows that state no architecture are treated as unknown, not as text-only.
+
 ### Recent OpenRouter Large Models
 
 OpenRouter completions and static registry rows include the April 2026 onward

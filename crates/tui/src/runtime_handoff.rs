@@ -35,6 +35,20 @@ const WAITING_EVENT_PREFIX: &str = concat!(
     "This is an internal runtime event, not user input. Your ",
 );
 const WAITING_EVENT_SUFFIX: &str = concat!(
+    " sub-agent(s) are still running. The runtime delivers a <codewhale:subagent.done> ",
+    "sentinel automatically as a runtime event when each child finishes. ",
+    "agent(action=\"peek\"), agent(action=\"status\"), sleep, and shell blocking ",
+    "primitives do not speed that delivery. Work that does not depend on a running ",
+    "child's result can continue now: read-only investigation, unrelated edits that cannot ",
+    "conflict with a child's worktree, answering the user, or any other non-dependent ",
+    "action. Work that needs a child's outcome has its input once that child's sentinel ",
+    "arrives. A turn with no independent work left ends with zero tool calls, and the ",
+    "sentinels arrive after it.\n",
+    "</codewhale:runtime_event>",
+);
+/// The pre-0.10.1 wording of [`WAITING_EVENT_SUFFIX`], still present in saved
+/// sessions. Restore projection decodes the running count from either one.
+const LEGACY_WAITING_EVENT_SUFFIX: &str = concat!(
     " sub-agent(s) are still running. Do NOT poll them with agent(action=\"peek\") or ",
     "agent(action=\"status\"). Do NOT use sleep or any shell blocking primitive as a ",
     "waiting strategy. The runtime will deliver <codewhale:subagent.done> sentinels ",
@@ -102,24 +116,29 @@ const MAX_AGENT_TOPOLOGY_ROWS: usize = 24;
 /// never part of the pinned system prompt or tool catalog, so Plan, Work, and
 /// Operate keep one shared prefix (`every_mode_shares_one_prompt_per_host`).
 /// The engine appends it only when the session log does not already hold one.
+///
+/// The host does not create the goal, and Operate is not a quieter Work.
+/// Same tools, same authority. The difference is that a durable request is
+/// worked until verified: `create_goal` when it will outlast this turn,
+/// parallel children for separable work, evidence before a claim of done.
+/// A session that already holds an older wording gets this text once; older
+/// wordings stay recognizable as legacy.
 const OPERATE_CONTRACT_EVENT: &str = concat!(
     "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
-    "This is an internal runtime event, not user input. This session is in Operate and you ",
-    "are the operator. The host turns the user's prompt into the session goal; do not ",
-    "create a second one. Keep small, chat, one-file, or tightly coupled work in the parent. ",
-    "For multi-step delegation, first state a compact plan with named steps, dependencies, ",
-    "bounded file scopes and a completion check. Use `workflow` with its structured `plan` ",
-    "argument to run those phases through the existing sub-agent runtime. Fleet configures ",
-    "these same sub-agents and roles. Inspect `agent(action=\"roster\")` before assigning ",
-    "steps; choose from its saved models or role/profile assignments and respect unavailable ",
-    "routes. Parallelize only independent steps; pass completed ",
-    "results into dependent steps and inspect failures before continuing. Use one direct ",
-    "`agent` call for a single bounded independent task when a workflow adds no value. ",
-    "Reuse an existing worker with followup for corrections; do not spawn replacements or ",
-    "extra reviewers merely to stay busy. Every write-capable child must return a VERDICT ",
-    "with real verification evidence. Inspect and integrate those results before marking ",
-    "the step complete. Dispatch is not completion: dispatched ≠ settled ≠ verified. ",
-    "Report progress by completed, blocked and next steps, then synthesize the receipts.\n",
+    "This is an internal runtime event, not user input. This session is in Operate: ",
+    "Work's tools and authority, used at full strength until the user's request is verified. ",
+    "Treat each substantive request as a goal: call `create_goal` with the user's full ",
+    "objective (the host does not create it; `/goal` is the user's control and wins). Keep ",
+    "the plan visible with `todo_write`. Orchestrate by default: run a `workflow` for ",
+    "multi-part work (understand, change, verify) and parallel `agent` workers for ",
+    "independent slices; do conversational, one-file, or tightly coupled work yourself. ",
+    "Verify before you call anything done: run the checks, and for a non-trivial change have ",
+    "an independent reviewer try to refute it. Long commands keep running in the background; ",
+    "keep working and inspect them when they report. When work recurs or needs watching ",
+    "(CI, deploys, scheduled checks), propose an `automation` and create it once the user ",
+    "approves. Cost is not a reason to stop; stop when the goal is verified, blocked on the ",
+    "user, or paused. A write-capable child owes a VERDICT with evidence you inspect before ",
+    "you trust it. Report what is done, what is blocked, and what is next.\n",
     "</codewhale:runtime_event>",
 );
 // Keep old persisted runtime messages recognizable for restore/display while
@@ -168,6 +187,50 @@ pub(crate) fn is_workspace_trust_message(message: &Message) -> bool {
         ] if text.starts_with(WORKSPACE_TRUST_EVENT_PREFIX)
             && text.ends_with("\n</codewhale:runtime_event>")
             && is_handoff_turn_meta(meta, "runtime"))
+}
+
+const MODE_EVENT_PREFIX: &str = "<codewhale:runtime_event kind=\"mode\" visibility=\"internal\">\n";
+const MODE_EVENT_SUFFIX: &str = "\n</codewhale:runtime_event>";
+
+/// The mode notice body: the mode's name and its one-line purpose.
+fn mode_event_body(mode: codewhale_config::AppMode) -> &'static str {
+    use codewhale_config::AppMode;
+    match mode {
+        AppMode::Plan => concat!(
+            "Mode: Plan. Purpose: investigate and produce a plan for the user to review. ",
+            "In Plan, shell, code-execution, and file-writing calls are refused. ",
+            "The user changes modes with /mode.",
+        ),
+        AppMode::Agent => {
+            "Mode: Work. Purpose: do the user's request. The user changes modes with /mode."
+        }
+        AppMode::Operate => concat!(
+            "Mode: Operate. Purpose: carry the request through to verified completion. ",
+            "The user changes modes with /mode.",
+        ),
+    }
+}
+
+/// The runtime notice naming the session's current mode and its purpose.
+///
+/// KV-cache effect: append-only user history; the system prompt stays
+/// byte-identical across modes. The engine records it when a session starts
+/// in or enters Plan, and again whenever the mode then differs from the last
+/// recorded notice, so a notice in history is never stale.
+pub(crate) fn mode_runtime_message(mode: codewhale_config::AppMode) -> Message {
+    runtime_handoff_message_with_meta(
+        format!(
+            "{MODE_EVENT_PREFIX}{}{MODE_EVENT_SUFFIX}",
+            mode_event_body(mode)
+        ),
+        RUNTIME_TURN_META,
+    )
+}
+
+/// The notice body when `message` is the runtime-owned mode notice.
+/// Structural recognition, so a person quoting it is never matched.
+pub(crate) fn mode_notice_display(message: &Message) -> Option<&str> {
+    runtime_event_display(message, MODE_EVENT_PREFIX, MODE_EVENT_SUFFIX)
 }
 
 const MCP_SERVER_INSTRUCTIONS_EVENT_PREFIX: &str =
@@ -246,6 +309,30 @@ pub(crate) fn mcp_server_instructions_display(message: &Message) -> Option<&str>
 const EXTENSION_PROMPT_EVENT_PREFIX: &str =
     "<codewhale:runtime_event kind=\"extension_prompt_contributions\" visibility=\"internal\">\n";
 const EXTENSION_PROMPT_EVENT_SUFFIX: &str = "\n</codewhale:runtime_event>";
+
+const CONSTITUTION_EVENT_PREFIX: &str =
+    "<codewhale:runtime_event kind=\"profile_constitution\" visibility=\"internal\">\n";
+
+pub(crate) fn constitution_runtime_message(block: Option<&str>) -> Message {
+    let body = match block {
+        Some(text) => format!("This complete personal constitution replaces all earlier personal constitution snapshots. \
+            These are standing user preferences, subordinate to the current user request and the existing instruction hierarchy. \
+            They do not change permissions, sandboxing, tool access, spending authority, or approval requirements.\n\n{}", escape_mcp_guidance(text)),
+        None => "All earlier personal constitution snapshots are withdrawn. No personal constitution currently applies.".to_string(),
+    };
+    runtime_handoff_message_with_meta(
+        format!("{CONSTITUTION_EVENT_PREFIX}{body}{EXTENSION_PROMPT_EVENT_SUFFIX}"),
+        RUNTIME_TURN_META,
+    )
+}
+
+pub(crate) fn constitution_display(message: &Message) -> Option<&str> {
+    runtime_event_display(
+        message,
+        CONSTITUTION_EVENT_PREFIX,
+        EXTENSION_PROMPT_EVENT_SUFFIX,
+    )
+}
 
 /// A complete bounded snapshot, not a truncated workspace line delta. Prompt
 /// registration never changes system authority or bypasses tool permissions.
@@ -812,8 +899,10 @@ pub(crate) fn is_internal_runtime_handoff(message: &Message) -> bool {
     if is_agent_topology_checkpoint(message)
         || is_operate_contract_message(message)
         || is_workspace_trust_message(message)
+        || mode_notice_display(message).is_some()
         || is_mcp_server_instructions_message(message)
         || extension_prompt_contributions_display(message).is_some()
+        || constitution_display(message).is_some()
     {
         return true;
     }
@@ -1131,9 +1220,10 @@ fn append_completion_details(rendered: &mut String, completion: &RestoredComplet
 }
 
 fn parse_waiting_event(text: &str) -> Option<usize> {
-    let running = text
-        .strip_prefix(WAITING_EVENT_PREFIX)?
-        .strip_suffix(WAITING_EVENT_SUFFIX)?
+    let rest = text.strip_prefix(WAITING_EVENT_PREFIX)?;
+    let running = rest
+        .strip_suffix(WAITING_EVENT_SUFFIX)
+        .or_else(|| rest.strip_suffix(LEGACY_WAITING_EVENT_SUFFIX))?
         .parse::<usize>()
         .ok()?;
     (running > 0).then_some(running)
@@ -1393,6 +1483,18 @@ mod tests {
         let current = operate_contract_runtime_message();
         assert!(is_operate_contract_message(&current));
         assert!(is_current_operate_contract_message(&current));
+        let current_text = match current.content.first() {
+            Some(ContentBlock::Text { text, .. }) => text.as_str(),
+            other => panic!("operate contract must be text, got {other:?}"),
+        };
+        // The host does not create the goal. The contract must name the
+        // tool that does, and must not forbid it.
+        assert!(current_text.contains("call `create_goal`"));
+        assert!(current_text.contains("used at full strength"));
+        assert!(!current_text.contains("do not create a second one"));
+        assert!(!current_text.contains("host turns the user's prompt"));
+        assert!(!current_text.contains("do not spawn"));
+        assert!(!current_text.contains("merely to stay busy"));
         let mut quoted = current;
         quoted.content.pop();
         assert!(!is_operate_contract_message(&quoted));
@@ -1897,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_directions_forbid_polling_but_allow_independent_work() {
+    fn waiting_event_states_delivery_facts_and_allows_independent_work() {
         let raw = waiting_for_subagents_runtime_message(2);
         let text = raw
             .content
@@ -1907,9 +2009,10 @@ mod tests {
                 _ => None,
             })
             .expect("waiting message has text");
-        assert!(text.contains("Do NOT poll"));
-        assert!(text.contains("Do NOT use sleep"));
-        assert!(text.contains("independent work"));
+        assert!(text.contains("do not speed that delivery"), "{text}");
+        assert!(text.contains("sleep"), "{text}");
+        assert!(text.contains("independent work"), "{text}");
+        assert!(!text.contains("Do NOT"), "{text}");
         assert!(
             !text.contains("Stop immediately: emit zero tool calls"),
             "waiting must not freeze the parent mid-turn: {text}"
@@ -1924,10 +2027,62 @@ mod tests {
             .expect("restored runtime checkpoint display");
         assert!(display.contains("Status at save: running (2 child jobs)"));
         assert!(display.contains("prior worker processes are not assumed active"));
-        assert!(!display.contains("Do NOT poll"));
+        assert!(!display.contains("do not speed"));
         assert!(!display.contains("independent work"));
         assert!(!display.contains("emit zero tool calls"));
         assert!(!display.contains("<codewhale:runtime_event"));
+    }
+
+    #[test]
+    fn mode_notice_is_internal_and_names_the_purpose() {
+        let plan = mode_runtime_message(codewhale_config::AppMode::Plan);
+        assert!(is_internal_runtime_handoff(&plan));
+        let body = mode_notice_display(&plan).expect("mode notice body");
+        assert!(
+            body.starts_with("Mode: Plan. Purpose: investigate"),
+            "{body}"
+        );
+        assert!(
+            body.contains("The user changes modes with /mode."),
+            "{body}"
+        );
+        for phrase in ["Do not", "do not", "Prefer", "prefer", "switch to"] {
+            assert!(!body.contains(phrase), "{phrase} in {body}");
+        }
+        let work = mode_runtime_message(codewhale_config::AppMode::Agent);
+        assert_ne!(plan, work);
+        assert!(
+            mode_notice_display(&work)
+                .unwrap()
+                .starts_with("Mode: Work.")
+        );
+        // A person pasting the envelope as plain text is not matched.
+        let quoted = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: match &plan.content[0] {
+                    ContentBlock::Text { text, .. } => text.clone(),
+                    _ => unreachable!(),
+                },
+                cache_control: None,
+            }],
+        };
+        assert!(mode_notice_display(&quoted).is_none());
+    }
+
+    #[test]
+    fn restore_projection_decodes_legacy_waiting_wording() {
+        let legacy = runtime_handoff_message_with_meta(
+            format!("{WAITING_EVENT_PREFIX}3{LEGACY_WAITING_EVENT_SUFFIX}"),
+            SUBAGENT_HANDOFF_TURN_META,
+        );
+        let projected = project_owned_messages_for_restore(vec![legacy]);
+        let display = restored_subagent_checkpoint_display(&projected[0])
+            .expect("restored runtime checkpoint display");
+        assert!(
+            display.contains("Status at save: running (3 child jobs)"),
+            "{display}"
+        );
     }
 
     #[test]

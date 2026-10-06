@@ -463,7 +463,7 @@ impl ChatWidget {
                 &cell_revisions,
                 transcript_width,
                 render_options,
-                &app.thinking_folds,
+                &app.cell_folds,
                 None,
                 provisional_action_owner,
             );
@@ -505,7 +505,7 @@ impl ChatWidget {
                 &filtered_revs,
                 transcript_width,
                 render_options,
-                &app.thinking_folds,
+                &app.cell_folds,
                 Some(&app.collapsed_cell_map),
                 provisional_action_owner,
             );
@@ -9076,12 +9076,12 @@ diff --git a/src/b.rs b/src/b.rs\n\
                     }
                     13 if total > 0 => {
                         let index = below(&mut state, total);
-                        app.thinking_folds.insert(
+                        app.cell_folds.insert(
                             index,
                             if below(&mut state, 2) == 0 {
-                                crate::tui::history::ThinkingFold::Expanded
+                                crate::tui::history::TranscriptFold::Expanded
                             } else {
-                                crate::tui::history::ThinkingFold::Collapsed
+                                crate::tui::history::TranscriptFold::Collapsed
                             },
                         );
                         "fold"

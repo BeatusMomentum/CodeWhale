@@ -282,6 +282,14 @@ pub(super) fn replacement_messages(
         });
         retained.insert(0, snapshot.clone());
     }
+    if let Some(snapshot) = messages
+        .iter()
+        .rev()
+        .find(|message| crate::runtime_handoff::constitution_display(message).is_some())
+    {
+        retained.retain(|message| crate::runtime_handoff::constitution_display(message).is_none());
+        retained.insert(0, snapshot.clone());
+    }
     retained
 }
 
@@ -745,6 +753,55 @@ mod tests {
                 replacement_messages(&kept, 20_000)
                     .iter()
                     .filter(|message| extension_prompt_contributions_display(message).is_some())
+                    .count(),
+                1,
+                "repeated compaction must not accumulate snapshots"
+            );
+        }
+    }
+
+    /// The handoff header tells the next turn what survived. It must match
+    /// what the replacement history keeps: only the last steps of a long
+    /// round, with long tool output shortened and marked.
+    #[test]
+    fn profile_constitution_compaction_keeps_only_the_complete_latest_snapshot() {
+        use crate::runtime_handoff::{constitution_display, constitution_runtime_message};
+        let old = constitution_runtime_message(Some("old instructions"));
+        let current_text = "current instructions ".repeat(400);
+        for current in [
+            constitution_runtime_message(Some(&current_text)),
+            constitution_runtime_message(None),
+        ] {
+            let quoted = msg(
+                "user",
+                &user_text_of(&current).expect("runtime snapshot has text"),
+            );
+            let original = vec![
+                old.clone(),
+                quoted.clone(),
+                current.clone(),
+                msg("user", "Continue this task."),
+                tool_use("first", "Read", json!({"path": "first"})),
+                tool_result("first", "first output"),
+                tool_use("second", "Read", json!({"path": "second"})),
+                tool_result("second", "second output"),
+                tool_use("third", "Read", json!({"path": "third"})),
+                tool_result("third", "third output"),
+            ];
+            let kept = replacement_messages(&original, 20_000);
+            let snapshots: Vec<_> = kept
+                .iter()
+                .filter(|message| constitution_display(message).is_some())
+                .collect();
+            assert_eq!(snapshots, [&current]);
+            assert!(
+                kept.contains(&quoted),
+                "a person's quote is ordinary user text"
+            );
+            assert_eq!(
+                replacement_messages(&kept, 20_000)
+                    .iter()
+                    .filter(|message| constitution_display(message).is_some())
                     .count(),
                 1,
                 "repeated compaction must not accumulate snapshots"

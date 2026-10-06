@@ -18504,10 +18504,11 @@ fn route_source_label(route: &ModelRoute) -> String {
 
 /// When a child agent fails because its model is unavailable under the current
 /// access profile, a bare provider 403/404 (classified `Authorization` or
-/// `State`) is unactionable. Annotate it so the parent knows which provider and
-/// route produced the failing model and how to recover (#2653, #4049) without
-/// re-classifying the underlying error. Errors unrelated to model availability
-/// pass through unchanged.
+/// `State`) or a spent-balance quota refusal (classified `RateLimit`) is
+/// unactionable. Annotate it so the parent knows which provider and route
+/// produced the failing model and how to recover (#2653, #4049) without
+/// re-classifying the underlying error. Short-lived rate limits and errors
+/// unrelated to model availability pass through unchanged.
 #[cfg(test)]
 fn annotate_child_model_error(
     err: &str,
@@ -18553,6 +18554,11 @@ fn annotate_child_model_error_with_origin(
     let lower = err.to_ascii_lowercase();
     match crate::error_taxonomy::classify_error_message(err) {
         crate::error_taxonomy::ErrorCategory::Authorization => hint(),
+        crate::error_taxonomy::ErrorCategory::RateLimit
+            if crate::error_taxonomy::is_spent_balance_message(err) =>
+        {
+            hint()
+        }
         crate::error_taxonomy::ErrorCategory::State if lower.contains("model") => hint(),
         _ => {
             // #3020 (#2653): Provider rejections like "Model Not Exist" or

@@ -693,10 +693,11 @@ fn dock_tab_count(app: &mut App, panel: RailPanel) -> Option<usize> {
                 .filter(|row| row.id.0.starts_with("graph:"))
                 .count(),
         ),
+        // Group headings (`▾ Shells N`) are selectable doors, not jobs.
         RailPanel::Background => Some(
             visible_rows_for(app, panel)
                 .iter()
-                .filter(|row| row.selectable)
+                .filter(|row| row.selectable && !row.id.0.starts_with("section:"))
                 .count(),
         ),
         RailPanel::Files => Some(super::views::files_touched_count(app)),

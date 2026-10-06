@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.1] - 2026-10-01
 
+### Contributor integration and reliability
+
+- Runtime clients can read one tool call's actual workspace changes and reviewed skill details (thanks @gaord, #6817 and #6869). In-flight snapshot pairs remain pending; missing objects and corrupt repository metadata are distinguished.
+- Search accepts valid preferred locales, and image dimensions describe the same bytes sent to the model (thanks @asto18089, #6860 and #6858). Automation deletion keeps its definition until cleanup succeeds, and compaction preserves its original summary anchor (#6864 and #6857).
+- Config/status/permission commands share portable contracts while the host retains mutation authority; queue workers acknowledge a scheduled retry for temporary first-claim contention and fail honestly on corruption (thanks @aboimpinto, #6832).
+- Indefinite questions, approvals and elevation waits survive the TUI watchdog. Answers get time to resume the current turn; settled requests disappear by identity. Thanks @7jrxt42BxFZo4iAnN4CX for #6872.
+- Configured approval expiry belongs to the held Engine request; hiding or covering its card cannot restart the deadline, and a late queued answer cannot approve an expired call.
+- Tool discovery keeps the highest-ranked matches when a result batch exceeds the existing cache bounds, preserving search order and the 16 KiB limit (adapted from @AdityaVG13's #6393).
+- Model-switch receipts now translate their session-only saving note in every complete locale pack; the three save commands remain directly usable (thanks @Lstarsky0, #6875).
+- The bundled `computer-use` plugin is 0.12.1, reconciled with canonical source
+  `a656f67455fc5639f28304fbf61075db3925058a` while retaining Core's embedding
+  manifest and version contract.
+
 Codewhale v0.10.1 focuses on reliability and first-run behavior. Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are
 quieter, and Fleet runs can be checked before they spend anything.
@@ -16,6 +29,19 @@ Scripts that parse `--json` output should read the **Breaking for scripts**
 note below before upgrading.
 
 ### Added
+
+- `/plugin doctor` reports stale built-in records and snapshots, and
+  `/plugin doctor --fix` retires them. A user plugin, a snapshot a running
+  process names, and a snapshot inside the grace window are kept. The
+  previous `state.json` is kept as `state.json.pre-gc`.
+- Reviewed plugins can declare named OpenAI-compatible OAuth routes. The host
+  owns PKCE, refresh and credential storage, and checks the review at each
+  request ([docs/PLUGIN_PROVIDERS.md](docs/PLUGIN_PROVIDERS.md), #6805).
+  The provider capability advances plugin review policy to v5 (v6 with the
+  extension host): older receipts require explicit review again.
+- OrcaRouter account sign-in uses PKCE and saves the same durable API key as
+  manual setup; its live catalog keeps chat-capable rows and stated pricing
+  and modality facts (#6867).
 
 - Experimental TypeScript extension host. New in this release and off by
   default: turn it on with `[features] extension_host = true`. A plugin that
@@ -259,6 +285,15 @@ note below before upgrading.
 
 ### Fixed
 
+- A failure Codewhale can name is no longer labelled an internal fault. An HTTP
+  400/405/409/413/422 rejection, an out-of-credits 402, the context-budget stop
+  and a turn's own step or wall-clock ceiling now carry an input or budget
+  label, and a bare `ERROR` from a provider is reported as an unreadable error
+  instead of a warning. Refs #6843.
+- A transient upstream failure reported as an error frame inside a successful
+  response is retried within the stream retry budget. When the budget is spent
+  the turn fails once with an error card instead of an amber warning that
+  promised a retry. Refs #6795.
 - Diff lines and tool output wrap at grapheme boundaries, so emoji families,
   skin tones and variation selectors no longer split across lines
   ([#6829](https://github.com/codewhale-hq/Codewhale/pull/6829), thanks @Lstarsky0).
@@ -1200,7 +1235,13 @@ note below before upgrading.
 
 ### Contributors
 
-Seventeen contributors and issue reporters are credited below, including
+- **[@AdityaVG13](https://github.com/AdityaVG13)** — supplied the discovery-cache priority correction adapted from [#6393](https://github.com/codewhale-hq/Codewhale/pull/6393), keeping highest-ranked tools through cache overflow. Its broader echo and fork-inheritance draft remains open.
+- **[@7jrxt42BxFZo4iAnN4CX](https://github.com/7jrxt42BxFZo4iAnN4CX)** — reported indefinite questions cancelled by the TUI watchdog and supplied the timer evidence ([#6872](https://github.com/codewhale-hq/Codewhale/issues/6872)).
+
+- **[@hodeswildsmith455-boop](https://github.com/hodeswildsmith455-boop)** — added OrcaRouter account sign-in with PKCE and its live chat catalog ([#6867](https://github.com/codewhale-hq/Codewhale/pull/6867)).
+- **[@LIghtJUNction](https://github.com/LIghtJUNction)** — added reviewed plugin-provided AI routes with host-owned OAuth PKCE credentials and request-time authority checks ([#6805](https://github.com/codewhale-hq/Codewhale/pull/6805)).
+
+Contributors and issue reporters are credited below, including
 @cenab's provider report.
 
 - **[@Guan0923](https://github.com/Guan0923)** — accepted case-insensitive HTTP(S) schemes in `config doctor` without rewriting the configured URL ([#6819](https://github.com/codewhale-hq/Codewhale/pull/6819)), and routed the Python and JavaScript execution tools through the session's execution policy ([#6820](https://github.com/codewhale-hq/Codewhale/pull/6820)).
@@ -1211,7 +1252,7 @@ Seventeen contributors and issue reporters are credited below, including
 - **[@Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/codewhale-hq/Codewhale/pull/6604), [#6603](https://github.com/codewhale-hq/Codewhale/issues/6603)).
 - **[@aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/codewhale-hq/Codewhale/pull/6761)).
 - **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/codewhale-hq/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/codewhale-hq/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/codewhale-hq/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/codewhale-hq/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/codewhale-hq/Codewhale/pull/6664)).
-- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/codewhale-hq/Codewhale/pull/6405), [#6417](https://github.com/codewhale-hq/Codewhale/pull/6417), [#6499](https://github.com/codewhale-hq/Codewhale/pull/6499), [#6574](https://github.com/codewhale-hq/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/codewhale-hq/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/codewhale-hq/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/codewhale-hq/Codewhale/pull/6733)), wrapped diff and tool output at grapheme boundaries ([#6829](https://github.com/codewhale-hq/Codewhale/pull/6829)), and translated the context inspector rows twelve packs still shipped in English ([#6831](https://github.com/codewhale-hq/Codewhale/pull/6831)).
+- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/codewhale-hq/Codewhale/pull/6405), [#6417](https://github.com/codewhale-hq/Codewhale/pull/6417), [#6499](https://github.com/codewhale-hq/Codewhale/pull/6499), [#6574](https://github.com/codewhale-hq/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/codewhale-hq/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/codewhale-hq/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/codewhale-hq/Codewhale/pull/6733)), wrapped diff and tool output at grapheme boundaries ([#6829](https://github.com/codewhale-hq/Codewhale/pull/6829)), and translated the context inspector rows twelve packs still shipped in English ([#6831](https://github.com/codewhale-hq/Codewhale/pull/6831)). Translated the session-only note after model switches across the complete TUI locale packs ([#6875](https://github.com/codewhale-hq/Codewhale/pull/6875)).
 - **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/codewhale-hq/Codewhale/pull/6581), [#6666](https://github.com/codewhale-hq/Codewhale/pull/6666)). Completed the seventeen-command portable session group, including `/structcopy` ([#6793](https://github.com/codewhale-hq/Codewhale/pull/6793)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/codewhale-hq/Codewhale/pull/6568)).
 - **[@jayanthvee](https://github.com/jayanthvee)** — reported and diagnosed that killing the npm launcher's `node.exe` ends Windows sessions without cleanup, with reproductions and fix directions ([#6827](https://github.com/codewhale-hq/Codewhale/issues/6827)).

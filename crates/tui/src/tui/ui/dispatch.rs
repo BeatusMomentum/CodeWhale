@@ -904,6 +904,7 @@ pub(crate) async fn spawned_dispatch_inner(
         batch: Some(initial_routed_usage.clone()),
     };
     let op = Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: prepare.content.clone(),
         images: Vec::new(),

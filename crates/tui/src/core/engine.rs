@@ -100,7 +100,7 @@ const SUBAGENT_COMPLETION_CHANNEL_CAPACITY: usize = 256;
 /// slot instead of being dropped.
 const MCP_BOOT_CHANNEL_CAPACITY: usize = 64;
 const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
-const PLAN_SHELL_NETWORK_DENIED_HINT: &str = "Shell command blocked: Plan mode runs shell commands in a read-only sandbox — no writes, no network. Use Act mode (`/mode act`) for any command that creates or modifies files, or that needs network access.";
+const PLAN_SHELL_NETWORK_DENIED_HINT: &str = "Shell command blocked: in Plan mode shell commands run in a read-only sandbox with no writes and no network access. The user can change modes with /mode.";
 
 fn context_pressure_message(usage_percent: f64) -> Option<&'static str> {
     if usage_percent >= crate::tui::context_inspector::CONTEXT_CRITICAL_THRESHOLD_PERCENT {
@@ -662,7 +662,8 @@ impl Default for EngineConfig {
             user_input_limits: crate::tools::user_input::UserInputLimits::default(),
             user_input_timeout: None,
             goal_max_steps: None,
-            prefer_bwrap: false,
+            // Mirrors `Config::prefers_bwrap`: on unless explicitly opted out.
+            prefer_bwrap: true,
             bwrap_extensions: crate::sandbox::BwrapMountExtensions::default(),
             // Fail-closed (F7): `Engine::new` unconditionally installs this
             // list process-wide via `read_guard::set_active`, so a default
@@ -957,6 +958,7 @@ pub struct Engine {
     /// Immutable contribution snapshot for the running turn. Re-delivery after
     /// compaction uses these same bytes, never a mid-turn host re-sampling.
     extension_prompt_block: Option<String>,
+    constitution_block: Option<String>,
     api_provider: ProviderKind,
     /// One captured admitted route. Presentation snapshots derive strings from
     /// it; a changed table cannot be blessed by reinterpreting those strings.
@@ -1468,6 +1470,7 @@ impl Engine {
     /// Surface the snapshots-disabled notice a blocking snapshot task parked
     /// (#5930). Called at turn boundaries; each session gets its own notice.
     pub(super) async fn emit_pending_snapshot_notices(&self) {
+        use crate::core::turn::SnapshotsDisabledNoticeUi as _;
         for notice in crate::core::turn::take_snapshots_disabled_notices(
             &self.session.workspace,
             Some(&self.session.id),
@@ -2233,6 +2236,7 @@ impl Engine {
             plugin_registry,
             extension_host,
             extension_prompt_block: None,
+            constitution_block: None,
             api_provider,
             api_provider_identity,
             active_route_limits,
@@ -3312,6 +3316,7 @@ impl Engine {
             .await;
         let _ = self
             .handle_send_message(TurnSpec {
+                profile_constitution: None,
                 content:
                     "[runtime] A background shell task finished; its completion evidence follows."
                         .to_string(),
@@ -3511,6 +3516,7 @@ impl Engine {
 
                         let _ = self
                             .handle_send_message(TurnSpec {
+                                profile_constitution: None,
                                 content,
                                 mode: self.current_mode,
                                 route: Box::new(route),
@@ -4131,6 +4137,7 @@ impl Engine {
                         let mode = self.current_mode;
                         let outcome = self
                             .handle_send_message(TurnSpec {
+                                profile_constitution: None,
                                 content: new_message.clone(),
                                 mode,
                                 route: Box::new(route),
@@ -4851,6 +4858,7 @@ impl Engine {
 
         let outcome = self
             .handle_send_message(TurnSpec {
+                profile_constitution: None,
                 content,
                 mode: self.current_mode,
                 route: Box::new(route),
@@ -5821,6 +5829,7 @@ impl Engine {
         autonomous: bool,
     ) -> SendMessageOutcome {
         let TurnSpec {
+            profile_constitution,
             max_output_tokens,
             content,
             images,
@@ -5895,6 +5904,41 @@ impl Engine {
         // any provider dispatch), so its admission waits for capacity instead
         // of refusing on cancellation. An interactive queued cancellation
         // keeps no lifecycle.
+        // Internal follow-ups belong to the already-admitted work. They must
+        // not replace its account preferences with the host operator's profile.
+        let constitution_block = if self.rlm_host.is_some()
+            || (!provenance.can_authorize_work() && profile_constitution.is_none())
+        {
+            self.constitution_block.clone()
+        } else {
+            match crate::profile_constitution::capture(
+                self.api_config.account_profile.as_deref(),
+                profile_constitution,
+            )
+            .await
+            {
+                Ok(block) => block,
+                Err(error) => {
+                    crate::cost_status::report_runtime_usage_batch(
+                        crate::cost_status::scope_token(),
+                        initial_usage_owner.as_deref(),
+                        &initial_routed_usage,
+                    );
+                    let _ = self
+                        .send_event(Event::error(ErrorEnvelope::new(
+                            ErrorCategory::InvalidInput,
+                            ErrorSeverity::Error,
+                            true,
+                            "profile_constitution_unavailable",
+                            error.to_string(),
+                        )))
+                        .await;
+                    return SendMessageOutcome::NotStarted {
+                        error: Some(error.to_string()),
+                    };
+                }
+            }
+        };
         let admission_cancel = (!self.host_managed_turns()).then_some(&self.cancel_token);
         let admission = async {
             let terminal = streaming::reserve_event_capacity(
@@ -6387,6 +6431,8 @@ impl Engine {
         } else {
             None
         };
+        self.constitution_block = constitution_block;
+        self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
 
         // Compose from the immutable values accepted for this turn. Preview
@@ -6404,6 +6450,8 @@ impl Engine {
                 }],
             });
         }
+
+        self.record_mode_notice(mode);
 
         // The Operate contract (docs/MODES.md) precedes the first Operate
         // prompt. KV-cache effect: append-only history, one user-role runtime
@@ -8250,6 +8298,36 @@ impl Engine {
         }
     }
 
+    /// Record the current mode and its purpose as a runtime notice (KV-cache
+    /// effect: append-only user history; the system prompt is byte-identical
+    /// across modes).
+    ///
+    /// Derived from the session log, like the workspace-trust note: a session
+    /// with no notice gets one only in Plan, and once a notice exists a new
+    /// one is appended whenever the mode differs from the latest, so leaving
+    /// Plan is announced too and history never ends on a stale mode. A
+    /// compaction that dropped the notice re-records it on the next Plan turn.
+    /// Child and RLM hosts get none: their mode is fixed by their parent.
+    fn record_mode_notice(&mut self, mode: AppMode) {
+        if self.child_host.is_some() || self.rlm_host.is_some() {
+            return;
+        }
+        let previous = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| crate::runtime_handoff::mode_notice_display(message).is_some());
+        let message = crate::runtime_handoff::mode_runtime_message(mode);
+        let record = match previous {
+            None => mode == AppMode::Plan,
+            Some(previous) => previous != &message,
+        };
+        if record {
+            self.session.add_message(message);
+        }
+    }
+
     /// Record connected MCP servers' `initialize` guidance in session history
     /// before a model request (KV-cache effect: append-only user history).
     ///
@@ -8310,6 +8388,34 @@ impl Engine {
         let block = self.extension_prompt_block.clone();
         self.record_extension_prompt_contributions(block.as_deref())
             .await;
+    }
+
+    async fn record_current_constitution(&mut self) {
+        let previous = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| crate::runtime_handoff::constitution_display(message).is_some());
+        if self.constitution_block.is_none() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::constitution_runtime_message(
+            self.constitution_block.as_deref(),
+        );
+        if previous == Some(&message) {
+            return;
+        }
+        self.add_session_message(message).await;
+        let receipt = match self.constitution_block.as_deref() {
+            Some(block) if block.starts_with("Account profile constitution,") => block
+                .lines()
+                .next()
+                .unwrap_or("Profile constitution applied."),
+            Some(_) => "Local constitution applied to this turn.",
+            None => "Personal constitution withdrawn for this turn.",
+        };
+        let _ = self.send_event(Event::status(receipt.to_owned())).await;
     }
 
     async fn record_extension_prompt_contributions(&mut self, block: Option<&str>) {
@@ -9054,16 +9160,44 @@ impl MockEngineHandle {
         &mut self,
     ) -> Option<(String, UserInputResponse)> {
         match self.rx_user_input.recv().await? {
-            UserInputDecision::Submitted { id, response } => Some((id, response)),
-            UserInputDecision::Cancelled { .. } => None,
+            UserInputDecision::Submitted {
+                id,
+                response,
+                accepted,
+            } => {
+                accepted.send(true).ok()?;
+                Some((id, response))
+            }
+            UserInputDecision::Cancelled { accepted, .. } => {
+                let _ = accepted.send(true);
+                None
+            }
         }
     }
 
     pub(crate) async fn recv_user_input_cancellation(&mut self) -> Option<String> {
         match self.rx_user_input.recv().await? {
-            UserInputDecision::Cancelled { id } => Some(id),
-            UserInputDecision::Submitted { .. } => None,
+            UserInputDecision::Cancelled { id, accepted } => {
+                accepted.send(true).ok()?;
+                Some(id)
+            }
+            UserInputDecision::Submitted { accepted, .. } => {
+                let _ = accepted.send(true);
+                None
+            }
         }
+    }
+
+    /// Model an Engine verdict that rejects this question's decision.
+    pub(crate) async fn reject_user_input_decision(&mut self) -> Option<String> {
+        let decision = self.rx_user_input.recv().await?;
+        let id = match &decision {
+            UserInputDecision::Submitted { id, .. } | UserInputDecision::Cancelled { id, .. } => {
+                id.clone()
+            }
+        };
+        decision.reject();
+        Some(id)
     }
 
     /// Close the engine event stream without moving fields out of the handle,

@@ -41,6 +41,7 @@ pub(crate) struct CapturedRlmCaller {
     config: EngineConfig,
     system: SystemPrompt,
     extension_prompt_block: Option<String>,
+    constitution_block: Option<String>,
     approval_store: Result<ApprovalReceiptStore, String>,
     review_policy: Arc<AutoReviewPolicy>,
     deadline: tokio::time::Instant,
@@ -142,6 +143,7 @@ impl CapturedRlmCaller {
                     ToolError::not_available("the Core policy prompt is unavailable")
                 })?,
                 extension_prompt_block: engine.extension_prompt_block.clone(),
+                constitution_block: engine.constitution_block.clone(),
                 approval_store: engine.approval_receipt_store.clone(),
                 review_policy: Arc::clone(&engine.shared_auto_review_policy),
                 deadline,
@@ -442,6 +444,7 @@ impl Engine {
         handle.client_preflight_required = false;
         engine.repl_kernel = kernel;
         engine.extension_prompt_block = caller.extension_prompt_block.clone();
+        engine.constitution_block = caller.constitution_block.clone();
         Ok((engine, handle))
     }
 
@@ -464,6 +467,7 @@ impl Engine {
             crate::rlm::turn::metadata_text(&state.prompt, 0, None, None)
         };
         Ok(TurnSpec {
+            profile_constitution: None,
             content,
             images: Vec::new(),
             mode: state.caller.authority.mode,

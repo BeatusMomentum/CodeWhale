@@ -37,7 +37,7 @@ use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::history::{
-    HistoryCell, ThinkingFold, TranscriptActionOwner, TranscriptRenderOptions,
+    HistoryCell, TranscriptActionOwner, TranscriptFold, TranscriptRenderOptions,
 };
 use crate::tui::hotbar::HotbarActionRegistry;
 use crate::tui::motion::MotionPolicy;
@@ -1780,8 +1780,9 @@ pub struct App {
     pub configured_sandbox_network: Option<bool>,
     /// The sandbox backend this platform+config can actually enforce with,
     /// resolved once at startup. `None` means there is NO enforcement
-    /// available (default Linux without `prefer_bwrap`, and all Windows), so
-    /// surfaces must not claim the session is sandboxed (2026-08-04 audit).
+    /// available (Linux with `prefer_bwrap = false` or no working bwrap, and
+    /// all Windows), so surfaces must not claim the session is sandboxed
+    /// (2026-08-04 audit).
     pub sandbox_backend: Option<crate::sandbox::SandboxType>,
     /// Off-event-loop worker for durable Lane control writes. `/lane interrupt`
     /// submits here instead of tearing down a Runtime on the composer thread
@@ -2611,15 +2612,16 @@ pub struct App {
     /// Transcript cells the user has collapsed (hidden from view).
     /// Stores **original** virtual cell indices (pre-filtering).
     pub collapsed_cells: HashSet<usize>,
-    /// Explicit expand/collapse intents the user has recorded for thinking
-    /// cells, keyed by **original** virtual cell index. Set by Space when the
-    /// composer is empty and the cursor is on a thinking cell.
+    /// Explicit expand/collapse intents for transcript cells, keyed by
+    /// **original** virtual cell index. Space preserves a visible preview;
+    /// context-menu Hide uses `collapsed_cells` instead.
     ///
     /// An absent index means the user has not touched that cell, so the
-    /// display preferences decide it. A present index is absolute, so
+    /// thinking display preferences decide it; other cells start expanded.
+    /// A present index is absolute, so
     /// changing `verbose` or `thinking_default_expanded` afterwards leaves
     /// the user's own choice alone (#5847).
-    pub thinking_folds: HashMap<usize, ThinkingFold>,
+    pub cell_folds: HashMap<usize, TranscriptFold>,
     /// Mapping from filtered cell index → original virtual index.
     /// Populated during `ChatWidget::new` by filtering out collapsed cells.
     /// Used by `build_context_menu_entries` to convert line-meta indices
@@ -4575,13 +4577,6 @@ impl App {
         })
     }
 
-    pub fn format_cost_amount_precise(&self, amount: f64) -> String {
-        crate::pricing::format_cost_amount_precise(
-            amount,
-            self.cost_display_currency(self.cost_currency),
-        )
-    }
-
     pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
         if currency == CostCurrency::Cny
             && self.session.cost_cny_priced_turns == 0
@@ -4718,7 +4713,7 @@ impl App {
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
-        self.thinking_folds.clear();
+        self.cell_folds.clear();
         self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
@@ -5120,7 +5115,7 @@ impl App {
     pub(crate) fn prune_transcript_index_state(&mut self, len: usize) {
         self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
         self.collapsed_cells.retain(|idx| *idx < len);
-        self.thinking_folds.retain(|idx, _| *idx < len);
+        self.cell_folds.retain(|idx, _| *idx < len);
         self.expanded_tool_runs.retain(|idx| *idx < len);
         self.collapsed_cell_map.clear();
     }
@@ -5500,6 +5495,36 @@ impl App {
             return;
         }
         let boundary = self.history.len();
+        // The same positional shift applies to presentation state. A late
+        // orphan result must not inherit the active row's fold or Hide choice.
+        self.cell_folds = std::mem::take(&mut self.cell_folds)
+            .into_iter()
+            .map(|(index, fold)| {
+                (
+                    if index >= boundary {
+                        index.saturating_add(added)
+                    } else {
+                        index
+                    },
+                    fold,
+                )
+            })
+            .collect();
+        for indices in [&mut self.collapsed_cells, &mut self.expanded_tool_runs] {
+            *indices = std::mem::take(indices)
+                .into_iter()
+                .map(|index| {
+                    if index >= boundary {
+                        index.saturating_add(added)
+                    } else {
+                        index
+                    }
+                })
+                .collect();
+        }
+        // A pre-insertion action still names the old virtual index. Reject
+        // it until the renderer establishes the owner's new position.
+        self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
         for index in self.tool_cells.values_mut() {
             if *index >= boundary {
                 *index = index.saturating_add(added);

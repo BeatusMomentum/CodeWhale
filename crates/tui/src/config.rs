@@ -2198,6 +2198,11 @@ pub(crate) struct AccountModelAccess {
 /// Resolved CLI configuration, including defaults and environment overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) account_profile: Option<String>,
+    /// Diagnostic clones must never refresh or mutate plugin OAuth credentials.
+    #[serde(skip)]
+    pub(crate) plugin_oauth_read_only: bool,
     /// Never deserialized from disk or exposed as provider configuration.
     #[serde(skip)]
     pub(crate) account_model_access:
@@ -2349,10 +2354,14 @@ pub struct Config {
     /// Optional API key for the external sandbox backend (sent as Bearer token).
     #[serde(alias = "sandboxApiKey")]
     pub sandbox_api_key: Option<String>,
-    /// When true and `/usr/bin/bwrap` is executable on Linux, route exec_shell
-    /// through bubblewrap (#2184).
-    /// Defaults to false. Requires the `bubblewrap` package to be installed
-    /// separately — we do NOT vendor bwrap.
+    /// When true and bubblewrap actually works on this Linux host, route
+    /// sandboxed exec_shell commands through it (#2184).
+    /// Defaults to true — an unset key means sandboxed commands run under
+    /// bwrap whenever `/usr/bin/bwrap` is installed and can create its
+    /// namespaces. An explicit `prefer_bwrap = false` opts out and leaves
+    /// Linux commands unwrapped (the posture then reports policy-only).
+    /// Requires the `bubblewrap` package to be installed separately — we do
+    /// NOT vendor bwrap.
     #[serde(alias = "preferBwrap")]
     pub prefer_bwrap: Option<bool>,
     /// Additional host paths to bind read-only inside the bubblewrap sandbox
@@ -3139,6 +3148,9 @@ pub struct ProviderConfig {
     pub wire: Option<String>,
     #[serde(alias = "authMode")]
     pub auth_mode: Option<String>,
+    /// Core-owned public-client OAuth descriptor for a named plugin provider.
+    #[serde(default)]
+    pub oauth: Option<crate::oauth::PluginOAuthConfig>,
     /// Validated basename of the active Codewhale-owned xAI OAuth generation.
     /// The file always lives below Codewhale's private credentials directory.
     #[serde(default, alias = "oauthCredentialGeneration")]
@@ -3174,6 +3186,9 @@ pub struct ProviderConfig {
     /// than silently routing as OpenAI. Built-in providers leave this unset.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Runtime-only receipt; a config file cannot manufacture plugin authority.
+    #[serde(skip)]
+    pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
     /// Name of the environment variable holding this custom provider's API key
     /// (#1519), e.g. `api_key_env = "EXAMPLE_API_KEY"`. The key value itself is
     /// never stored in config; only the env var name is.
@@ -3683,6 +3698,17 @@ impl Config {
     #[must_use]
     pub fn effective_sandbox_denied_read_paths(&self) -> Vec<std::path::PathBuf> {
         self.read_denylist().subtree_paths()
+    }
+
+    /// Whether Linux shell commands prefer bubblewrap confinement.
+    ///
+    /// On by default: an unset `prefer_bwrap` means sandboxed commands use
+    /// the OS wrapper whenever `/usr/bin/bwrap` works on this host, matching
+    /// the Seatbelt behavior macOS already has. An explicit `false` opts out
+    /// and leaves Linux commands unwrapped.
+    #[must_use]
+    pub fn prefers_bwrap(&self) -> bool {
+        self.prefer_bwrap.unwrap_or(true)
     }
 
     #[must_use]
@@ -4304,6 +4330,7 @@ impl Config {
         })?;
         let legacy_root = parsed.legacy_root.clone();
         let mut config = apply_profile(parsed, profile)?;
+        config.account_profile = profile.map(str::to_owned);
         config.legacy_root = legacy_root;
         Ok(config)
     }
@@ -4336,6 +4363,7 @@ impl Config {
         };
 
         // Scope and profile choices outrank device startup memory. Environment
+        config.account_profile = profile.map(str::to_owned);
         // and managed values are applied afterwards, so their models win too.
         if profile.is_none() && path.as_deref().is_some_and(is_home_config_path) {
             if let Ok(settings) =
@@ -4350,6 +4378,7 @@ impl Config {
         apply_env_overrides(&mut config, environment_policy);
         apply_managed_overrides(&mut config)?;
         apply_requirements(&mut config)?;
+        crate::plugins::providers::apply_startup_providers(&mut config)?;
         normalize_model_config(&mut config);
         config.exec_policy_engine = load_sibling_exec_policy_engine(path.as_deref())?;
         config.loaded_config_path = path.as_deref().map(std::path::absolute).transpose()?;
@@ -6475,8 +6504,16 @@ impl Config {
             .active_provider_identity()
             .map_err(anyhow::Error::msg)?;
 
-        let api_key = self.active_route_api_key_read_only()?;
         let mut diagnostic = self.clone();
+        if identity.provider == ProviderKind::Custom
+            && self
+                .provider_config_for(&identity)
+                .is_some_and(|entry| entry.oauth.is_some())
+        {
+            diagnostic.plugin_oauth_read_only = true;
+            return Ok(diagnostic);
+        }
+        let api_key = self.active_route_api_key_read_only()?;
         diagnostic.set_provider_api_key_override(&identity, Some(api_key))?;
         Ok(diagnostic)
     }
@@ -6497,6 +6534,29 @@ impl Config {
             anyhow::bail!(codewhale_config::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE);
         }
         let auth_mode = self.auth_mode_for_provider(&identity);
+        if provider == ProviderKind::Custom
+            && let Some(entry) = self.provider_config_for(&identity)
+            && let Some(oauth) = entry.oauth.as_ref()
+        {
+            entry
+                .plugin_authority
+                .as_ref()
+                .context("Plugin OAuth route lacks an approved plugin authority")?;
+            anyhow::ensure!(
+                auth_mode.as_deref() == Some("oauth"),
+                "Plugin OAuth route requires auth_mode = oauth"
+            );
+            self.provider
+                .as_deref()
+                .context("Plugin OAuth route has no provider name")?;
+            oauth.validate()?;
+            // Generic config/client construction must never read secure storage,
+            // hash plugin files or refresh OAuth on an async caller's thread.
+            // The request worker verifies the receipt, resolves the bound token
+            // and checks revocation again immediately before each actual send.
+            return Ok((String::new(), "host-managed plugin OAuth".to_string()));
+        }
+
         if auth_mode_disables_api_key(auth_mode.as_deref()) {
             return Ok(keyless());
         }
@@ -7777,9 +7837,9 @@ impl Config {
         self.approval.unwrap_or_default().default_selection
     }
 
-    /// Effective expiry for the interactive approval card (#6101).
+    /// Effective expiry for the Engine-held approval request (#6101).
     /// `None` (absent or an explicit `0`) waits indefinitely; a positive
-    /// value bounds the wait and expiry resolves to deny (fail-closed).
+    /// value bounds the wait, including a hidden card, and expiry blocks the call.
     /// Values above 24h clamp with a warning.
     #[must_use]
     pub fn approval_timeout(&self) -> Option<std::time::Duration> {
@@ -8177,7 +8237,11 @@ fn provider_env_base_url_override(provider: ProviderKind) -> Option<String> {
         ProviderKind::Openai => &["OPENAI_BASE_URL"],
         ProviderKind::Atlascloud => &["ATLASCLOUD_BASE_URL"],
         ProviderKind::Openrouter => &["OPENROUTER_BASE_URL"],
-        ProviderKind::Orcarouter => &["ORCAROUTER_BASE_URL"],
+        // The inference/catalog origin. OrcaRouter's **auth** origin is a
+        // different host and is resolved by
+        // `crate::oauth::resolve_orcarouter_auth_base`; the two never derive
+        // from each other.
+        ProviderKind::Orcarouter => &["ORCA_API_BASE_URL", "ORCA_BASE_URL", "ORCAROUTER_BASE_URL"],
         ProviderKind::XiaomiMimo => &["XIAOMI_MIMO_BASE_URL", "MIMO_BASE_URL"],
         ProviderKind::WanjieArk => &[
             "WANJIE_ARK_BASE_URL",
@@ -10142,7 +10206,7 @@ fn model_for_provider(provider: ProviderKind, normalized: String) -> String {
     }
 }
 
-fn normalize_base_url(base: &str) -> String {
+pub(crate) fn normalize_base_url(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     let deepseek_domains = ["api.deepseek.com", "api.deepseeki.com"];
     if deepseek_domains
@@ -10417,6 +10481,8 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         legacy_root: base.legacy_root,
         legacy_root_custom_generation: base.legacy_root_custom_generation,
         account_model_access: base.account_model_access,
+        account_profile: override_cfg.account_profile.or(base.account_profile),
+        plugin_oauth_read_only: base.plugin_oauth_read_only || override_cfg.plugin_oauth_read_only,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
         runtime_thread_inference_unrelated: override_cfg.runtime_thread_inference_unrelated
             || base.runtime_thread_inference_unrelated,
@@ -10490,6 +10556,8 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         mode: override_cfg.mode.or(base.mode),
         wire: override_cfg.wire.or(base.wire),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
+        oauth: override_cfg.oauth.or(base.oauth),
+        plugin_authority: base.plugin_authority,
         oauth_credential_generation: override_cfg
             .oauth_credential_generation
             .or(base.oauth_credential_generation),
@@ -11492,21 +11560,35 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
 
 #[must_use]
 pub fn active_provider_has_env_api_key(config: &Config) -> bool {
-    let Ok(identity) = config.active_provider_identity() else {
-        return false;
-    };
+    active_provider_env_api_key_source(config).is_some()
+}
+
+/// Where the active provider's environment key comes from, in the resolver's
+/// env precedence (`credential_resolve` steps 2-4): `--api-key`, the route's
+/// `api_key_env` variable, or the provider's own ambient variable. Returns the
+/// place's name only; any value read to test presence is dropped here.
+#[must_use]
+pub(crate) fn active_provider_env_api_key_source(config: &Config) -> Option<String> {
+    let identity = config.active_provider_identity().ok()?;
     let provider = identity.provider;
     if provider == ProviderKind::OpenaiCodex && !config.provider_uses_custom_endpoint(&identity) {
-        return false;
+        return None;
     }
     if auth_mode_disables_api_key(config.auth_mode_for_provider(&identity).as_deref()) {
-        return false;
+        return None;
     }
-    (!provider_uses_oauth_credentials(config, &identity)
-        && explicit_cli_api_key_override().is_some())
-        || provider_config_env_api_key(config, &identity).is_some()
-        || (!config.should_skip_secret_store_for_provider(&identity)
-            && provider_env_api_key(provider).is_some())
+    if !provider_uses_oauth_credentials(config, &identity)
+        && explicit_cli_api_key_override().is_some()
+    {
+        return Some("--api-key".to_string());
+    }
+    if provider_config_env_api_key(config, &identity).is_some() {
+        return bound_provider_api_key_env_name(config, &identity);
+    }
+    if config.should_skip_secret_store_for_provider(&identity) {
+        return None;
+    }
+    provider_env_api_key_named(provider).map(|(name, _)| name.to_string())
 }
 
 #[must_use]
@@ -11582,6 +11664,14 @@ fn user_global_config_api_key(identity: &ProviderIdentity) -> Option<String> {
 /// prompt for a key inline.
 #[must_use]
 pub fn has_api_key_for(config: &Config, identity: &ProviderIdentity) -> bool {
+    if identity.provider == ProviderKind::Custom
+        && config
+            .provider_config_for(identity)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        return crate::provider_readiness::credential_state_for_provider(config, identity)
+            == crate::provider_readiness::CredentialState::Saved;
+    }
     credential_resolve::resolve_credential_source(config, identity).is_present()
 }
 
@@ -12259,8 +12349,10 @@ fn provider_config_table_name(identity: &ProviderIdentity) -> Result<String> {
     Ok(format!("providers.{}", provider_config_key(identity)?))
 }
 
-fn provider_env_api_key(provider: ProviderKind) -> Option<String> {
-    provider_env_api_key_named(provider).map(|(_, value)| value)
+/// Name of the ambient provider variable that currently holds a non-empty key
+/// for `provider`. Presence only: the value is dropped here.
+pub(crate) fn provider_env_api_key_var(provider: ProviderKind) -> Option<&'static str> {
+    provider_env_api_key_named(provider).map(|(name, _)| name)
 }
 
 /// The provider's ambient env key and the variable that supplied it,

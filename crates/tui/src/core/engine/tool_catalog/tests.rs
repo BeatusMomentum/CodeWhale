@@ -260,13 +260,16 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
         &catalog,
         &mut active,
         &mut cache,
-        "deferred-0"
+        "deferred-7"
     ));
     let delta = cache.activate(&catalog, &["deferred-8".to_string()]);
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
+    // The batch is ranked best-first; using its oldest retained match
+    // promotes it ahead of the next batch without granting an unseen tool.
+    assert!(cache.names().any(|name| name == "deferred-7"));
     assert!(cache.names().any(|name| name == "deferred-0"));
-    assert!(!cache.names().any(|name| name == "deferred-1"));
+    assert!(!cache.names().any(|name| name == "deferred-6"));
 
     assert!(!touch_cached_tool_after_execution(
         &catalog,

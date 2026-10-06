@@ -1632,6 +1632,19 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Sign in to a reviewed plugin-defined OAuth provider (PKCE loopback).
+    #[command(name = "plugin-login")]
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove host-owned credentials for a plugin-defined provider.
+    #[command(name = "plugin-logout")]
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
+
     /// Sign in to xAI/Grok with an SSH-friendly device code; run again to switch accounts.
     ///
     /// The account you approve on the xAI page replaces the Codewhale-owned
@@ -1652,6 +1665,15 @@ enum AuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE and store the issued key.
+    ///
+    /// Opens the OrcaRouter consent screen on a loopback callback and
+    /// exchanges the authorization code for a durable `sk-orca-...` API key.
+    /// The key is billed to your OrcaRouter account and revocable there.
+    /// To paste an existing key instead, use
+    /// `codewhale auth set --provider orcarouter`.
+    #[command(name = "orcarouter")]
+    Orcarouter,
     /// Explicitly allow read-only access to one credential file owned by
     /// another CLI. Managed mutation is currently unsupported and fails closed.
     #[command(name = "external-consent")]
@@ -2420,7 +2442,7 @@ fn run() -> Result<()> {
                 args.no_open,
                 args.timeout_seconds,
                 cli.profile.as_deref(),
-                &store,
+                &mut store,
             )
         }
         Some(Commands::Logout(args)) => {
@@ -2428,6 +2450,32 @@ fn run() -> Result<()> {
             run_logout_command(&mut store, cli.profile.as_deref())
         }
         Some(Commands::Auth(args)) => match args.command {
+            AuthCommand::PluginLogin { provider } => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec![
+                        "auth".to_string(),
+                        "plugin-login".to_string(),
+                        "--provider".to_string(),
+                        provider,
+                    ],
+                )
+            }
+            AuthCommand::PluginLogout { provider } => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec![
+                        "auth".to_string(),
+                        "plugin-logout".to_string(),
+                        "--provider".to_string(),
+                        provider,
+                    ],
+                )
+            }
             AuthCommand::XaiDevice => {
                 let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
                 run_tui_in_process(
@@ -2450,6 +2498,14 @@ fn run() -> Result<()> {
                     &cli,
                     &resolved_runtime,
                     vec!["auth".to_string(), "chatgpt-revoke".to_string()],
+                )
+            }
+            AuthCommand::Orcarouter => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec!["auth".to_string(), "orcarouter".to_string()],
                 )
             }
             command @ AuthCommand::Status {
@@ -2477,7 +2533,7 @@ fn run() -> Result<()> {
         },
         Some(Commands::Account(args)) => {
             cloud::reject_inline_api_key(cli.api_key.as_deref())?;
-            cloud::run(args, cli.profile.as_deref(), &store)
+            cloud::run(args, cli.profile.as_deref(), &mut store)
         }
         Some(Commands::Dispatch(args)) => dispatch::run(args),
         Some(Commands::McpServer) => {
@@ -4601,6 +4657,9 @@ fn run_auth_command_with_secrets_and_runtime(
     runtime_overrides: &CliRuntimeOverrides,
 ) -> Result<()> {
     match command {
+        AuthCommand::PluginLogin { .. } | AuthCommand::PluginLogout { .. } => {
+            bail!("plugin OAuth commands must run through the runtime dispatch")
+        }
         AuthCommand::XaiDevice => {
             let argv = vec!["auth".to_string(), "xai-device".to_string()];
             let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
@@ -4621,6 +4680,15 @@ fn run_auth_command_with_secrets_and_runtime(
         }
         AuthCommand::ChatgptRevoke => {
             let argv = vec!["auth".to_string(), "chatgpt-revoke".to_string()];
+            let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            })
+        }
+        AuthCommand::Orcarouter => {
+            let argv = vec!["auth".to_string(), "orcarouter".to_string()];
             let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
             std::process::exit(if code == std::process::ExitCode::SUCCESS {
                 0

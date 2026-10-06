@@ -426,6 +426,19 @@ pub(super) fn credential_writeability(
     }
     let provider = identity.provider;
     let auth_mode = config.auth_mode_for_provider(identity);
+    if provider == ProviderKind::Custom
+        && config
+            .provider_config_for(identity)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        return CredentialWriteability {
+            source: ProviderCredentialSource::ExternalAuth,
+            writable: false,
+            reason: Some(
+                "This provider signs in through its reviewed plugin. Use the plugin login or logout command.",
+            ),
+        };
+    }
     if codewhale_config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialWriteability {
             source: ProviderCredentialSource::None,
@@ -860,6 +873,37 @@ mod tests {
                 .as_deref(),
             Some("manual-key")
         );
+    }
+
+    #[test]
+    fn plugin_oauth_credentials_cannot_be_replaced_by_an_api_key() {
+        let mut config = Config {
+            provider: Some("plugin-test".into()),
+            ..Default::default()
+        };
+        let entry = config
+            .providers
+            .get_or_insert_with(Default::default)
+            .custom
+            .entry("plugin-test".into())
+            .or_default();
+        entry.kind = Some("openai-compatible".into());
+        entry.base_url = Some("https://gateway.example/api".into());
+        entry.auth_mode = Some("oauth".into());
+        entry.oauth = Some(crate::oauth::PluginOAuthConfig {
+            issuer: "https://gateway.example".into(),
+            authorization_endpoint: "https://gateway.example/authorize".into(),
+            token_endpoint: "https://gateway.example/token".into(),
+            client_id: "plugin-test".into(),
+            scopes: vec![],
+            resource: None,
+            callback_path: "/oauth/callback".into(),
+        });
+        let identity = config.active_provider_identity().unwrap();
+        let writeability = credential_writeability(&config, &identity);
+        assert!(!writeability.writable);
+        assert_eq!(writeability.source, ProviderCredentialSource::ExternalAuth);
+        assert!(writeability.reason.unwrap().contains("plugin"));
     }
 
     /// A route Codewhale owns is writable, and says its source is the store it

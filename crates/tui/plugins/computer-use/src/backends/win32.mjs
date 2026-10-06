@@ -440,7 +440,12 @@ $bmp.Dispose(); $img.Dispose();
 Write-Output '{"ok": true}';`;
       const r = await psOk(script, { timeoutMs: 20_000 });
       if (r.code !== 0 || !fs.existsSync(out)) throw new ExecError(`zoom failed: ${(r.stderr || "").slice(0, 250)}`, r);
-      return { file: out, bytes: fs.statSync(out).size, region, source: src };
+      const parent = lastRaster;
+      const [x, y, w, h] = region.map(Math.round);
+      lastRaster = { file: out, bytes: fs.statSync(out).size, region, source: src,
+        points: { x: (parent.points?.x ?? 0) + x / parent.scale, y: (parent.points?.y ?? 0) + y / parent.scale, w: w / parent.scale, h: h / parent.scale },
+        pixels: { w, h }, scale: parent.scale, capturedAt: new Date().toISOString() };
+      return { ...lastRaster };
     },
     left_click: ({ target, strategy }) => { assertEventStrategy(strategy); return clickAt(0, target.x, target.y, 1); },
     double_click: ({ target }) => clickAt(0, target.x, target.y, 2),

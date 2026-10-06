@@ -37,7 +37,7 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-10-02T18:06:32.682Z",
+  "generatedAt": "2026-10-06T00:44:34.685Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
   "version": "0.10.1",
@@ -73,7 +73,7 @@ export const FACTS: RepoFacts = {
   ],
   "sandboxBackends": [
     "seatbelt (macOS, when available)",
-    "bubblewrap (Linux, opt-in when installed)"
+    "bubblewrap (Linux, default when installed and working)"
   ],
   "providers": [
     {

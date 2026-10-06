@@ -277,7 +277,7 @@ owner = "crates/execpolicy/src/approval_mode.rs"
 [[feature]]
 id = "sandbox"
 name = "Command sandbox"
-summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is opt-in."
+summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is on by default once installed and verified."
 status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/SANDBOX.md"
@@ -468,7 +468,7 @@ owner = "crates/tui/src/lsp"
 [[feature]]
 id = "runtime-api"
 name = "Runtime API"
-summary = "Local HTTP API for threads, events, approvals and the rest of the session."
+summary = "Local HTTP API for threads, events and approvals, with scoped watch/drive device tokens."
 status = "stable"
 surfaces = { api = "stable" }
 docs = "docs/RUNTIME_API.md"
@@ -651,6 +651,26 @@ since = "unreleased"
 docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
 owner = "crates/tui/src/oauth.rs"
 
+[[feature]]
+id = "plugin-oauth-providers"
+name = "Reviewed plugin OAuth providers"
+summary = "Reviewed plugins add OpenAI-compatible routes; the host owns PKCE grants and rechecks approval at each request."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PLUGIN_PROVIDERS.md"
+owner = "crates/tui/src/plugins/providers.rs"
+
+[[feature]]
+id = "orcarouter-sign-in"
+name = "Sign in with OrcaRouter"
+summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
+status = "experimental"
+surfaces = { tui = "preview", api = "none", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md"
+owner = "crates/tui/src/oauth.rs"
+
 # Community marketing website, separate from the Runtime's local web client.
 [[feature]]
 id = "merch-interest"
@@ -661,3 +681,13 @@ surfaces = { tui = "none", web = "none", api = "none" }
 since = "unreleased"
 docs = "web/lib/merch/README.md"
 owner = "web/components/merch-interest.tsx"
+
+[[feature]]
+id = "profile-constitution"
+name = "Profile constitution"
+summary = "Account preferences are captured per turn and previewed by the Engine."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+since = "unreleased"
+docs = "docs/RUNTIME_API.md#profile-constitution"
+owner = "crates/tui/src/profile_constitution.rs"

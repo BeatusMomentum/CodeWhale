@@ -286,6 +286,10 @@ pub struct CodewhaleClient {
     /// is signed in and how to switch, appended to plan-quota errors. Holds
     /// an account label only, never token material.
     subscription_limit_guidance: Option<String>,
+    /// Reviewed runtime authority and OAuth descriptor travel with the frozen route.
+    plugin_provider: Option<Box<crate::config::ProviderConfig>>,
+    /// Read-only diagnostic probes must never migrate or refresh the grant.
+    plugin_oauth_read_only: bool,
     /// Exact configured credential values removed from model-bound tool
     /// results. Structural redaction handles config/JSON assignments, while
     /// this list closes the gap for bare provider tokens with no recognizable
@@ -647,6 +651,8 @@ impl Clone for CodewhaleClient {
             api_key: self.api_key.clone(),
             api_key_source: self.api_key_source.clone(),
             subscription_limit_guidance: self.subscription_limit_guidance.clone(),
+            plugin_provider: self.plugin_provider.clone(),
+            plugin_oauth_read_only: self.plugin_oauth_read_only,
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
@@ -1634,6 +1640,29 @@ impl CodewhaleClient {
         config
             .verify_provider_identity(&admitted_identity)
             .map_err(anyhow::Error::msg)?;
+        let plugin_provider = config
+            .provider_config_for(&admitted_identity)
+            .filter(|entry| entry.plugin_authority.is_some())
+            .cloned()
+            .map(Box::new);
+        if let Some(entry) = &plugin_provider {
+            anyhow::ensure!(
+                entry.oauth.is_some()
+                    && config.auth_mode_for_provider(&admitted_identity).as_deref()
+                        == Some("oauth"),
+                "plugin provider requires host-managed OAuth"
+            );
+        }
+        let base_url = if plugin_provider.is_some() {
+            let reviewed = config.base_url_for_route(&admitted_identity);
+            anyhow::ensure!(
+                reqwest::Url::parse(&base_url)? == reqwest::Url::parse(&reviewed)?,
+                "plugin candidate changed its reviewed provider endpoint"
+            );
+            reviewed
+        } else {
+            base_url
+        };
         let openrouter_vendor = config.openrouter_vendor()?;
         let billing_surface = crate::route_billing::billing_surface_for_dispatch(
             Some(config),
@@ -1725,7 +1754,12 @@ impl CodewhaleClient {
                 "HTTP/1.1 pinned (stream configuration or environment) — HTTP/2 disabled",
             );
         }
-        let http_headers = config.http_headers();
+        // A newly reviewed plugin destination must not inherit credentials or
+        // routing headers from unrelated, global provider configuration.
+        let http_headers = plugin_provider.as_ref().map_or_else(
+            || config.http_headers(),
+            |entry| entry.http_headers.clone().unwrap_or_default(),
+        );
         let auth_disabled = auth_mode_disables_api_key(
             config.auth_mode_for_provider(&admitted_identity).as_deref(),
         );
@@ -1782,7 +1816,12 @@ impl CodewhaleClient {
             auth_disabled,
             force_http1,
             config,
-        )?
+        )?;
+        let http_client = if plugin_provider.is_some() {
+            http_client.redirect(reqwest::redirect::Policy::none())
+        } else {
+            http_client
+        }
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
             &api_key,
@@ -1808,7 +1847,12 @@ impl CodewhaleClient {
             auth_disabled,
             true,
             config,
-        )?
+        )?;
+        let http1_client = if plugin_provider.is_some() {
+            http1_client.redirect(reqwest::redirect::Policy::none())
+        } else {
+            http1_client
+        }
         .build()?;
 
         let catalog_error_secret_values = Arc::new(catalog_error_secret_values(
@@ -1823,6 +1867,8 @@ impl CodewhaleClient {
             api_key,
             api_key_source,
             subscription_limit_guidance,
+            plugin_provider,
+            plugin_oauth_read_only: config.plugin_oauth_read_only,
             model_bound_secret_values,
             catalog_error_secret_values,
             model_bound_masking,
@@ -1855,6 +1901,62 @@ impl CodewhaleClient {
             stream_open_timeout,
             force_http1,
         })
+    }
+
+    /// Revalidate revocation and refresh host-owned OAuth before each actual send.
+    /// Plugin code receives neither the access token nor the refresh token.
+    pub(super) async fn authorize_plugin_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
+        let Some(provider) = self.plugin_provider.clone() else {
+            return Ok(request);
+        };
+        let authority = provider
+            .plugin_authority
+            .clone()
+            .context("plugin provider has no authority")?;
+        let name = self.admitted_identity.key.to_string();
+        let base_url = self.base_url.clone();
+        let destination = request
+            .try_clone()
+            .context("plugin request cannot be inspected")?
+            .build()?;
+        let base = reqwest::Url::parse(&base_url)?;
+        anyhow::ensure!(
+            destination.url().origin() == base.origin(),
+            "plugin request escaped its reviewed provider origin"
+        );
+        let policy = crate::plugins::activation::extension_host_policy_enabled();
+        let read_only = self.plugin_oauth_read_only;
+        let token = tokio::task::spawn_blocking(move || -> Result<String> {
+            let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+            let descriptor = provider
+                .oauth
+                .as_ref()
+                .context("plugin provider requires host-managed OAuth")?;
+            let empty_headers = std::collections::HashMap::new();
+            crate::plugins::providers::verify_provider_binding(
+                &authority,
+                &name,
+                &base_url,
+                descriptor,
+                Some(provider.http_headers.as_ref().unwrap_or(&empty_headers)),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let token =
+                crate::oauth::plugin_oauth_access_token(&name, &base_url, descriptor, read_only)?;
+            // Refresh may wait on the issuer. Do not send a model request if
+            // the review was revoked while that HTTP request was in flight.
+            crate::plugins::registry::verify_plugin_component_authority(
+                &authority,
+                crate::plugins::activation::PluginActivationCapability::Providers,
+            )
+            .map_err(anyhow::Error::msg)?;
+            Ok(token)
+        })
+        .await??;
+        Ok(request.bearer_auth(token))
     }
 
     /// Map a failed HTTP response, naming the route, host and key source on
@@ -3273,8 +3375,15 @@ impl CodewhaleClient {
         &self,
         mode: ModelsRequestMode,
     ) -> Result<(String, tokio::time::Instant), ModelsFetchError> {
-        let endpoint = reqwest::Url::parse(&api_url(&self.base_url, "models"))
+        let mut endpoint = reqwest::Url::parse(&api_url(&self.base_url, "models"))
             .map_err(|_| CatalogRefreshError::InvalidResponse)?;
+        // OrcaRouter scopes `GET /v1/models` to one capability. Ask for the chat
+        // roster so the model control is the real chat list rather than every
+        // kind the account can reach; other providers take the unfiltered
+        // listing. Non-text rows are dropped again by the chat endpoint filter.
+        if self.api_provider == ProviderKind::Orcarouter {
+            endpoint.query_pairs_mut().append_pair("capability", "chat");
+        }
         // https://platform.claude.com/docs/en/api/models/list specifies after_id.
         // Go is unpaginated. A Messages generation dialect or a custom identity
         // resembling a built-in provider does not establish this list contract.
@@ -3309,7 +3418,10 @@ impl CodewhaleClient {
                         .await
                         .map_err(ModelsFetchError::Interactive)?
                     }
-                    ModelsRequestMode::Refresh => build()
+                    ModelsRequestMode::Refresh => self
+                        .authorize_plugin_request(build())
+                        .await
+                        .map_err(|_| CatalogRefreshError::Unauthorized)?
                         .send()
                         .await
                         .map_err(|_| CatalogRefreshError::Network)?,
@@ -3417,7 +3529,7 @@ impl CodewhaleClient {
     /// allowing this provider's successful roster to retire removed ids.
     ///
     /// Activated for model-list authorities that are not satisfied by the
-    /// cross-provider Models.dev snapshot: OpenRouter, named live gateways,
+    /// cross-provider Models.dev snapshot: OpenRouter, OrcaRouter, named live gateways,
     /// and Baseten's account-scoped endpoint (no static snapshot can serve a
     /// per-credential roster). Custom OpenAI-compatible hosts are included
     /// too: a private relay is not in the Models.dev snapshot, so without a
@@ -3651,12 +3763,19 @@ impl CodewhaleClient {
             return;
         }
         let health_url = api_url(&self.base_url, "models");
-        let probe = self
+        let request = self
             .models_http_client
             .get(health_url)
-            .timeout(NON_STREAMING_HTTP_TIMEOUT)
-            .send()
-            .await;
+            .timeout(NON_STREAMING_HTTP_TIMEOUT);
+        let request = match self.authorize_plugin_request(request).await {
+            Ok(request) => request,
+            Err(_) => {
+                self.mark_request_failure("probe authorization failed")
+                    .await;
+                return;
+            }
+        };
+        let probe = request.send().await;
         match probe {
             Ok(resp) if resp.status().is_success() => {
                 // Consume the response body so the connection can be returned to the pool.
@@ -3694,6 +3813,11 @@ impl CodewhaleClient {
         status: u16,
         raw: &str,
     ) -> String {
+        // Rotated opaque bearer values are not part of this client's frozen
+        // redaction list. Do not disclose an untrusted plugin endpoint's body.
+        if self.plugin_provider.is_some() {
+            return "plugin provider request failed".into();
+        }
         let provider = Some(self.api_provider.provider().display_name());
         let ErrorBodyDisclosure::Guarded { request_secrets } = disclosure else {
             return sanitize_http_error_body(provider, status, raw);
@@ -3822,6 +3946,10 @@ impl CodewhaleClient {
                         tokio::time::sleep(delay.min(RATE_LIMIT_PAUSE_RECHECK_INTERVAL)).await;
                     }
                     self.wait_for_rate_limit().await;
+                    let request = self
+                        .authorize_plugin_request(request)
+                        .await
+                        .map_err(|error| LlmError::Other(error.to_string()))?;
                     let response = request
                         .send()
                         .await
@@ -3935,6 +4063,10 @@ impl CodewhaleClient {
                     let request = build();
                     async move {
                         self.wait_for_rate_limit().await;
+                        let request = self
+                            .authorize_plugin_request(request)
+                            .await
+                            .map_err(|error| LlmError::Other(error.to_string()))?;
                         let response = request
                             .send()
                             .await
@@ -4128,9 +4260,12 @@ impl LlmClient for CodewhaleClient {
         let health_url = api_url(&self.base_url, "models");
         self.wait_for_rate_limit().await;
         let response = self
-            .models_http_client
-            .get(health_url)
-            .timeout(NON_STREAMING_HTTP_TIMEOUT)
+            .authorize_plugin_request(
+                self.models_http_client
+                    .get(health_url)
+                    .timeout(NON_STREAMING_HTTP_TIMEOUT),
+            )
+            .await?
             .send()
             .await;
         match response {
@@ -4249,6 +4384,11 @@ struct OpenRouterModelItem {
     supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     architecture: Option<OpenRouterArchitecture>,
+    /// Endpoint dialects this gateway advertises for the row. OrcaRouter
+    /// publishes this for every model it lists; it is what lets chat rows be
+    /// separated from image/video/rerank rows without guessing from the name.
+    #[serde(default)]
+    supported_endpoint_types: Option<Vec<String>>,
     #[serde(default)]
     #[expect(dead_code)]
     expiration_date: Option<String>,
@@ -4608,7 +4748,40 @@ fn catalog_delta_from_models_body(
     // OpenRouter returns extended capability metadata in its /models
     // response (#3385). Capture limits, pricing, reasoning, and modalities
     // from the live API instead of leaving them unknown.
-    let offerings: Vec<CatalogOffering> = if api_provider == ProviderKind::Openrouter {
+    let offerings: Vec<CatalogOffering> = if api_provider == ProviderKind::Orcarouter {
+        // OrcaRouter serves the extended capability shape too, and adds
+        // `supported_endpoint_types` on every row. That field is what keeps a
+        // gateway model list — which mixes chat with image/video generation —
+        // from dumping non-text rows into the text selector. A row that does
+        // not advertise a chat dialect is dropped here, so the roster the
+        // picker and `/model` read is chat-only.
+        let listed = parse_orcarouter_models_response(body)?;
+        if listed.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+        let chat_rows: Vec<_> = listed
+            .iter()
+            .filter(|item| orcarouter_row_is_chat(item))
+            .collect();
+        let non_chat = listed.len() - chat_rows.len();
+        if non_chat > 0 {
+            tracing::info!(
+                dropped = non_chat,
+                listed = listed.len(),
+                "OrcaRouter catalog refresh kept chat rows and dropped non-chat dialects"
+            );
+        }
+        let offerings: Vec<_> = chat_rows
+            .iter()
+            .filter_map(|item| {
+                orcarouter_to_catalog_offering(item, &provider, &fingerprint, fetched_at).ok()
+            })
+            .collect();
+        if offerings.is_empty() {
+            return Err(CatalogRefreshError::InvalidResponse);
+        }
+        offerings
+    } else if api_provider == ProviderKind::Openrouter {
         let or_models = parse_openrouter_models_response(body)?;
         if or_models.is_empty() {
             return Err(CatalogRefreshError::EmptyList);
@@ -4860,6 +5033,108 @@ fn parse_openrouter_models_response(
         return Err(CatalogRefreshError::InvalidResponse);
     }
     Ok(models)
+}
+
+/// Endpoint dialects that mean "a chat/completions text turn can be served".
+///
+/// OrcaRouter (and OpenRouter) publish `supported_endpoint_types`; a chat row
+/// must carry at least one of these, and the non-chat dialects
+/// (`image-generation`, `openai-video`, `jina-rerank`, `embeddings`) are how a
+/// generation-only model is kept out of the chat selector.
+const ORCAROUTER_CHAT_ENDPOINT_TYPES: &[&str] =
+    &["openai", "anthropic", "gemini", "openai-response"];
+
+/// Whether an OrcaRouter row is offered on a chat/completions dialect.
+///
+/// Fail-closed on silence: a row that declares no `supported_endpoint_types`
+/// is **not** assumed to be chat. On a gateway that mixes chat with image and
+/// video generation, guessing by omission would put a generation model in the
+/// text selector.
+fn orcarouter_row_is_chat(item: &OpenRouterModelItem) -> bool {
+    item.supported_endpoint_types.as_ref().is_some_and(|types| {
+        types.iter().any(|endpoint| {
+            let endpoint = endpoint.trim();
+            ORCAROUTER_CHAT_ENDPOINT_TYPES
+                .iter()
+                .any(|chat| endpoint.eq_ignore_ascii_case(chat))
+        })
+    })
+}
+
+/// Parse OrcaRouter's `/v1/models` body.
+///
+/// The gateway serves the OpenRouter extended shape: every row carries
+/// `supported_endpoint_types`, and text models add `architecture`,
+/// `context_length`, `top_provider` and `pricing`. Rows are accepted or
+/// skipped by the same id rules as [`parse_openrouter_models_response`], so one
+/// malformed row cannot fail the whole roster.
+fn parse_orcarouter_models_response(
+    payload: &str,
+) -> Result<Vec<OpenRouterModelItem>, CatalogRefreshError> {
+    let parsed: OpenRouterModelsResponse =
+        serde_json::from_str(payload).map_err(|_| CatalogRefreshError::InvalidResponse)?;
+    let listed = parsed.data.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut malformed = 0usize;
+    let mut models = Vec::with_capacity(listed);
+    for row in parsed.data {
+        let Ok(item) = serde_json::from_str::<OpenRouterModelItem>(row.get()) else {
+            malformed += 1;
+            continue;
+        };
+        if item.id.starts_with('~') {
+            continue;
+        }
+        if !crate::provider_lake::valid_catalog_model_id(&item.id) {
+            malformed += 1;
+            continue;
+        }
+        if seen.insert(item.id.clone()) {
+            models.push(item);
+        }
+    }
+    if malformed > 0 {
+        tracing::warn!(
+            malformed,
+            listed,
+            "skipped malformed OrcaRouter model rows in the catalog refresh"
+        );
+    }
+    if models.is_empty() && malformed > 0 {
+        return Err(CatalogRefreshError::InvalidResponse);
+    }
+    Ok(models)
+}
+
+/// Project one OrcaRouter `/v1/models` row onto a catalog offering.
+///
+/// Pricing and limits reuse the OpenRouter projection (OrcaRouter bills the
+/// same extended fields). Two differences matter:
+///
+/// - OrcaRouter does not publish `supported_parameters` on its rows, so the
+///   OpenRouter projection's `reasoning`/`tool_call` would become a factual
+///   "no reasoning, no tools". It strips them back to unclaimed instead: on
+///   this gateway an absent parameter list is silence, not a refusal. That
+///   also keeps Codewhale's tools enabled for OrcaRouter chat models.
+/// - A row whose `architecture` names an explicit input set keeps it verbatim,
+///   so the multimodal gate downstream is reading a stated fact. Rows with no
+///   `architecture` stay unclaimed rather than inheriting a "text" default.
+fn orcarouter_to_catalog_offering(
+    item: &OpenRouterModelItem,
+    provider: &str,
+    base_url_fingerprint: &str,
+    fetched_at: u64,
+) -> Result<CatalogOffering, CatalogRefreshError> {
+    let mut offering =
+        openrouter_to_catalog_offering(item, provider, base_url_fingerprint, fetched_at)?;
+    if item.supported_parameters.is_none() {
+        offering.reasoning = None;
+        offering.tool_call = None;
+    }
+    if item.architecture.is_none() {
+        offering.modalities = None;
+    }
+    Ok(offering)
 }
 
 /// Parse Baseten's authenticated Model APIs catalog without inferring facts
@@ -5863,6 +6138,8 @@ mod tests {
     include!("client/test_cases_06.rs");
 
     include!("client/test_cases_07.rs");
+
+    include!("client/test_cases_08.rs");
 }
 
 #[cfg(test)]

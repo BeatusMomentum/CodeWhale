@@ -602,7 +602,18 @@ fn load_staged_skill_snapshots_with_roots(
     Ok(snapshots)
 }
 
-fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
+pub(super) fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
+    PluginId(format!(
+        "{}/{}/{name}",
+        scope.as_str(),
+        plugin_root_hash(scope, canonical_root)
+    ))
+}
+
+/// The path-derived middle segment of a plugin id. It depends only on the
+/// scope and canonical root, never the manifest name, so a persisted record
+/// can be matched to a directory on disk even when its manifest no longer parses.
+pub(super) fn plugin_root_hash(scope: PluginScope, canonical_root: &Path) -> String {
     let mut hasher = Sha256::new();
     // v2 intentionally invalidates receipts produced by the former lossy
     // Unicode path identity.
@@ -611,11 +622,10 @@ fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId 
     hasher.update(b"\0");
     super::path_identity::hash_os_path(&mut hasher, b"canonical-plugin-root", canonical_root);
     let digest = hasher.finalize();
-    let suffix = digest[..6]
+    digest[..6]
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    PluginId(format!("{}/{suffix}/{name}", scope.as_str()))
+        .collect::<String>()
 }
 
 #[cfg(test)]

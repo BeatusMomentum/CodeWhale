@@ -650,9 +650,10 @@ codewhale doctor --probe-api
 #   · Testing connection...  ✓ API connection successful
 ```
 
-Use `auth status`. Plain `codewhale doctor` does **not** tell you: it prints
-`deepseek: env_source=not inspected` even when the key is set, and it exits 0
-even when no key is found.
+Plain `codewhale doctor` names an environment key it can see
+(`deepseek: env_source=set via DEEPSEEK_API_KEY (value not shown; not checked offline)`)
+but does not read the secret store or check the key; `--probe-api` does both.
+Doctor exits 0 even when no key is found, so scripts should use `auth status`.
 
 ### Remove a stored key
 
