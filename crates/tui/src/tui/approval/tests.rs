@@ -2228,6 +2228,7 @@ fn test_elevation_view_initial_state() {
             None,
             "elevation is not an initial approval"
         );
+        assert_eq!(view.tool_decision_request_id(), Some("test-id"));
     }
 }
 

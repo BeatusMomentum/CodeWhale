@@ -8626,12 +8626,12 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
     let mut first = ChildSurfaceProbe::new(catalog.clone(), &warm);
     let mut second = ChildSurfaceProbe::new(catalog, &[]);
     let first_names = model_tool_names(model_request_tools(&mut first));
-    assert!(!first_names.contains("deferred_0"));
-    assert!(first_names.contains("deferred_8"));
-    assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_8"));
+    assert!(first_names.contains("deferred_0"));
+    assert!(!first_names.contains("deferred_8"));
+    assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_0"));
 
-    first.catalog_mut().retain(|tool| tool.name != "deferred_8");
-    assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_8"));
+    first.catalog_mut().retain(|tool| tool.name != "deferred_0");
+    assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_0"));
     first
         .catalog_mut()
         .push(synthetic_deferred_tool("oversized", 17 * 1024));
@@ -8652,8 +8652,8 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
         .collect::<Vec<_>>();
     let mut byte_surface = ChildSurfaceProbe::new(byte_catalog, &byte_warm);
     let byte_names = model_tool_names(model_request_tools(&mut byte_surface));
-    assert!(!byte_names.contains("bytes_0"));
-    assert!(byte_names.contains("bytes_1") && byte_names.contains("bytes_2"));
+    assert!(byte_names.contains("bytes_0") && byte_names.contains("bytes_1"));
+    assert!(!byte_names.contains("bytes_2"));
 }
 
 #[tokio::test]

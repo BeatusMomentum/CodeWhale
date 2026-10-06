@@ -8517,11 +8517,19 @@ mod tests {
                     );
                 }
                 CredentialAcquisition::ApiKeyOrOAuth => {
-                    assert_eq!(provider, ProviderKind::Xai, "{provider:?}");
+                    assert!(matches!(
+                        provider,
+                        ProviderKind::Xai | ProviderKind::Orcarouter
+                    ));
                     assert!(matches!(action, ViewAction::None), "{provider:?}");
                     let choices = render_text(&picker, 80, 24);
                     assert!(choices.contains("API key"), "{choices}");
-                    assert!(choices.contains("device OAuth"), "{choices}");
+                    let oauth_label = match provider {
+                        ProviderKind::Xai => "device OAuth",
+                        ProviderKind::Orcarouter => "PKCE",
+                        _ => unreachable!(),
+                    };
+                    assert!(choices.contains(oauth_label), "{choices}");
 
                     // Choice 1 is an ordinary API-key path. Text remains a key;
                     // it is never reinterpreted as an OAuth bearer token.
@@ -8538,7 +8546,26 @@ mod tests {
                         picker.handle_key(key(KeyCode::Char(ch)));
                     }
                     assert!(picker.handle_paste("otter-key"));
-                    let key_text = "violet-otter-key";
+                    if provider == ProviderKind::Orcarouter {
+                        // Reject a key from another provider without emitting a
+                        // save/validation event, then accept the owned key shape.
+                        assert!(matches!(
+                            picker.handle_key(key(KeyCode::Enter)),
+                            ViewAction::None
+                        ));
+                        assert_eq!(picker.stage, Stage::KeyEntry);
+                        assert!(picker.key_entry_error.is_some());
+                        for _ in 0..picker.api_key_input.chars().count() {
+                            picker.handle_key(key(KeyCode::Backspace));
+                        }
+                        assert!(picker.api_key_input.is_empty());
+                        assert!(picker.handle_paste("sk-orca-violet-otter-key"));
+                    }
+                    let key_text = if provider == ProviderKind::Orcarouter {
+                        "sk-orca-violet-otter-key"
+                    } else {
+                        "violet-otter-key"
+                    };
                     assert_eq!(picker.api_key_input, key_text);
                     for (width, height) in [(80, 24), (120, 32)] {
                         let rendered = render_text(&picker, width, height);
@@ -8551,14 +8578,14 @@ mod tests {
                             identity,
                             api_key,
                             base_url: None,
-                        }) if identity.provider == ProviderKind::Xai && identity.persisted_id() == Some("xai") && api_key == key_text
+                        }) if identity.provider == provider && identity.persisted_id() == Some(provider.as_str()) && api_key == key_text
                     ));
 
-                    // Choice 2 is the provider-native device flow and emits only
+                    // Choice 2 is the provider-native OAuth flow and emits only
                     // the request event; the picker never manufactures a token.
                     let mut oauth = ProviderPickerView::new_for_onboarding(
                         ProviderKind::Deepseek,
-                        Some(ProviderKind::Xai.as_str().into()),
+                        Some(provider.as_str().into()),
                         &config,
                         None,
                     );
@@ -8570,10 +8597,20 @@ mod tests {
                         oauth.handle_key(key(KeyCode::Char('2'))),
                         ViewAction::None
                     ));
-                    assert!(matches!(
-                        oauth.handle_key(key(KeyCode::Enter)),
-                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerXaiOAuthRequested)
-                    ));
+                    let action = oauth.handle_key(key(KeyCode::Enter));
+                    match provider {
+                        ProviderKind::Xai => assert!(matches!(
+                            action,
+                            ViewAction::EmitAndClose(ViewEvent::ProviderPickerXaiOAuthRequested)
+                        )),
+                        ProviderKind::Orcarouter => assert!(matches!(
+                            action,
+                            ViewAction::EmitAndClose(
+                                ViewEvent::ProviderPickerOrcarouterOAuthRequested
+                            )
+                        )),
+                        _ => unreachable!(),
+                    }
                 }
                 CredentialAcquisition::LocalOptional => assert!(matches!(
                     action,

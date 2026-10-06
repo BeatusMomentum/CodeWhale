@@ -284,13 +284,18 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
         // Phase 3: reproduce the old resume path — deriving a store from the
         // saved conversation id without its binding opens a foreign scope and
         // cannot run.
-        let foreign = TaskManager::start(
-            task_config.clone(),
-            config.clone(),
-            Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
-            &loaded.metadata.id,
-            None,
-        )
+        // Keep this start future out of the outer poll frame too. Its Config
+        // temporaries otherwise stay on the stack underneath every boxed phase.
+        let foreign = boxed_phase(move || async move {
+            TaskManager::start(
+                task_config.clone(),
+                config.clone(),
+                Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+                &loaded.metadata.id,
+                None,
+            )
+            .await
+        })
         .await?;
         let foreign = &foreign;
         boxed_phase(move || async move {

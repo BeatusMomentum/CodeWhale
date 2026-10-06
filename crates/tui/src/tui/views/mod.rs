@@ -1225,6 +1225,12 @@ pub trait ModalView: std::any::Any {
         None
     }
 
+    /// The tool decision this card waits on, including an elevation retry.
+    /// Retirement shares identity without granting initial approval authority.
+    fn tool_decision_request_id(&self) -> Option<&str> {
+        self.approval_request_id()
+    }
+
     /// The human-question tool id, kept separate from approval authority.
     fn user_input_request_id(&self) -> Option<&str> {
         None
@@ -1309,12 +1315,12 @@ impl ViewStack {
         self.views.len() != before
     }
 
-    /// Remove the approval card for tool/approval id `id` at any depth.
-    pub fn remove_approval_by_id(&mut self, id: &str) -> bool {
+    /// Remove the initial approval or elevation retry for `id` at any depth.
+    pub fn remove_tool_decision_by_id(&mut self, id: &str) -> bool {
         let before = self.views.len();
         let top = self.top_identity();
         self.views
-            .retain(|view| view.approval_request_id() != Some(id));
+            .retain(|view| view.tool_decision_request_id() != Some(id));
         self.note_top_change(top);
         self.views.len() != before
     }
@@ -1329,25 +1335,40 @@ impl ViewStack {
         self.views.len() != before
     }
 
-    /// Whether an approval card for `id` is anywhere in the stack.
+    /// Whether an initial approval card for `id` is anywhere in the stack.
+    #[cfg(test)]
     pub fn contains_approval_id(&self, id: &str) -> bool {
         self.views
             .iter()
             .any(|view| view.approval_request_id() == Some(id))
     }
 
-    pub fn approval_request_ids(&self) -> Vec<String> {
+    pub fn contains_tool_decision_id(&self, id: &str) -> bool {
         self.views
             .iter()
-            .filter_map(|view| view.approval_request_id().map(str::to_owned))
+            .any(|view| view.tool_decision_request_id() == Some(id))
+    }
+
+    pub fn tool_decision_request_ids(&self) -> Vec<String> {
+        self.views
+            .iter()
+            .filter_map(|view| view.tool_decision_request_id().map(str::to_owned))
             .collect()
     }
 
-    /// The approval id of the top view, when it is an approval card.
+    /// The initial approval id of the top view, kept distinct in authority tests.
+    #[cfg(test)]
     pub fn top_approval_id(&self) -> Option<&str> {
         self.views
             .last()
             .and_then(|view| view.approval_request_id())
+    }
+
+    /// The decision currently shown, including an elevation retry.
+    pub fn top_tool_decision_id(&self) -> Option<&str> {
+        self.views
+            .last()
+            .and_then(|view| view.tool_decision_request_id())
     }
 
     /// Whether a key observed at `observed_at` predates the moment the

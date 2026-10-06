@@ -7,25 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `/plugin doctor` reports stale built-in records and snapshots, and
-  `/plugin doctor --fix` retires them. A user plugin, a snapshot a running
-  process names, and a snapshot inside the grace window are kept. The
-  previous `state.json` is kept as `state.json.pre-gc`.
-
-### Fixed
-
-- A failure Codewhale can name is no longer labelled an internal fault. An HTTP
-  400/405/409/413/422 rejection, an out-of-credits 402, the context-budget stop
-  and a turn's own step or wall-clock ceiling now carry an input or budget
-  label, and a bare `ERROR` from a provider is reported as an unreadable error
-  instead of a warning. Refs #6843.
-- A transient upstream failure reported as an error frame inside a successful
-  response is retried within the stream retry budget. When the budget is spent
-  the turn fails once with an error card instead of an amber warning that
-  promised a retry. Refs #6795.
-
 ## [0.10.1] - 2026-10-01
 
 ### Contributor integration and reliability
@@ -49,6 +30,10 @@ note below before upgrading.
 
 ### Added
 
+- `/plugin doctor` reports stale built-in records and snapshots, and
+  `/plugin doctor --fix` retires them. A user plugin, a snapshot a running
+  process names, and a snapshot inside the grace window are kept. The
+  previous `state.json` is kept as `state.json.pre-gc`.
 - Reviewed plugins can declare named OpenAI-compatible OAuth routes. The host
   owns PKCE, refresh and credential storage, and checks the review at each
   request ([docs/PLUGIN_PROVIDERS.md](docs/PLUGIN_PROVIDERS.md), #6805).
@@ -300,6 +285,15 @@ note below before upgrading.
 
 ### Fixed
 
+- A failure Codewhale can name is no longer labelled an internal fault. An HTTP
+  400/405/409/413/422 rejection, an out-of-credits 402, the context-budget stop
+  and a turn's own step or wall-clock ceiling now carry an input or budget
+  label, and a bare `ERROR` from a provider is reported as an unreadable error
+  instead of a warning. Refs #6843.
+- A transient upstream failure reported as an error frame inside a successful
+  response is retried within the stream retry budget. When the budget is spent
+  the turn fails once with an error card instead of an amber warning that
+  promised a retry. Refs #6795.
 - Diff lines and tool output wrap at grapheme boundaries, so emoji families,
   skin tones and variation selectors no longer split across lines
   ([#6829](https://github.com/codewhale-hq/Codewhale/pull/6829), thanks @Lstarsky0).

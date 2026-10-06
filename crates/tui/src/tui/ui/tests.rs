@@ -33901,6 +33901,39 @@ fn human_decision_from_another_session_does_not_refresh_this_turn() {
 }
 
 #[test]
+fn child_elevation_footer_tracks_the_visible_decision_without_initial_approval_authority() {
+    let mut app = human_wait_test_app(true);
+    let id = "agent:child-wait:approval:boot:1";
+    crate::tui::pending_requests::record(
+        &mut app,
+        id,
+        crate::tui::pending_requests::PendingChildRequest {
+            agent_id: "child-wait".into(),
+            tool_name: "exec_shell".into(),
+            description: "Review child command".into(),
+            input: serde_json::json!({"command": "pwd"}),
+            approval_key: "key".into(),
+            approval_grouping_key: "group".into(),
+            intent_summary: None,
+            requested_at: Instant::now(),
+        },
+    );
+    assert_eq!(crate::tui::pending_requests::footer_rows(&app).len(), 1);
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(id, "exec_shell", "denied"),
+            app.ui_locale,
+        ));
+    assert_eq!(app.view_stack.top_approval_id(), None);
+    assert!(crate::tui::pending_requests::footer_rows(&app).is_empty());
+    add_human_wait_approval(&mut app, "other-decision");
+    assert_eq!(crate::tui::pending_requests::footer_rows(&app).len(), 1);
+    crate::tui::pending_requests::retire(&mut app, id);
+    assert!(crate::tui::pending_requests::footer_rows(&app).is_empty());
+    assert!(app.view_stack.contains_approval_id("other-decision"));
+}
+
+#[test]
 fn ended_parent_turn_retires_approvals_and_elevations_but_keeps_child_requests() {
     let mut app = human_wait_test_app(true);
     add_human_wait_approval(&mut app, "parent-card");
@@ -33914,9 +33947,11 @@ fn ended_parent_turn_retires_approvals_and_elevations_but_keeps_child_requests()
             ),
             app.ui_locale,
         ));
+    assert!(app.view_stack.contains_tool_decision_id("parent-elevation"));
+    assert!(!app.view_stack.contains_approval_id("parent-elevation"));
     settle_pending_human_requests(&mut app);
     assert!(!app.view_stack.contains_approval_id("parent-card"));
-    assert!(!app.view_stack.contains_approval_id("parent-elevation"));
+    assert!(!app.view_stack.contains_tool_decision_id("parent-elevation"));
     assert!(
         app.view_stack
             .contains_approval_id("agent:child-wait:approval:boot:1")

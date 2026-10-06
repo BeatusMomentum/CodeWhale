@@ -1463,23 +1463,29 @@ async fn apply_conversation_undo(
     Ok(())
 }
 
-pub(crate) async fn apply_command_result(
-    terminal: &mut AppTerminal,
-    app: &mut App,
-    engine_handle: &mut EngineHandle,
-    task_manager: &SharedTaskManager,
-    config: &mut Config,
+// The event loop awaits this dispatcher at several call sites. In debug
+// builds, embedding its entire state machine at each site gives the caller
+// separate large stack slots even though only one action runs at a time.
+// Construct it here so callers carry one pointer, as modal dispatch already does.
+pub(crate) fn apply_command_result<'a>(
+    terminal: &'a mut AppTerminal,
+    app: &'a mut App,
+    engine_handle: &'a mut EngineHandle,
+    task_manager: &'a SharedTaskManager,
+    config: &'a mut Config,
     result: commands::CommandResult,
-) -> Result<bool> {
-    let outcome =
-        apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
-            .await;
-    // A save the command made may have moved legacy top-level `base_url` /
-    // `api_key` into their provider tables (#6394); say so once.
-    for notice in codewhale_config::legacy_root::take_notices() {
-        app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
-    }
-    outcome
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + 'a>> {
+    Box::pin(async move {
+        let outcome =
+            apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
+                .await;
+        // A save the command made may have moved legacy top-level `base_url` /
+        // `api_key` into their provider tables (#6394); say so once.
+        for notice in codewhale_config::legacy_root::take_notices() {
+            app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
+        }
+        outcome
+    })
 }
 
 async fn apply_command_result_inner(
@@ -3140,7 +3146,7 @@ pub(crate) fn settle_pending_human_requests(app: &mut App) {
     }
     // A completed/cancelled parent turn cannot still await an approval.
     // Children own their separate lifecycle and may legitimately remain live.
-    for id in app.view_stack.approval_request_ids() {
+    for id in app.view_stack.tool_decision_request_ids() {
         if !crate::tools::subagent::SubAgentManager::is_child_approval_id(&id) {
             crate::tui::pending_requests::retire(app, &id);
             app.retire_action_notices(Some(&id));

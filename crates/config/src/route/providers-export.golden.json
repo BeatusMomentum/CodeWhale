@@ -948,6 +948,10 @@
         {
           "kind": "api-key",
           "label": "API key"
+        },
+        {
+          "kind": "oauth",
+          "label": "OAuth"
         }
       ],
       "transport": "chat-completions"

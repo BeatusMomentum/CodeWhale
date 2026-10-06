@@ -196,7 +196,7 @@ impl ModalView for ElevationView {
         ModalKind::Elevation
     }
 
-    fn approval_request_id(&self) -> Option<&str> {
+    fn tool_decision_request_id(&self) -> Option<&str> {
         Some(&self.request.tool_id)
     }
 
