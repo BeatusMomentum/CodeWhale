@@ -12,6 +12,7 @@ use crate::tui::approval::{RiskLevel, ToolCategory, classify_risk, get_tool_cate
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoReviewAction {
@@ -1120,11 +1121,224 @@ fn windows_tool_runtime_risk(tool_name: &str, params: &Value) -> Option<SessionR
 fn windows_shell_stdin_risk(params: &Value) -> Option<SessionRuntimeRisk> {
     // Match Bash's first non-null alias exactly. Wrong types remain refused by
     // the existing tool schema; this projection never admits an execution.
+    // Stdin runs in a persistent session, so `$var` proofs stay off: an
+    // earlier payload may have primed the variable this one names.
     ["stdin", "input", "data"]
         .into_iter()
         .find_map(|name| params.get(name).filter(|value| !value.is_null()))
         .and_then(Value::as_str)
-        .and_then(windows_session_runtime_risk)
+        .and_then(|stdin| windows_session_runtime_risk_scoped(stdin, false))
+}
+
+fn ps_invocation_word(argv: &[String]) -> &str {
+    let word = argv
+        .first()
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim_start_matches(['(', '$']);
+    let word = word.split(')').next().unwrap_or(word);
+    word.strip_suffix(".exe").unwrap_or(word)
+}
+
+// PowerShell accepts an unambiguous parameter prefix and colon syntax.
+// Reuse the invocation's words; do not interpret a PowerShell program.
+fn ps_parameter(arg: &str, name: &str) -> bool {
+    let flag = arg.split(':').next().unwrap_or(arg).to_ascii_lowercase();
+    flag.starts_with('-') && flag.len() > 1 && name.starts_with(&flag)
+}
+
+fn ps_literal_pids(value: &str) -> bool {
+    value
+        .split(',')
+        .all(|pid| pid.parse::<u32>().is_ok_and(|pid| pid != 0))
+}
+
+/// The inline port-owner rule: `(Get-NetTCPConnection -LocalPort <port>
+/// ...).OwningProcess`. Shared by `-Id`/`/PID` selectors and by `$var`
+/// assignments proven to hold the same expression, so the two stay one rule.
+fn port_owner_words_are_bounded(words: &[String]) -> bool {
+    ps_invocation_word(words).eq_ignore_ascii_case("get-nettcpconnection")
+        && words
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains(").owningprocess"))
+        && words.windows(2).any(|pair| {
+            ps_parameter(&pair[0], "-localport")
+                && pair[1]
+                    .split(')')
+                    .next()
+                    .unwrap_or(&pair[1])
+                    .parse::<u16>()
+                    .is_ok_and(|port| port != 0)
+        })
+}
+
+/// What a `$var` on a PID selector provably holds: the command assigned it
+/// exactly once, from a PID source the gate already accepts inline (#6871).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PidVarSource {
+    /// A literal PID list: `$p = 26128`.
+    Literal,
+    /// A listening port's owner: `$p = (Get-NetTCPConnection -LocalPort 3999 ...).OwningProcess`.
+    PortOwner,
+    /// An owned process object: `$proc = Start-Process ... -PassThru` (usable as `$proc.Id`).
+    PassThruProcess,
+}
+
+/// Variables the command itself proves bounded (lowercased name to source).
+/// Any second assignment, compound assignment, or `++`/`--` drops the proof:
+/// with a single assignment in a fresh shell, every use sees either the
+/// proven value or `$null` (a use before the assignment, which fails safe).
+/// Callers on persistent (interact) sessions must not use this: a stale value
+/// from an earlier payload would survive a later proof.
+fn pid_var_proofs(command: &str) -> HashMap<String, PidVarSource> {
+    let mut proofs: HashMap<String, PidVarSource> = HashMap::new();
+    let mut touched: HashSet<String> = HashSet::new();
+    for stmt in command.split([';', '\n']) {
+        let stmt = stmt.trim().trim_end_matches('\r');
+        let bytes = stmt.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                i += 1;
+                continue;
+            }
+            let Some((name, mut j)) = ps_var_name(stmt, i) else {
+                i += 1;
+                continue;
+            };
+            let key = name.to_ascii_lowercase();
+            // Prefix `++`/`--`, destructuring (`$a, $b = ...` proves nothing
+            // about `$b`), postfix `++`/`--`, and compound assignment all
+            // mutate without proving: mark touched, keep no proof.
+            let prefix_mutated = i >= 2 && matches!(&stmt[i - 2..i], "++" | "--");
+            let destructured = stmt[..i].trim_end().ends_with(',');
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            let rest = &stmt[j..];
+            let mutated = prefix_mutated
+                || destructured
+                || rest.starts_with("++")
+                || rest.starts_with("--")
+                || ["+=", "-=", "*=", "/=", "%="]
+                    .iter()
+                    .any(|op| rest.starts_with(op));
+            if mutated {
+                touched.insert(key.clone());
+                proofs.remove(&key);
+                i = j;
+                continue;
+            }
+            let Some(rhs) = rest.strip_prefix('=') else {
+                i = j;
+                continue;
+            };
+            if !touched.insert(key.clone()) {
+                proofs.remove(&key);
+            } else if let Some(source) = pid_assignment_source(rhs) {
+                proofs.insert(key, source);
+            }
+            i = j;
+        }
+    }
+    proofs
+}
+
+/// `$name` or `${name}` at `stmt[dollar] == b'$'`; the name and the offset
+/// just past it. Scope-qualified (`$global:x`) names are not plain variables.
+fn ps_var_name(stmt: &str, dollar: usize) -> Option<(&str, usize)> {
+    let rest = stmt.get(dollar + 1..)?;
+    if let Some(braced) = rest.strip_prefix('{') {
+        let (name, _) = braced.split_once('}')?;
+        if ps_var_name_is_valid(name) {
+            return Some((name, dollar + 1 + 1 + name.len() + 1));
+        }
+        return None;
+    }
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(|pos| dollar + 1 + pos)
+        .unwrap_or(stmt.len());
+    let name = stmt.get(dollar + 1..end)?;
+    ps_var_name_is_valid(name).then_some((name, end))
+}
+
+fn ps_var_name_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Classify one plain-assignment RHS. `Some` only for the shapes the gate
+/// already accepts inline at `-Id`: a literal PID list, the port-owner
+/// lookup, or `Start-Process -PassThru`. A `|` anywhere vetoes: a pipeline
+/// can re-derive the value from anything downstream.
+fn pid_assignment_source(rhs: &str) -> Option<PidVarSource> {
+    if rhs.contains('|') {
+        return None;
+    }
+    let rhs = rhs.trim().trim_matches(['\'', '"']);
+    if ps_literal_pids(rhs) {
+        return Some(PidVarSource::Literal);
+    }
+    let words: Vec<String> = rhs.split_whitespace().map(str::to_string).collect();
+    if words.is_empty() {
+        return None;
+    }
+    if port_owner_words_are_bounded(&words) {
+        return Some(PidVarSource::PortOwner);
+    }
+    if passthru_start_words(&words) {
+        return Some(PidVarSource::PassThruProcess);
+    }
+    None
+}
+
+/// `Start-Process ... -PassThru ...`: the value is the owned process object.
+/// `saps` is its unambiguous alias; bare `start` also names cmd's launcher,
+/// so it stays refused (an approval click, not an error).
+fn passthru_start_words(words: &[String]) -> bool {
+    let base = ps_invocation_word(words);
+    let base = base.rsplit(['\\', '/']).next().unwrap_or(base);
+    (base.eq_ignore_ascii_case("start-process") || base.eq_ignore_ascii_case("saps"))
+        && words.iter().any(|word| ps_parameter(word, "-passthru"))
+}
+
+/// A `-Id`/`/PID` value naming a proven variable: `$var` for a PID-valued
+/// proof (literal, port owner), `$var.Id` for a `-PassThru` process object.
+fn pid_var_use_is_bounded(value: &str, proofs: &HashMap<String, PidVarSource>) -> bool {
+    let Some((name, prop)) = pid_var_use_parts(value) else {
+        return false;
+    };
+    match proofs.get(&name.to_ascii_lowercase()) {
+        Some(PidVarSource::PassThruProcess) => prop.is_some_and(|prop| prop.eq_ignore_ascii_case("id")),
+        Some(_) => prop.is_none(),
+        None => false,
+    }
+}
+
+/// Split `$var`, `${var}`, `$var.Id` into (name, property). Anything else is
+/// not a variable use this proof covers.
+fn pid_var_use_parts(value: &str) -> Option<(&str, Option<&str>)> {
+    let var = value.trim().strip_prefix('$')?;
+    if let Some(braced) = var.strip_prefix('{') {
+        let (name, rest) = braced.split_once('}')?;
+        if name.is_empty() {
+            return None;
+        }
+        let prop = rest.strip_prefix('.').filter(|prop| !prop.is_empty());
+        if prop.is_some_and(|prop| prop.contains('.')) {
+            return None;
+        }
+        return Some((name, prop));
+    }
+    let mut parts = var.splitn(2, '.');
+    let name = parts.next().filter(|name| !name.is_empty())?;
+    let prop = parts.next().filter(|prop| !prop.is_empty());
+    if prop.is_some_and(|prop| prop.contains('.')) {
+        return None;
+    }
+    Some((name, prop))
 }
 
 /// Reuse the existing bounded invocation walk, including nested shell payloads.
@@ -1132,6 +1346,16 @@ fn windows_shell_stdin_risk(params: &Value) -> Option<SessionRuntimeRisk> {
 /// another Codewhale launcher is excluded. This is not a PowerShell evaluator
 /// or a sandbox for arbitrary scripts. Literal PID/port cleanup stays available.
 fn windows_session_runtime_risk(command: &str) -> Option<SessionRuntimeRisk> {
+    windows_session_runtime_risk_scoped(command, true)
+}
+
+/// `fresh_shell` gates `$var` proofs: one fresh command is analyzable whole,
+/// while an interact payload runs in a session earlier payloads may have
+/// primed, so variables there keep requiring approval.
+fn windows_session_runtime_risk_scoped(
+    command: &str,
+    fresh_shell: bool,
+) -> Option<SessionRuntimeRisk> {
     use codewhale_execpolicy::command_safety::command_invocations;
     let Some(mut invocations) = command_invocations(command) else {
         return Some(SessionRuntimeRisk::UnclassifiedWindowsInvocation);
@@ -1150,48 +1374,20 @@ fn windows_session_runtime_risk(command: &str) -> Option<SessionRuntimeRisk> {
         };
         invocations.extend(windows_paths);
     }
-    fn word(argv: &[String]) -> &str {
-        let word = argv
-            .first()
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim_start_matches(['(', '$']);
-        let word = word.split(')').next().unwrap_or(word);
-        word.strip_suffix(".exe").unwrap_or(word)
-    }
-    // PowerShell accepts an unambiguous parameter prefix and colon syntax.
-    // Reuse the invocation's words; do not interpret a PowerShell program.
-    let parameter = |arg: &str, name: &str| {
-        let flag = arg.split(':').next().unwrap_or(arg).to_ascii_lowercase();
-        flag.starts_with('-') && flag.len() > 1 && name.starts_with(&flag)
-    };
-    let literal_pids = |value: &str| {
-        value
-            .split(',')
-            .all(|pid| pid.parse::<u32>().is_ok_and(|pid| pid != 0))
-    };
+    let pid_vars = fresh_shell
+        .then(|| pid_var_proofs(command))
+        .unwrap_or_default();
     let bounded_pid_selector = |args: &[String]| {
         let Some(first) = args.first() else {
             return false;
         };
-        literal_pids(first)
-            || (word(args).eq_ignore_ascii_case("get-nettcpconnection")
-                && args
-                    .iter()
-                    .any(|arg| arg.to_ascii_lowercase().contains(").owningprocess"))
-                && args.windows(2).any(|pair| {
-                    parameter(&pair[0], "-localport")
-                        && pair[1]
-                            .split(')')
-                            .next()
-                            .unwrap_or(&pair[1])
-                            .parse::<u16>()
-                            .is_ok_and(|port| port != 0)
-                }))
+        ps_literal_pids(first)
+            || port_owner_words_are_bounded(args)
+            || pid_var_use_is_bounded(first, &pid_vars)
     };
     let named_targets = |args: &[String], flag: &str| {
         args.iter()
-            .position(|arg| parameter(arg, flag))
+            .position(|arg| ps_parameter(arg, flag))
             .map(|index| {
                 let inline = args[index].split_once(':').map(|(_, name)| name);
                 let names: Vec<_> = inline
@@ -1208,14 +1404,15 @@ fn windows_session_runtime_risk(command: &str) -> Option<SessionRuntimeRisk> {
     };
     // -Id is not bounded when it is fed IDs from a whole named image group.
     // Conservatively retain this getter fact across the supplied statement;
-    // do not evaluate PowerShell variables, pipelines or branch conditions.
+    // do not evaluate pipelines or branch conditions. `$var` PID proofs live
+    // with the selectors below, not here.
     let getter_can_include_node = invocations.iter().any(|argv| {
-        if !matches!(word(argv), "get-process" | "gps" | "ps") {
+        if !matches!(ps_invocation_word(argv), "get-process" | "gps" | "ps") {
             return false;
         }
         let args = &argv[1..];
         named_targets(args, "-name").unwrap_or_else(|| {
-            if args.iter().any(|arg| parameter(arg, "-id")) {
+            if args.iter().any(|arg| ps_parameter(arg, "-id")) {
                 return false;
             }
             let names: Vec<_> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
@@ -1226,13 +1423,13 @@ fn windows_session_runtime_risk(command: &str) -> Option<SessionRuntimeRisk> {
         let args = &argv[1..];
         if getter_can_include_node
             && matches!(
-                word(argv),
+                ps_invocation_word(argv),
                 "taskkill" | "stop-process" | "spps" | "kill" | "killall" | "pkill"
             )
         {
             return true;
         }
-        match word(argv) {
+        match ps_invocation_word(argv) {
             "taskkill" => {
                 let images: Vec<_> = args
                     .windows(2)
@@ -1272,12 +1469,17 @@ fn windows_session_runtime_risk(command: &str) -> Option<SessionRuntimeRisk> {
             }
             "stop-process" | "spps" | "kill" => {
                 named_targets(args, "-name").unwrap_or_else(|| {
-                    // A bare pipeline/variable input is not proof of an owned
-                    // PID. Keep explicit -Id (including a port's owner) usable.
+                    // A bare pipeline input is not proof of an owned PID. A
+                    // `$var` the command assigned once from a bounded source
+                    // is (fresh shells only); keep explicit -Id (including a
+                    // port's owner) usable.
                     args.iter()
-                        .position(|arg| parameter(arg, "-id"))
+                        .position(|arg| ps_parameter(arg, "-id"))
                         .is_none_or(|index| match args[index].split_once(':') {
-                            Some((_, value)) => !literal_pids(value),
+                            Some((_, value)) => {
+                                !ps_literal_pids(value)
+                                    && !pid_var_use_is_bounded(value, &pid_vars)
+                            }
                             None => !bounded_pid_selector(&args[index + 1..]),
                         })
                 })
@@ -1740,6 +1942,17 @@ mod tests {
             "cmd /c taskkill /F /IM node.exe",
             "pkill '^node$'",
             "killall node.exe",
+            // #6871: a variable proves nothing unless the command assigned it
+            // once from a bounded source.
+            "$p = (Get-Process node).Id; Stop-Process -Id $p",
+            "$p = (Get-Process -Id 1234).Id; Stop-Process -Id $p",
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; $p = (Get-Process node).Id; Stop-Process -Id $p",
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess | Select-Object -First 1; Stop-Process -Id $p",
+            "$proc = Start-Process node server.js; Stop-Process -Id $proc.Id",
+            "$p = (Get-NetTCPConnection).OwningProcess; Stop-Process -Id $p",
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; Stop-Process -Id $p.Id",
+            "$proc = Start-Process node server.js -PassThru; Stop-Process -Id $proc",
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; $p++; Stop-Process -Id $p",
         ] {
             assert_eq!(
                 windows_session_runtime_risk(command),
@@ -1764,9 +1977,29 @@ mod tests {
             "Stop-Process -Name chrome -Force",
             "Stop-Process -Name nodemon -Force",
             "Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000).OwningProcess -Force",
+            // #6871: the same PID the gate accepts inline, held in a variable
+            // the command assigned once from a bounded source.
+            "$p = (Get-NetTCPConnection -LocalPort 3999 -State Listen).OwningProcess; Stop-Process -Id $p",
+            "$proc = Start-Process node server.js -PassThru; Start-Sleep 3; Stop-Process -Id $proc.Id",
+            "$P = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; Stop-Process -Id $p",
+            "$pid_1 = 26128; Stop-Process -Id $pid_1",
+            "${p} = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; Stop-Process -Id ${p}",
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; taskkill /PID $p /F",
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; Stop-Process -Id:$p -Force",
         ] {
             assert_eq!(windows_session_runtime_risk(command), None, "{command}");
         }
+    }
+
+    #[test]
+    fn windows_pid_var_proofs_stay_off_on_persistent_stdin() {
+        let command =
+            "$p = (Get-NetTCPConnection -LocalPort 3999).OwningProcess; Stop-Process -Id $p";
+        assert_eq!(windows_session_runtime_risk_scoped(command, true), None);
+        assert_eq!(
+            windows_session_runtime_risk_scoped(command, false),
+            Some(SessionRuntimeRisk::WindowsNodeImageKill)
+        );
     }
 
     #[test]
