@@ -309,6 +309,7 @@ pub(crate) fn reconcile_turn_liveness_with(
         // it before clearing turn state so `--continue` keeps the prompt
         // instead of loading the previous save.
         persist_recovery_snapshot(app);
+        settle_pending_user_input_request(app);
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.turn_started_at = None;
@@ -334,6 +335,7 @@ pub(crate) fn reconcile_turn_liveness_with(
         && !app.is_compacting
         && !app.is_purging
     {
+        settle_pending_user_input_request(app);
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.turn_started_at = None;
@@ -466,6 +468,7 @@ pub(crate) fn maybe_throttled_recovery_snapshot(
 }
 
 pub(crate) fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: StatusToastLevel) {
+    settle_pending_user_input_request(app);
     // Capture the turn identity before the reset below clears it; the
     // outbox event must name the turn that stalled.
     let stalled_turn_id = app.runtime_turn_id.clone();
@@ -545,6 +548,7 @@ pub(crate) fn recover_engine_event_disconnect(app: &mut App) -> bool {
         || app.is_purging
         || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         || app.pending_turn_route.is_some()
+        || app.pending_user_input_prompt.is_some()
         || app.active_turn.is_some()
         || app.suppress_stream_events_until_turn_complete
         || app.streaming_message_index.is_some()
@@ -557,6 +561,8 @@ pub(crate) fn recover_engine_event_disconnect(app: &mut App) -> bool {
     if !had_live_work {
         return false;
     }
+
+    settle_pending_user_input_request(app);
 
     streaming_thinking::finalize_current(app);
     app.finalize_streaming_assistant_as_interrupted();

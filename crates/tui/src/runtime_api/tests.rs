@@ -18948,7 +18948,7 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
             "input_summary": "silent settlement fixture", "created_at": Utc::now()
         }))?;
         manager.test_store().save_turn(&turn)?;
-        let mock = crate::core::engine::mock_engine_handle();
+        let mut mock = crate::core::engine::mock_engine_handle();
         manager
             .install_test_engine(&thread.id, mock.handle.clone())
             .await?;
@@ -19014,7 +19014,12 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
                 ExternalApprovalDecision::Allow { remember: false }
             );
         } else {
-            assert!(manager.cancel_user_input(&thread.id, "request").await?);
+            let (canceled, consumed) = tokio::join!(
+                manager.cancel_user_input(&thread.id, "request"),
+                mock.recv_user_input_cancellation(),
+            );
+            assert!(canceled?);
+            assert_eq!(consumed.as_deref(), Some("request"));
         }
         let settled = manager.get_thread_detail(&thread.id).await?;
         assert!(settled.pending_approvals.is_empty());

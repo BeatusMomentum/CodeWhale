@@ -3111,20 +3111,57 @@ pub(crate) fn apply_hotbar_setup_saved(
     app.needs_redraw = true;
 }
 
-pub(crate) fn settle_user_input_request(app: &mut App, tool_id: &str) {
+pub(crate) fn settle_user_input_request(app: &mut App, tool_id: &str) -> bool {
     app.retire_action_notices(Some(tool_id));
-    if app
+    let removed_view = app.view_stack.remove_user_input_by_id(tool_id);
+    let matched = app
         .pending_user_input_prompt
         .as_ref()
-        .is_some_and(|(id, _)| id == tool_id)
-    {
+        .is_some_and(|(id, _)| id == tool_id);
+    if matched {
         app.pending_user_input_prompt = None;
+    }
+    app.needs_redraw |= removed_view || matched;
+    matched
+}
+
+pub(crate) fn settle_pending_user_input_request(app: &mut App) {
+    if let Some((id, _)) = app.pending_user_input_prompt.as_ref() {
+        let id = id.clone();
+        settle_user_input_request(app, &id);
+    }
+}
+
+/// The Engine's terminal tool event retires the exact request even when its
+/// presentation is filtered after a local cancel. An outer Code Mode call's
+/// completion cannot settle a different, inner request id.
+pub(crate) fn observe_user_input_settlement(app: &mut App, event: &EngineEvent) {
+    match event {
+        EngineEvent::ToolCallComplete { id, .. } => {
+            settle_user_input_request(app, id);
+        }
+        EngineEvent::TurnComplete { .. }
+            if !(app.suppress_stream_events_until_turn_complete && app.is_loading) =>
+        {
+            settle_pending_user_input_request(app);
+        }
+        _ => {}
     }
 }
 
 pub(crate) fn apply_user_input_submission_result(app: &mut App, tool_id: &str, result: Result<()>) {
     match result {
-        Ok(()) => settle_user_input_request(app, tool_id),
+        Ok(()) => {
+            if settle_user_input_request(app, tool_id)
+                && (app.is_loading
+                    || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
+                && !app.suppress_stream_events_until_turn_complete
+            {
+                // Queue delivery resumes Engine work before its next event
+                // reaches this frame. Human waiting is not stalled work.
+                app.turn_last_activity_at = Some(Instant::now());
+            }
+        }
         Err(error) => {
             tracing::warn!(tool_id, error = %error, "user input submit failed");
             if let Some((id, request)) = app

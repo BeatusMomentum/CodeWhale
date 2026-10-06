@@ -7810,11 +7810,19 @@ impl RuntimeThreadManager {
         );
     }
 
-    fn claim_pending_user_input(&self, thread_id: &str, input_id: &str) -> PendingUserInputClaim {
+    fn claim_pending_user_input(
+        &self,
+        thread_id: &str,
+        input_id: &str,
+        turn_id: Option<&str>,
+    ) -> PendingUserInputClaim {
         let mut pending = self.pending_user_inputs.lock();
         let Some(entry) = pending.get_mut(&(thread_id.to_string(), input_id.to_string())) else {
             return PendingUserInputClaim::Missing;
         };
+        if turn_id.is_some_and(|turn_id| entry.request.turn_id != turn_id) {
+            return PendingUserInputClaim::Missing;
+        }
         if entry.indeterminate {
             return PendingUserInputClaim::Indeterminate;
         }
@@ -8173,7 +8181,7 @@ impl RuntimeThreadManager {
             };
             state.engine.clone()
         };
-        let request = match self.claim_pending_user_input(thread_id, input_id) {
+        let request = match self.claim_pending_user_input(thread_id, input_id, None) {
             PendingUserInputClaim::Claimed(request) => request,
             PendingUserInputClaim::Missing | PendingUserInputClaim::Settling => {
                 return Ok(false);
@@ -8218,7 +8226,7 @@ impl RuntimeThreadManager {
             };
             state.engine.clone()
         };
-        let request = match self.claim_pending_user_input(thread_id, input_id) {
+        let request = match self.claim_pending_user_input(thread_id, input_id, None) {
             PendingUserInputClaim::Claimed(request) => request,
             PendingUserInputClaim::Missing | PendingUserInputClaim::Settling => {
                 return Ok(false);
@@ -8284,30 +8292,106 @@ impl RuntimeThreadManager {
             }
             return Err(error);
         }
-        let settlement_tx = self.finish_pending_user_input_settlement(thread_id, &request);
         drop(_projection);
 
+        let terminal = matches!(
+            &outcome,
+            UserInputTerminalOutcome::Canceled { terminal: true }
+        );
         let delivery_result = match (engine, outcome) {
             (Some(engine), UserInputTerminalOutcome::Answered(response)) => {
                 engine.submit_user_input(&request.id, response).await
             }
             (Some(engine), UserInputTerminalOutcome::Canceled { .. }) => {
-                if let Err(error) = engine.cancel_user_input(&request.id).await {
-                    tracing::debug!(
-                        thread_id,
-                        input_id = %request.id,
-                        "User-input cancellation was durable after engine mailbox closed: {error}"
-                    );
-                }
-                Ok(())
+                engine.cancel_user_input(&request.id).await
             }
             (None, _) => Ok(()),
         };
+        if let Err(error) = delivery_result {
+            if !terminal {
+                // Keep the same claim until Engine's verdict. A simultaneous
+                // ToolCallComplete waits for this owner, then closes it; a
+                // failed delivery alone must not erase an indefinite waiter.
+                let _projection = projection_lock.lock().await;
+                if let Err(receipt_error) = self.emit_event(
+                    thread_id,
+                    Some(&request.turn_id),
+                    None,
+                    "user_input.required",
+                    json!({
+                        "id": &request.id,
+                        "request": &request.request,
+                        "delivery_error": "Engine did not accept the decision. Retry if the question is still pending.",
+                    }),
+                ).await {
+                    if event_append_is_indeterminate(&receipt_error) {
+                        self.mark_pending_user_input_indeterminate(thread_id, &request);
+                    } else {
+                        self.restore_pending_user_input_claim(thread_id, &request);
+                    }
+                    return Err(receipt_error);
+                }
+                self.restore_pending_user_input_claim(thread_id, &request);
+                return Err(error);
+            }
+            // A terminal turn already ended the waiter. Its durable cleanup
+            // remains authoritative even when Engine rejects a late cancel.
+            tracing::debug!(thread_id, input_id = %request.id,
+                "Terminal user-input cancellation was durable after waiter ended: {error}");
+        }
+        let settlement_tx = self.finish_pending_user_input_settlement(thread_id, &request);
         if let Some(settlement_tx) = settlement_tx {
             settlement_tx.send_modify(|epoch| *epoch = epoch.saturating_add(1));
         }
-        delivery_result?;
         Ok(true)
+    }
+
+    async fn settle_user_input_for_completed_tool(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        input_id: &str,
+    ) -> Result<()> {
+        let request = loop {
+            match self.claim_pending_user_input(thread_id, input_id, Some(turn_id)) {
+                PendingUserInputClaim::Claimed(request) => break request,
+                PendingUserInputClaim::Missing => return Ok(()),
+                PendingUserInputClaim::Settling => {
+                    // An API answer/cancel may still fail its durable append
+                    // and restore the request. Wait for that owner, then
+                    // retry rather than leaving the completed waiter pending.
+                    let progress = self
+                        .pending_user_inputs
+                        .lock()
+                        .get(&(thread_id.to_string(), input_id.to_string()))
+                        .filter(|entry| {
+                            entry.request.turn_id == turn_id
+                                && entry.settling
+                                && !entry.indeterminate
+                        })
+                        .map(|entry| entry.settlement_tx.subscribe());
+                    if let Some(mut progress) = progress {
+                        let _ = progress.changed().await;
+                    }
+                }
+                PendingUserInputClaim::Indeterminate => {
+                    bail!(
+                        "User-input request '{input_id}' has an indeterminate terminal receipt; inspect Runtime storage before completing its tool"
+                    );
+                }
+            }
+        };
+        // Engine already ended this waiter (timeout, cancellation or failure).
+        // Reuse durable request settlement without sending a stale decision
+        // back to it. The tool result carries the actual reason it ended.
+        self.settle_claimed_user_input(
+            thread_id,
+            None,
+            request,
+            UserInputTerminalOutcome::Canceled { terminal: false },
+        )
+        .await?;
+        Ok(())
     }
 
     async fn settle_user_inputs_for_terminal_turn(
@@ -16521,6 +16605,8 @@ impl RuntimeThreadManager {
                 EngineEvent::ToolCallComplete {
                     id, name, result, ..
                 } => {
+                    self.settle_user_input_for_completed_tool(&thread_id, &turn_id, &id)
+                        .await?;
                     if let Some(hooks) = thread_hooks.as_deref() {
                         let input = tool_items
                             .get(&id)

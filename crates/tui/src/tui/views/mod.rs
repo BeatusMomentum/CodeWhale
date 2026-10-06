@@ -1220,6 +1220,11 @@ pub trait ModalView: std::any::Any {
     fn approval_request_id(&self) -> Option<&str> {
         None
     }
+
+    /// The human-question tool id, kept separate from approval authority.
+    fn user_input_request_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -1306,6 +1311,16 @@ impl ViewStack {
         let top = self.top_identity();
         self.views
             .retain(|view| view.approval_request_id() != Some(id));
+        self.note_top_change(top);
+        self.views.len() != before
+    }
+
+    /// Retire one settled question at any depth without closing other views.
+    pub fn remove_user_input_by_id(&mut self, id: &str) -> bool {
+        let before = self.views.len();
+        let top = self.top_identity();
+        self.views
+            .retain(|view| view.user_input_request_id() != Some(id));
         self.note_top_change(top);
         self.views.len() != before
     }

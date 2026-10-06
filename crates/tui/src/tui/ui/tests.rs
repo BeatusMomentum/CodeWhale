@@ -15722,12 +15722,12 @@ async fn stall_dispatch_task_panic_still_reports_back() {
 
 #[test]
 fn turn_liveness_preserves_pending_user_input_beyond_tool_timeout() {
-    // A direct question, a question nested in Code Mode, and a temporarily
-    // absent tool cell all share the same outstanding human request.
+    // The outstanding request owns the wait independently of its tool cell
+    // or modal presentation. Code Mode currently refuses nested questions.
     for tool_name in [None, Some("request_user_input"), Some("execute_tools")] {
         let mut app = create_test_app();
-        let started_at = Instant::now();
-        let now = started_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(3600);
+        let now = Instant::now();
+        let started_at = now - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(3600);
         app.is_loading = true;
         app.runtime_turn_status = Some("in_progress".into());
         app.turn_started_at = Some(started_at);
@@ -15738,6 +15738,15 @@ fn turn_liveness_preserves_pending_user_input_beyond_tool_timeout() {
                 questions: Vec::new(),
             },
         ));
+        app.view_stack.push(UserInputView::new(
+            "question-1",
+            crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        ));
+        // A hidden modal is not an answer or a cancellation. Engine still
+        // owns an indefinite wait; the UI must not manufacture a timeout.
+        app.view_stack.pop();
         if let Some(name) = tool_name {
             let mut active = ActiveCell::new();
             active.push_tool(
@@ -15764,15 +15773,160 @@ fn turn_liveness_preserves_pending_user_input_beyond_tool_timeout() {
         assert!(app.pending_user_input_prompt.is_some());
         assert!(app.status_toasts.is_empty());
 
-        // A delivered answer retires the exemption. Recovery still handles a
-        // subsequently stalled turn/tool; the question cannot mask it forever.
+        // Delivery retires the exemption and gives resumed work a fresh
+        // window, even before the next Engine event reaches this frame.
         apply_user_input_submission_result(&mut app, "question-1", Ok(()));
         assert!(app.pending_user_input_prompt.is_none());
+        let resumed_at = app.turn_last_activity_at.expect("answer is activity");
+        assert!(resumed_at >= now);
         assert!(
-            reconcile_turn_liveness(&mut app, now, false),
+            !reconcile_turn_liveness(&mut app, resumed_at, false),
+            "{tool_name:?} recovered before resumed work could run"
+        );
+        let stalled_at = resumed_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1);
+        assert!(
+            reconcile_turn_liveness(&mut app, stalled_at, false),
             "{tool_name:?}"
         );
         assert!(!app.is_loading);
+    }
+}
+
+fn install_pending_question(app: &mut App, id: &str) {
+    let request = crate::tools::user_input::UserInputRequest {
+        questions: Vec::new(),
+    };
+    app.pending_user_input_prompt = Some((id.into(), request.clone()));
+    app.view_stack.push(UserInputView::new(id, request));
+    app.push_status_toast_record(
+        StatusToast::new("Answer question", StatusToastLevel::Warning, None).for_action(id),
+    );
+}
+
+#[test]
+fn user_input_timeout_retires_only_matching_question_even_when_completion_is_filtered() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    install_pending_question(&mut app, "input-timeout");
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "unrelated-approval",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "unrelated-key",
+    )));
+    app.push_status_toast_record(
+        StatusToast::new("Review command", StatusToastLevel::Warning, None)
+            .for_action("unrelated-approval"),
+    );
+    let completion = EngineEvent::ToolCallComplete {
+        id: "input-timeout".into(),
+        model_call: None,
+        name: "request_user_input".into(),
+        result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
+    };
+    assert!(suppress_engine_event_after_local_cancel(&completion));
+    observe_user_input_settlement(&mut app, &completion);
+    assert!(app.pending_user_input_prompt.is_none());
+    assert!(!app.view_stack.contains_kind(ModalKind::UserInput));
+    assert!(app.view_stack.contains_approval_id("unrelated-approval"));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+    assert_eq!(app.status_toasts.len(), 1);
+    assert_eq!(app.status_toasts[0].text, "Review command");
+}
+
+#[test]
+fn user_input_completion_preserves_newer_question_and_dispatch() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    let activity = Instant::now() - Duration::from_secs(30);
+    app.turn_last_activity_at = Some(activity);
+    install_pending_question(&mut app, "input-new");
+    let completion = |id: &str| EngineEvent::ToolCallComplete {
+        id: id.into(),
+        model_call: None,
+        name: "execute_tools".into(),
+        result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
+    };
+    // Neither a previous request nor a wrapping call's different id owns it.
+    observe_user_input_settlement(&mut app, &completion("input-old"));
+    observe_user_input_settlement(&mut app, &completion("outer-call"));
+    apply_user_input_submission_result(&mut app, "input-old", Ok(()));
+    assert_eq!(app.turn_last_activity_at, Some(activity));
+    assert_eq!(
+        app.pending_user_input_prompt
+            .as_ref()
+            .map(|(id, _)| id.as_str()),
+        Some("input-new")
+    );
+    app.suppress_stream_events_until_turn_complete = true;
+    observe_user_input_settlement(
+        &mut app,
+        &EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: crate::core::events::TurnOutcomeStatus::Interrupted,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        },
+    );
+    assert!(app.pending_user_input_prompt.is_some());
+    assert!(app.view_stack.contains_kind(ModalKind::UserInput));
+    assert_eq!(app.status_toasts.len(), 1);
+}
+
+#[test]
+fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
+    for boundary in ["completed", "interrupted", "failed", "cancel", "disconnect"] {
+        let mut app = create_test_app();
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".into());
+        install_pending_question(&mut app, "input-boundary");
+        app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+            "keep-approval",
+            "exec_shell",
+            "Review command",
+            &serde_json::json!({"command": "git status"}),
+            "keep-key",
+        )));
+        match boundary {
+            "cancel" => mark_active_turn_cancelled_locally(&mut app),
+            "disconnect" => assert!(recover_engine_event_disconnect(&mut app)),
+            _ => observe_user_input_settlement(
+                &mut app,
+                &EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: match boundary {
+                        "completed" => crate::core::events::TurnOutcomeStatus::Completed,
+                        "interrupted" => crate::core::events::TurnOutcomeStatus::Interrupted,
+                        _ => crate::core::events::TurnOutcomeStatus::Failed,
+                    },
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                },
+            ),
+        }
+        assert!(app.pending_user_input_prompt.is_none(), "{boundary}");
+        assert!(
+            !app.view_stack.contains_kind(ModalKind::UserInput),
+            "{boundary}"
+        );
+        assert!(
+            app.view_stack.contains_approval_id("keep-approval"),
+            "{boundary}"
+        );
+        assert!(
+            !app.status_toasts
+                .iter()
+                .any(|toast| toast.text == "Answer question")
+        );
     }
 }
 
@@ -27266,11 +27420,13 @@ async fn stale_parent_approval_is_resolved_unavailable_not_dropped() {
             questions: Vec::new(),
         },
     };
-    assert!(resolve_stale_parent_request(&app, &mock.handle, &question).await);
-    assert_eq!(
-        mock.recv_user_input_cancellation().await.as_deref(),
-        Some("stale-question")
+    let handle = mock.handle.clone();
+    let (resolved, canceled) = tokio::join!(
+        resolve_stale_parent_request(&app, &handle, &question),
+        mock.recv_user_input_cancellation(),
     );
+    assert!(resolved);
+    assert_eq!(canceled.as_deref(), Some("stale-question"));
 }
 
 #[tokio::test]

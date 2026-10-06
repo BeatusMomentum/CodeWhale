@@ -66,15 +66,26 @@ pub(super) enum ApprovalDecision {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) enum UserInputDecision {
     Submitted {
         id: String,
         response: UserInputResponse,
+        accepted: tokio::sync::oneshot::Sender<bool>,
     },
     Cancelled {
         id: String,
+        accepted: tokio::sync::oneshot::Sender<bool>,
     },
+}
+
+impl UserInputDecision {
+    pub(super) fn reject(self) {
+        let accepted = match self {
+            Self::Submitted { accepted, .. } | Self::Cancelled { accepted, .. } => accepted,
+        };
+        let _ = accepted.send(false);
+    }
 }
 
 /// A person pressed Allow on an approval card for this call.
@@ -403,6 +414,11 @@ impl Engine {
         // agent's own time, not how long a person takes to answer.
         self.turn_wall_clock.begin_human_wait();
         let response = self.await_user_input_decision(tool_id).await;
+        // The waiter has ended. Every queued reply is now stale, including a
+        // second answer racing the accepted one or the configured deadline.
+        while let Ok(decision) = self.rx_user_input.try_recv() {
+            decision.reject();
+        }
         self.turn_wall_clock.end_human_wait();
         response
     }
@@ -455,16 +471,35 @@ impl Engine {
                 } => {
                     match result {
                         Ok(Some(decision)) => {
+                            // A ready mailbox can win `select!` when the
+                            // cancellation/deadline is also ready. Verify the
+                            // wait still belongs to this request before ack.
+                            if self.cancel_token.is_cancelled() {
+                                decision.reject();
+                                return Err(ToolError::cancelled(
+                                    format!("Request cancelled while awaiting user input{}", self.cancel_reason_suffix()),
+                                ));
+                            }
+                            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                                decision.reject();
+                                return Err(ToolError::Timeout { seconds: wait.map(|wait| wait.as_secs()).unwrap_or(0) });
+                            }
                             match decision {
-                                UserInputDecision::Submitted { id, response } if id == tool_id => {
-                                    return Ok(response);
+                                UserInputDecision::Submitted { id, response, accepted } if id == tool_id => {
+                                    // An abandoned/timed-out sender must not
+                                    // commit an answer after it saw failure.
+                                    if accepted.send(true).is_ok() {
+                                        return Ok(response);
+                                    }
                                 }
-                                UserInputDecision::Cancelled { id } if id == tool_id => {
-                                    return Err(ToolError::cancelled(
-                                        "User input cancelled".to_string(),
-                                    ));
+                                UserInputDecision::Cancelled { id, accepted } if id == tool_id => {
+                                    if accepted.send(true).is_ok() {
+                                        return Err(ToolError::cancelled(
+                                            "User input cancelled".to_string(),
+                                        ));
+                                    }
                                 }
-                                _ => continue,
+                                other => other.reject(),
                             }
                         }
                         Ok(None) => {

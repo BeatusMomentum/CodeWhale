@@ -9087,16 +9087,44 @@ impl MockEngineHandle {
         &mut self,
     ) -> Option<(String, UserInputResponse)> {
         match self.rx_user_input.recv().await? {
-            UserInputDecision::Submitted { id, response } => Some((id, response)),
-            UserInputDecision::Cancelled { .. } => None,
+            UserInputDecision::Submitted {
+                id,
+                response,
+                accepted,
+            } => {
+                accepted.send(true).ok()?;
+                Some((id, response))
+            }
+            UserInputDecision::Cancelled { accepted, .. } => {
+                let _ = accepted.send(true);
+                None
+            }
         }
     }
 
     pub(crate) async fn recv_user_input_cancellation(&mut self) -> Option<String> {
         match self.rx_user_input.recv().await? {
-            UserInputDecision::Cancelled { id } => Some(id),
-            UserInputDecision::Submitted { .. } => None,
+            UserInputDecision::Cancelled { id, accepted } => {
+                accepted.send(true).ok()?;
+                Some(id)
+            }
+            UserInputDecision::Submitted { accepted, .. } => {
+                let _ = accepted.send(true);
+                None
+            }
         }
+    }
+
+    /// Model an Engine verdict that rejects this question's decision.
+    pub(crate) async fn reject_user_input_decision(&mut self) -> Option<String> {
+        let decision = self.rx_user_input.recv().await?;
+        let id = match &decision {
+            UserInputDecision::Submitted { id, .. } | UserInputDecision::Cancelled { id, .. } => {
+                id.clone()
+            }
+        };
+        decision.reject();
+        Some(id)
     }
 
     /// Close the engine event stream without moving fields out of the handle,

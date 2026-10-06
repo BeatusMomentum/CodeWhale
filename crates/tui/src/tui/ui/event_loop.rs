@@ -2283,6 +2283,7 @@ pub(crate) async fn run_event_loop(
                 let redraw_requested_before_event = received_engine_event;
                 received_engine_event = true;
                 capture_turn_started_metadata(app, &event);
+                observe_user_input_settlement(app, &event);
                 // Child approval bookkeeping runs before every filter: it is
                 // keyed by approval id and agent, not by the active session,
                 // so a withdrawal always retires its card (approvals M1).
