@@ -45,7 +45,7 @@ async fn load_from(
         .map(|user| user.id.as_str())
         .filter(|id| !id.is_empty())
         .context("Sign in again to load your profile constitution")?;
-    let client = reqwest::Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
