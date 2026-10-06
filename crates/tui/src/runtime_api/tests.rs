@@ -17023,6 +17023,245 @@ fn create_managed_skill(root_dir: &std::path::Path, name: &str) -> Result<(PathB
 }
 
 #[tokio::test]
+async fn skill_detail_returns_body_and_routing_metadata() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    // A skill with routing metadata and a body a client can activate.
+    let skill_dir = workspace
+        .join(".codewhale")
+        .join("skills")
+        .join("activatable");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: activatable\ndescription: Activate me\naliases-for: activate-me\nargument-hint: <target>\n---\nDo the thing.\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/activatable"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(detail["name"], "activatable");
+    assert_eq!(detail["description"], "Activate me");
+    assert_eq!(detail["source"], "native");
+    assert_eq!(detail["invocation"], "model+user");
+    assert_eq!(detail["aliases"][0], "activate-me");
+    assert!(
+        detail["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Do the thing.")),
+        "detail body must carry the SKILL.md instructions, got {:?}",
+        detail["body"]
+    );
+    assert!(
+        detail["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("SKILL.md")),
+        "native skill detail must name its SKILL.md path"
+    );
+    // The alias resolves to the same body, so a client can activate by either
+    // spelling without a second lookup table.
+    let by_alias: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/activate-me"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(by_alias["name"], "activatable");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_detail_404s_for_unknown_skill() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .get(format!("http://{addr}/v1/skills/no-such-skill"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_list_rows_carry_routing_metadata() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    let skill_dir = workspace.join(".codewhale").join("skills").join("listed");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: listed\ndescription: Listed skill\ninvocation: explicit-only\n---\nbody\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let listed = list["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .find(|sk| sk["name"] == "listed")
+        .expect("listed skill present");
+    assert_eq!(listed["invocation"], "explicit-only");
+    assert_eq!(listed["is_bundled"], false);
+    // A custom skill has no curated tier; the field is present but null.
+    assert!(listed["bundled_tier"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_tier_belongs_to_the_bundled_copy_only() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    // A bundled name at the bundled path: the shipped skill, grouped.
+    let bundled = workspace.join(".codewhale").join("skills").join("help");
+    fs::create_dir_all(&bundled)?;
+    fs::write(
+        bundled.join("SKILL.md"),
+        "---\nname: help\ndescription: Shipped\n---\nbody\n",
+    )?;
+    // A bundled *name* somewhere else: a community skill that shares the name
+    // of a shipped one. It is not the shipped copy, so it is not in the
+    // shipped tier either — the two fields have to agree.
+    let impostor = workspace.join(".agents").join("skills").join("pdf");
+    fs::create_dir_all(&impostor)?;
+    fs::write(
+        impostor.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Mine, not the shipped one\n---\nbody\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rows = list["skills"].as_array().expect("skills array");
+    let row = |name: &str| {
+        rows.iter()
+            .find(|sk| sk["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be listed"))
+    };
+    assert_eq!(row("help")["is_bundled"], true);
+    assert_eq!(row("help")["bundled_tier"], "tools");
+    assert_eq!(row("pdf")["is_bundled"], false);
+    assert!(
+        row("pdf")["bundled_tier"].is_null(),
+        "a non-bundled copy of a bundled name must not claim the shipped tier: {}",
+        row("pdf")["bundled_tier"]
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_info_advertises_skill_detail_capability() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let info: serde_json::Value = client
+        .get(format!("http://{addr}/v1/runtime/info"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        info["capabilities"]["skill_detail"], true,
+        "runtime/info must advertise skill_detail capability"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn skill_lifecycle_uninstall_removes_installed_skill() -> Result<()> {
     let _env = lock_test_env();
     let tmp = tempfile::tempdir()?;
@@ -17389,6 +17628,9 @@ async fn skill_lifecycle_endpoints_require_auth_when_token_is_set() -> Result<()
         ("POST", "/v1/skills/any/update"),
         ("DELETE", "/v1/skills/any"),
         ("POST", "/v1/skills/any/trust"),
+        // The detail route hands back a SKILL.md body, so it is as sensitive
+        // as the listing plus the file it names.
+        ("GET", "/v1/skills/any"),
     ] {
         let resp = client
             .request(
