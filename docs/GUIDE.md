@@ -62,7 +62,8 @@ For occupied directories, package-managed installs, and PATH setup, follow
 [the installation and migration guide](INSTALL.md#recommended-official-github-releases).
 Android/Termux uses its own [preview archive or source-build path](INSTALL.md#android--termux-arm64).
 
-Docker is also available when you want an isolated runtime:
+Docker is also available when you want an isolated runtime. The published
+image is currently 0.10.0; to test current `main`, [build it from source](DOCKER.md#building-locally).
 
 ```bash
 docker volume create codewhale-home
@@ -71,7 +72,7 @@ docker run --rm -it \
   -v codewhale-home:/home/codewhale/.codewhale \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/codewhale-hq/codewhale:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 Once the install directory is on PATH, launch Codewhale from the repository or
