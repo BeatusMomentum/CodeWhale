@@ -9987,6 +9987,107 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
 }
 
 #[tokio::test]
+async fn watch_client_token_refuses_runtime_mutations_and_upgrades() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let Some((addr, _, handle)) = spawn_test_server_with_root_and_token(
+        root.path().to_path_buf(),
+        root.path().join("sessions"),
+        Some("watch-scope-fixture-master".to_string()),
+    )
+    .await?
+    else {
+        bail!("the owned client-token HTTP fixture could not bind");
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let info: Value = client
+        .get(format!("{base}/v1/runtime/info"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(info["capabilities"]["client_token_intents"], true);
+    let mint = |body: Value| {
+        client
+            .post(format!("{base}/v1/auth/client-tokens"))
+            .bearer_auth("watch-scope-fixture-master")
+            .json(&body)
+    };
+    let watch: Value = mint(json!({"device_id": "read-device", "label": "cwc-seat:drive"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(watch["intent"], "watch");
+    let watch_token = watch["token"].as_str().context("watch token")?;
+    let reads = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .send()
+        .await?;
+    assert_eq!(reads.status(), StatusCode::OK);
+    for (method, path) in [
+        (Method::POST, "/v1/threads"),
+        (Method::PUT, "/v1/workspace/files"),
+        (Method::DELETE, "/v1/memory"),
+        (Method::POST, "/v1/approvals/not-pending"),
+    ] {
+        let refused = client
+            .request(method, format!("{base}{path}"))
+            .bearer_auth(watch_token)
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let upgrade = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .header(header::UPGRADE, "websocket")
+        .send()
+        .await?;
+    assert_eq!(upgrade.status(), StatusCode::FORBIDDEN);
+    let drive: Value = mint(json!({"device_id": "write-device", "intent": "drive"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(drive["intent"], "drive");
+    let created = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth(drive["token"].as_str().context("drive token")?)
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let invalid = mint(json!({"device_id": "bad-device", "intent": "admin"}))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let revoked = client
+        .delete(format!(
+            "{base}/v1/auth/client-tokens/{}",
+            watch["id"].as_str().context("watch id")?
+        ))
+        .bearer_auth("watch-scope-fixture-master")
+        .send()
+        .await?;
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    let expired_read = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .send()
+        .await?;
+    assert_eq!(expired_read.status(), StatusCode::UNAUTHORIZED);
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_info_reports_bind_state() -> Result<()> {
     let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());

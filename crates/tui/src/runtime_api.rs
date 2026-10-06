@@ -1230,6 +1230,7 @@ struct RuntimeInfoResponse {
 
 fn default_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
+        client_token_intents: true,
         account_session: true,
         threads: true,
         thread_shell_consent: true,

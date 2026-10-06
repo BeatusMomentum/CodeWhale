@@ -53,6 +53,10 @@ fn default_runtime_event_envelope_schema_version() -> u32 {
 /// All fields are required on serialization so clients can rely on the shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
+    /// Device client tokens have immutable watch/drive intent. Watch cannot
+    /// mutate Runtime state, acquire control, or forward display input.
+    #[serde(default)]
+    pub client_token_intents: bool,
     #[serde(default)]
     pub account_session: bool,
     pub threads: bool,
@@ -427,6 +431,7 @@ mod tests {
     #[test]
     fn runtime_capabilities_serializes_expected_shape() {
         let caps = RuntimeCapabilities {
+            client_token_intents: true,
             turn_output_token_limit: false,
             profile_constitution: false,
             account_session: true,
@@ -462,6 +467,17 @@ mod tests {
         };
         let value = serde_json::to_value(&caps).unwrap();
         let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("client_token_intents"), Some(&json!(true)));
+        let mut legacy_intents = value.clone();
+        legacy_intents
+            .as_object_mut()
+            .unwrap()
+            .remove("client_token_intents");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(legacy_intents)
+                .unwrap()
+                .client_token_intents
+        );
         assert_eq!(obj.get("threads").unwrap(), &json!(true));
         assert_eq!(obj.get("thread_shell_consent"), Some(&json!(true)));
         assert!(

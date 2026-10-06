@@ -68,6 +68,23 @@ The legacy in-process `codewhale app-server` also requires an explicit
 `--auth-token` or `CODEWHALE_APP_SERVER_TOKEN` before binding a non-loopback
 host; its generated one-time `cwapp_*` token is loopback-only.
 
+Device tokens minted by the master through `POST /v1/auth/client-tokens`
+have an immutable `intent`: `watch` (the default when omitted) or explicit
+`drive`. Labels do not grant authority. Watch permits ordinary GET/HEAD reads,
+Computer display and one-use display tickets; it cannot mutate Runtime state,
+upgrade a protected HTTP read into a write channel, acquire/release control,
+or forward display input. Drive retains the existing Runtime/control authority
+but cannot mint, list or revoke device tokens. Display tickets retain the
+issuing principal's intent; input still requires its current, live control lease.
+
+`GET /v1/runtime/info` advertises `capabilities.client_token_intents: true`,
+and the mint receipt returns `device_id`, `intent` and `expires_at`. A relay
+grant issuer must require this capability before minting and validate that
+receipt against the requested device/intent before exposing a token. Older
+Engines lack enforcement and must refuse relay grants through this issuer;
+an intent-like label or a successful legacy mint is insufficient. This change
+does not add account/Computer ownership scopes to Engine-local device tokens.
+
 ### Workspace file suggestions
 
 `GET /v1/workspace/files/search?query=runtime&limit=20` returns
