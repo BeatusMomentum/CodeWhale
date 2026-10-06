@@ -19858,7 +19858,14 @@ mod mcp_add_arg_tests {
     #[test]
     fn mcp_add_arg_accepts_hyphen_values() {
         let cli = Cli::try_parse_from([
-            "codewhale", "mcp", "add", "srv", "--command", "npx", "--arg", "-y",
+            "codewhale",
+            "mcp",
+            "add",
+            "srv",
+            "--command",
+            "npx",
+            "--arg",
+            "-y",
         ])
         .expect("mcp add parses hyphen-led --arg values");
         let Some(Commands::Mcp { command }) = cli.command else {

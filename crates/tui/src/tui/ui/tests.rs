@@ -15721,6 +15721,62 @@ async fn stall_dispatch_task_panic_still_reports_back() {
 }
 
 #[test]
+fn turn_liveness_preserves_pending_user_input_beyond_tool_timeout() {
+    // A direct question, a question nested in Code Mode, and a temporarily
+    // absent tool cell all share the same outstanding human request.
+    for tool_name in [None, Some("request_user_input"), Some("execute_tools")] {
+        let mut app = create_test_app();
+        let started_at = Instant::now();
+        let now = started_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(3600);
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".into());
+        app.turn_started_at = Some(started_at);
+        app.turn_last_activity_at = Some(started_at);
+        app.pending_user_input_prompt = Some((
+            "question-1".into(),
+            crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        ));
+        if let Some(name) = tool_name {
+            let mut active = ActiveCell::new();
+            active.push_tool(
+                "question-1",
+                HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                    name: name.into(),
+                    status: ToolStatus::Running,
+                    input_summary: None,
+                    output: None,
+                    prompts: None,
+                    spillover_path: None,
+                    output_summary: None,
+                    is_diff: false,
+                })),
+            );
+            app.active_cell = Some(active);
+        }
+
+        assert!(
+            !reconcile_turn_liveness(&mut app, now, false),
+            "{tool_name:?}"
+        );
+        assert!(app.is_loading);
+        assert!(app.pending_user_input_prompt.is_some());
+        assert!(app.status_toasts.is_empty());
+
+        // A delivered answer retires the exemption. Recovery still handles a
+        // subsequently stalled turn/tool; the question cannot mask it forever.
+        apply_user_input_submission_result(&mut app, "question-1", Ok(()));
+        assert!(app.pending_user_input_prompt.is_none());
+        assert!(
+            reconcile_turn_liveness(&mut app, now, false),
+            "{tool_name:?}"
+        );
+        assert!(!app.is_loading);
+    }
+}
+
+#[test]
 fn turn_liveness_recovers_running_tool_without_heartbeat() {
     let mut app = create_test_app();
     let started_at = Instant::now();

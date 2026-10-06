@@ -284,6 +284,9 @@ pub(crate) fn reconcile_turn_liveness_with(
     // overdue (a quiet model, a live stream). Its watchdog owns that bound;
     // the UI does not second-guess it with a timer of its own.
     let engine_owns_wait = heartbeat.is_some_and(|snapshot| snapshot.engine_owns_live_wait());
+    // #6872: a question can wait indefinitely. Its configured Engine timeout,
+    // answer or cancellation owns the wait, even if its modal was dismissed.
+    let awaiting_user_input = app.pending_user_input_prompt.is_some();
     if app.is_loading
         && app.runtime_turn_status.is_none()
         && !has_running_agents
@@ -353,6 +356,7 @@ pub(crate) fn reconcile_turn_liveness_with(
         && matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         && !has_running_agents
         && !engine_owns_wait
+        && !awaiting_user_input
         && !app.is_compacting
         && !active_turn_has_running_tool(app)
         && let Some(last_activity) = app.turn_last_activity_at.or(app.turn_started_at)
@@ -375,6 +379,7 @@ pub(crate) fn reconcile_turn_liveness_with(
     if app.is_loading
         && matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         && !has_running_agents
+        && !awaiting_user_input
         && !app.is_compacting
         && !app.is_purging
         && active_turn_has_running_tool(app)

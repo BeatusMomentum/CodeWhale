@@ -1338,7 +1338,14 @@ mod tests {
                 workspace.path().to_path_buf(),
                 Duration::from_secs(15),
             )
-            .with_policy(SandboxPolicy::default());
+            // CI's hermetic HOME lives under /tmp. Exclude temporary roots so
+            // the outside fixture is outside this test's writable policy too.
+            .with_policy(SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                network_access: false,
+                exclude_tmpdir: true,
+                exclude_slash_tmp: true,
+            });
             let env = manager.prepare(&spec);
             let (program, args) = env.command.split_first().unwrap();
             let status = std::process::Command::new(program)

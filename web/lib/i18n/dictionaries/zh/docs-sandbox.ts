@@ -37,7 +37,7 @@ export const docsSandbox: DocsSandboxDict = {
         {
           code: `sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap
 
-# ~/.codewhale/config.toml — 可选退出
+# ~/.codewhale/config.toml
 prefer_bwrap = false`,
           lang: "终端 / config.toml",
         },
