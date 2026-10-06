@@ -107,7 +107,7 @@ test("production process keeps polling and owner approvals live, dedupes real me
   f.event("approval.required", f.approvals[0]);
   await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("approval_id=approval-1")), "approval notice missing");
   f.batches.push([incoming(0, "private original prompt"), incoming(2, "/allow approval-1", "bob"), incoming(3, "/allow approval-1")]);
-  await until(() => f.decisions.length === 1, "initiating owner could not approve during stream");
+  await until(() => f.decisions.length === 1 && f.polls > polls, "initiating owner could not approve or polling stopped during stream");
   assert.equal(f.posts.length, 1); assert.ok(f.polls > polls); assert.deepEqual(f.decisions, [{ decision: "allow", remember: false }]);
   f.event("item.delta", { kind: "agent_message", delta: "answer" }); f.complete("answer");
   await until(async () => !(await f.disk()).chats?.alice?.activeTurnId, "accepted output did not settle");
