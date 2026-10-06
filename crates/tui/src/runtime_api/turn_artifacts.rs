@@ -396,7 +396,14 @@ pub(super) async fn list_call_changes(
 
     let workspace = span.thread_workspace.clone();
     let restore_snapshot_id = Some(pre.clone());
+    // The side repo lives under the sealed test home; a blocking-pool thread
+    // is a foreign reader until it joins the test's env scope, and would
+    // otherwise resolve the isolated root and report every span pruned.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     let read = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
         call_span_files(
             &workspace,
             &pre,
