@@ -377,8 +377,7 @@ pub(crate) fn surface_goal_persistence_failure(app: &mut App, error: &str) {
 
 /// Apply Space only to the owner stored by the final render pass.
 pub(super) fn handle_transcript_space(app: &mut App) -> bool {
-    let Some((owner, reasoning_target)) = app.viewport.transcript_cache.take_transcript_action()
-    else {
+    let Some((owner, fold_target)) = app.viewport.transcript_cache.take_transcript_action() else {
         return false;
     };
     let idx = owner.cell_index;
@@ -389,28 +388,62 @@ pub(super) fn handle_transcript_space(app: &mut App) -> bool {
         return false;
     };
     let is_thinking = matches!(cell, HistoryCell::Thinking { .. });
-    if let Some(target) = reasoning_target.filter(|_| !app.collapsed_cells.contains(&idx)) {
+    let selected_first_line = app
+        .viewport
+        .transcript_selection
+        .ordered_endpoints()
+        .filter(|(start, _)| {
+            app.viewport
+                .transcript_cache
+                .line_meta()
+                .get(start.line_index)
+                .and_then(|meta| meta.cell_line())
+                .is_some_and(|(rendered, _)| app.original_cell_index_for_rendered(rendered) == idx)
+        })
+        .and_then(|_| {
+            app.viewport
+                .transcript_cache
+                .line_meta()
+                .iter()
+                .position(|meta| {
+                    meta.cell_line().is_some_and(|(rendered, _)| {
+                        app.original_cell_index_for_rendered(rendered) == idx
+                    })
+                })
+        });
+    if let Some(target) = fold_target.filter(|_| !app.collapsed_cells.contains(&idx)) {
         if target.owner != owner {
             return false;
         }
-        if !app.show_thinking || !is_thinking {
+        if is_thinking && !app.show_thinking {
             return false;
         }
         // The rendered action names the state the user is asking for, so
         // record that outright. A relative bit would be re-read as its
         // opposite the next time a display preference changed (#5847).
         let intent = match target.action {
-            ReasoningAction::Expand => ThinkingFold::Expanded,
-            ReasoningAction::Collapse => ThinkingFold::Collapsed,
+            CellFoldAction::Expand => TranscriptFold::Expanded,
+            CellFoldAction::Collapse => TranscriptFold::Collapsed,
         };
-        app.thinking_folds.insert(idx, intent);
+        app.cell_folds.insert(idx, intent);
     } else if app.toggle_tool_run_expansion_at(idx) {
         return true;
     } else if !app.collapsed_cells.remove(&idx) {
         if is_thinking {
             return false;
         }
-        app.collapsed_cells.insert(idx);
+        app.cell_folds.insert(idx, TranscriptFold::Collapsed);
+    }
+    if let Some(line_index) = selected_first_line {
+        // A middle-body row may disappear or become another cell after the
+        // fold. Keep the selected owner at its stable first row (#6876).
+        let point = crate::tui::selection::TranscriptSelectionPoint {
+            line_index,
+            column: 0,
+        };
+        app.viewport.transcript_selection.clear();
+        app.viewport.transcript_selection.anchor = Some(point);
+        app.viewport.transcript_selection.head = Some(point);
     }
     app.mark_history_updated();
     true

@@ -153,7 +153,7 @@ use super::approval::{
     ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    ExecCell, HistoryCell, ReasoningAction, ThinkingFold, ToolCell, ToolStatus,
+    CellFoldAction, ExecCell, HistoryCell, ToolCell, ToolStatus, TranscriptFold,
     history_cells_from_message, summarize_tool_output,
 };
 use super::slash_menu::{

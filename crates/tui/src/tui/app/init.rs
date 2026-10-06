@@ -1182,7 +1182,7 @@ impl App {
             prefix_drift_count: 0,
             prefix_context_updates: 0,
             collapsed_cells: HashSet::new(),
-            thinking_folds: HashMap::new(),
+            cell_folds: HashMap::new(),
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),

@@ -91,17 +91,19 @@ pub enum RenderMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReasoningAction {
+pub(crate) enum CellFoldAction {
     Expand,
     Collapse,
 }
 
-/// A user's explicit decision about one thinking cell.
+const FOLDED_CELL_PREVIEW_LINES: usize = 3;
+
+/// A user's explicit decision about one transcript cell.
 ///
-/// The absence of a `ThinkingFold` — `None` at a call site, no entry in
-/// `App::thinking_folds` — means the user has not touched that cell, so the
-/// display preferences (`verbose` or `thinking_default_expanded`) decide its
-/// default. An explicit intent is *absolute*: it says expanded or collapsed
+/// The absence of a `TranscriptFold` — `None` at a call site, no entry in
+/// `App::cell_folds` — means the user has not touched that cell, so the
+/// thinking display preferences decide a thinking cell's default; other
+/// cells start expanded. An explicit intent is *absolute*: expanded or collapsed
 /// outright, never "the opposite of whatever the preference currently says".
 /// That is what lets a choice outlive a later preference change (#5847).
 ///
@@ -109,7 +111,7 @@ pub(crate) enum ReasoningAction {
 /// It is not persisted across restarts, and destructive transcript edits drop
 /// it along with the other per-index state (`prune_transcript_index_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThinkingFold {
+pub enum TranscriptFold {
     /// The user expanded this cell; show the whole body whatever the
     /// preference says.
     Expanded,
@@ -126,9 +128,9 @@ pub(crate) struct TranscriptActionOwner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReasoningActionTarget {
+pub(crate) struct CellFoldActionTarget {
     pub owner: TranscriptActionOwner,
-    pub action: ReasoningAction,
+    pub action: CellFoldAction,
 }
 
 // === History Cells ===
@@ -426,21 +428,26 @@ impl HistoryCell {
         self.lines_with_options_folded(width, options, None).0
     }
 
-    /// Render with the user's explicit per-cell fold intent for thinking
-    /// cells.
+    /// Render with the user's explicit per-cell fold intent.
     ///
-    /// `None` means the user has not touched this cell, so the expanded
-    /// baseline decides: on when the session is verbose or the thinking
-    /// default is expanded, off otherwise. `Some(..)` is the user's own
-    /// decision and outranks the baseline in both directions, so changing a
-    /// preference later never rewrites what they already chose (#5847).
+    /// Untouched ordinary cells are expanded. Thinking follows the session's
+    /// display preferences. An explicit choice outranks that baseline in both
+    /// directions, so changing a preference never rewrites it (#5847).
     pub fn lines_with_options_folded(
         &self,
         width: u16,
         options: TranscriptRenderOptions,
-        fold: Option<ThinkingFold>,
-    ) -> (Vec<Line<'static>>, Option<ReasoningAction>) {
-        let mut reasoning_action = None;
+        fold: Option<TranscriptFold>,
+    ) -> (Vec<Line<'static>>, Option<CellFoldAction>) {
+        if fold == Some(TranscriptFold::Collapsed) && !matches!(self, HistoryCell::Thinking { .. })
+        {
+            let (lines, action) = self.lines_with_copy_metadata_folded(width, options, fold);
+            return (
+                lines.into_iter().map(|rendered| rendered.line).collect(),
+                action,
+            );
+        }
+        let mut fold_action = None;
         let mut lines = match self {
             HistoryCell::Thinking {
                 streaming,
@@ -459,8 +466,8 @@ impl HistoryCell {
                 duration_secs,
             } => {
                 let collapsed = match fold {
-                    Some(ThinkingFold::Expanded) => false,
-                    Some(ThinkingFold::Collapsed) => true,
+                    Some(TranscriptFold::Expanded) => false,
+                    Some(TranscriptFold::Collapsed) => true,
                     None => !(options.verbose || options.thinking_default_expanded),
                 };
                 let (lines, expandable) = thinking::render_thinking_with_preview_limit(
@@ -478,10 +485,10 @@ impl HistoryCell {
                         options.thinking_preview_lines
                     },
                 );
-                reasoning_action = expandable.then_some(if collapsed {
-                    ReasoningAction::Expand
+                fold_action = expandable.then_some(if collapsed {
+                    CellFoldAction::Expand
                 } else {
-                    ReasoningAction::Collapse
+                    CellFoldAction::Collapse
                 });
                 lines
             }
@@ -564,7 +571,7 @@ impl HistoryCell {
                 MotionMode::Full => {}
             }
         }
-        (lines, reasoning_action)
+        (lines, fold_action)
     }
 
     pub(crate) fn lines_with_copy_metadata(
@@ -579,14 +586,14 @@ impl HistoryCell {
         &self,
         width: u16,
         options: TranscriptRenderOptions,
-        fold: Option<ThinkingFold>,
-    ) -> (Vec<RenderedTranscriptLine>, Option<ReasoningAction>) {
+        fold: Option<TranscriptFold>,
+    ) -> (Vec<RenderedTranscriptLine>, Option<CellFoldAction>) {
         if matches!(self, HistoryCell::Thinking { .. }) {
             let (lines, action) =
                 self.lines_with_options_folded(options.prose_width(width), options, fold);
             return (hard_break_copy_lines(lines), action);
         }
-        let lines = match self {
+        let mut lines = match self {
             HistoryCell::User { content } => hard_break_copy_lines(render_user_message(
                 content,
                 options.prose_width(width),
@@ -618,7 +625,7 @@ impl HistoryCell {
                 )
             }
             HistoryCell::Tool(_) => self
-                .lines_with_options_folded(width, options, fold)
+                .lines_with_options_folded(width, options, None)
                 .0
                 .into_iter()
                 .map(|line| {
@@ -632,8 +639,36 @@ impl HistoryCell {
                 })
                 .collect(),
             HistoryCell::Thinking { .. } => unreachable!("reasoning handled above"),
-            _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, fold).0),
+            _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, None).0),
         };
+        if fold == Some(TranscriptFold::Collapsed) && !lines.is_empty() {
+            // Keep the cell in the rendered projection so Space can restore
+            // that same owner (#6876). This control row is separate from the
+            // body, whose copy separators and links must remain intact.
+            if lines.len() > FOLDED_CELL_PREVIEW_LINES {
+                lines.truncate(FOLDED_CELL_PREVIEW_LINES);
+                lines
+                    .last_mut()
+                    .expect("retained preview body")
+                    .copy_separator_after = CopyLineSeparator::Newline;
+            }
+            let style = Style::default().fg(palette::TEXT_MUTED);
+            let header = Line::from(vec![
+                Span::styled("…", style),
+                Span::styled(if width >= 3 { " ›" } else { "" }, style),
+            ]);
+            let header_width = header.width();
+            lines.insert(
+                0,
+                RenderedTranscriptLine {
+                    line: header,
+                    links: Vec::new(),
+                    copy_prefix_width: header_width,
+                    copy_separator_after: CopyLineSeparator::Newline,
+                },
+            );
+            return (lines, Some(CellFoldAction::Expand));
+        }
         (lines, None)
     }
 

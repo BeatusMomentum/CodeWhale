@@ -22,8 +22,8 @@ use super::constants::{TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_LINE_LIMIT, TOOL_OUTP
 use super::thinking::cached_color_depth;
 use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
-    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ThinkingFold, ToolCell,
-    ToolStatus, TranscriptRenderOptions, WebSearchCell, assistant_label_style_for,
+    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ToolCell, ToolStatus,
+    TranscriptFold, TranscriptRenderOptions, WebSearchCell, assistant_label_style_for,
     extract_reasoning_summary, render_spillover_annotation, render_thinking,
     render_thinking_with_analysis, running_status_label_with_elapsed,
 };
@@ -112,6 +112,87 @@ fn calm_options() -> TranscriptRenderOptions {
     TranscriptRenderOptions {
         low_motion: true,
         ..TranscriptRenderOptions::default()
+    }
+}
+
+#[test]
+fn ordinary_cell_fold_preserves_body_metadata_and_full_exports() {
+    let content = format!(
+        "[reference](https://example.com/reference)\n\n{}",
+        (1..=12)
+            .map(|line| format!("paragraph {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let mut tool = exec_tool("example", ToolStatus::Failed);
+    tool.output = Some(content.clone());
+    let cells = [
+        HistoryCell::User {
+            content: content.clone(),
+        },
+        HistoryCell::Assistant {
+            content: content.clone(),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: content.clone(),
+            streaming: true,
+        },
+        HistoryCell::System {
+            content: content.clone(),
+        },
+        HistoryCell::Error {
+            message: content.clone(),
+            severity: crate::error_taxonomy::ErrorSeverity::Error,
+        },
+        HistoryCell::Tool(ToolCell::Exec(tool)),
+    ];
+    for cell in cells {
+        let options = calm_options();
+        let full = cell.lines_with_copy_metadata(80, options);
+        let (preview, action) =
+            cell.lines_with_copy_metadata_folded(80, options, Some(TranscriptFold::Collapsed));
+        assert!(
+            preview.len() < full.len(),
+            "a folded long body stays bounded"
+        );
+        assert_eq!(action, Some(super::CellFoldAction::Expand));
+        assert_eq!(preview[0].copy_prefix_width, preview[0].line.width());
+        assert!(preview[0].links.is_empty());
+        let body = &preview[1..];
+        for (index, line) in body.iter().enumerate() {
+            assert_eq!(line.line, full[index].line);
+            assert_eq!(line.links, full[index].links);
+            assert_eq!(line.copy_prefix_width, full[index].copy_prefix_width);
+            if index + 1 < body.len() {
+                assert_eq!(line.copy_separator_after, full[index].copy_separator_after);
+            }
+        }
+        assert_eq!(
+            body.last().unwrap().copy_separator_after,
+            crate::tui::ui_text::CopyLineSeparator::Newline
+        );
+        let (plain, plain_action) =
+            cell.lines_with_options_folded(80, options, Some(TranscriptFold::Collapsed));
+        assert_eq!(plain_action, action);
+        assert_eq!(
+            plain,
+            preview
+                .iter()
+                .map(|line| line.line.clone())
+                .collect::<Vec<_>>()
+        );
+        let (restored, action) =
+            cell.lines_with_copy_metadata_folded(80, options, Some(TranscriptFold::Expanded));
+        assert!(action.is_none());
+        assert_eq!(restored.len(), full.len());
+        for (restored, original) in restored.iter().zip(&full) {
+            assert_eq!(restored.line, original.line);
+            assert_eq!(restored.links, original.links);
+            assert_eq!(restored.copy_prefix_width, original.copy_prefix_width);
+            assert_eq!(restored.copy_separator_after, original.copy_separator_after);
+        }
+        assert!(lines_text(&cell.transcript_lines(80)).contains("paragraph 12"));
     }
 }
 
@@ -535,12 +616,12 @@ fn reasoning_folds_in_live_and_the_fold_is_reversible() {
         // the intent is not re-read through the preference.
         let expanded = lines_text(
             &cell
-                .lines_with_options_folded(80, options, Some(ThinkingFold::Expanded))
+                .lines_with_options_folded(80, options, Some(TranscriptFold::Expanded))
                 .0,
         );
         let collapsed = lines_text(
             &cell
-                .lines_with_options_folded(80, options, Some(ThinkingFold::Collapsed))
+                .lines_with_options_folded(80, options, Some(TranscriptFold::Collapsed))
                 .0,
         );
 
@@ -593,15 +674,15 @@ fn explicit_thinking_fold_outranks_every_preference_baseline() {
         (None, true, false, true),
         (None, true, true, true),
         // An explicit expand renders expanded whatever the preferences say.
-        (Some(ThinkingFold::Expanded), false, false, true),
-        (Some(ThinkingFold::Expanded), false, true, true),
-        (Some(ThinkingFold::Expanded), true, false, true),
-        (Some(ThinkingFold::Expanded), true, true, true),
+        (Some(TranscriptFold::Expanded), false, false, true),
+        (Some(TranscriptFold::Expanded), false, true, true),
+        (Some(TranscriptFold::Expanded), true, false, true),
+        (Some(TranscriptFold::Expanded), true, true, true),
         // And an explicit collapse renders collapsed whatever they say.
-        (Some(ThinkingFold::Collapsed), false, false, false),
-        (Some(ThinkingFold::Collapsed), false, true, false),
-        (Some(ThinkingFold::Collapsed), true, false, false),
-        (Some(ThinkingFold::Collapsed), true, true, false),
+        (Some(TranscriptFold::Collapsed), false, false, false),
+        (Some(TranscriptFold::Collapsed), false, true, false),
+        (Some(TranscriptFold::Collapsed), true, false, false),
+        (Some(TranscriptFold::Collapsed), true, true, false),
     ] {
         let options = TranscriptRenderOptions {
             verbose,
@@ -3065,9 +3146,9 @@ fn calm1_settled_reasoning_is_one_localized_row_and_stays_expandable() {
             "{}",
             lines_text(&lines)
         );
-        assert_eq!(action, Some(super::ReasoningAction::Expand));
+        assert_eq!(action, Some(super::CellFoldAction::Expand));
         let expanded = cell
-            .lines_with_options_folded(80, options, Some(ThinkingFold::Expanded))
+            .lines_with_options_folded(80, options, Some(TranscriptFold::Expanded))
             .0;
         assert!(lines_text(&expanded).contains("private reasoning body"));
     }
