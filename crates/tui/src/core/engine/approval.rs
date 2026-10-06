@@ -292,6 +292,12 @@ impl Engine {
         withdraw: Option<&CancellationToken>,
     ) -> Result<ApprovalResult, ToolError> {
         let started = std::time::Instant::now();
+        // The held Engine request owns this absolute deadline. Hiding or
+        // rebuilding a host card cannot restart the configured human wait.
+        let deadline = self
+            .api_config
+            .approval_timeout()
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick completes immediately; consume it so the first
@@ -327,6 +333,16 @@ impl Engine {
                         "Approval withdrawn: the call that asked for it no longer waits for the answer".to_string(),
                     ));
                 }
+                () = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout, None).await?;
+                    let _ = self.send_event(Event::ApprovalWithdrawn { id: tool_id.to_string() }).await;
+                    return Ok(ApprovalResult::TimedOut);
+                }
                 decision = self.rx_approval.recv() => {
                     let Some(decision) = decision else {
                         self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable, Some(ApprovalDecider::Host)).await?;
@@ -337,6 +353,15 @@ impl Engine {
                                 .to_string(),
                         ));
                     };
+                    // A deadline/cancellation can become ready after select
+                    // chose the inbox. Re-enter the prioritized exit branches
+                    // instead of granting an answer that is already too late.
+                    if self.cancel_token.is_cancelled()
+                        || withdraw.is_some_and(CancellationToken::is_cancelled)
+                        || deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                    {
+                        continue;
+                    }
                     match decision {
                         ApprovalDecision::Approved { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
@@ -1792,6 +1817,194 @@ mod tests {
             intent_summary: None,
             approval_force_prompt: false,
         }
+    }
+
+    fn approval_deadline_fixture(
+        seconds: Option<u64>,
+    ) -> (
+        tempfile::TempDir,
+        Engine,
+        crate::core::engine::EngineHandle,
+        crate::approval_log::ApprovalReceiptStore,
+    ) {
+        let tmp = tempfile::tempdir().expect("approval deadline fixture");
+        let api = Config {
+            approval: seconds.map(|seconds| crate::config::ApprovalConfig {
+                timeout_seconds: Some(seconds),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (mut engine, handle) = Engine::new(EngineConfig::default(), &api);
+        let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+        engine.approval_receipt_store = Ok(store.clone());
+        (tmp, engine, handle, store)
+    }
+
+    #[tokio::test]
+    async fn configured_approval_deadline_expires_without_a_host_timer() {
+        let (_tmp, mut engine, handle, store) = approval_deadline_fixture(Some(1));
+        let session = engine.session.id.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .request_tool_approval("hidden-card", "exec_shell", approval_event("hidden-card"))
+                .await
+        });
+        // Receiving the request does not create or tick any UI card.
+        let mut events = handle.rx_event.write().await;
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::ApprovalRequired { .. })
+        ));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("Engine must enforce its deadline")
+            .expect("approval wait task");
+        assert!(matches!(outcome, Ok(ApprovalResult::TimedOut)));
+        let mut withdrawn = false;
+        while let Ok(event) = events.try_recv() {
+            withdrawn |= matches!(event, Event::ApprovalWithdrawn { id } if id == "hidden-card");
+        }
+        assert!(withdrawn, "the hidden host card must be retired by ID");
+        let replay = store.replay(&session).expect("approval receipts");
+        assert_eq!(replay.completed.len(), 1);
+        assert_eq!(replay.completed[0].outcome, ApprovalOutcome::Timeout);
+        assert_eq!(replay.completed[0].decided_by, None);
+        assert!(replay.unmatched_asks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn absent_or_zero_approval_deadline_remains_indefinite() {
+        for seconds in [None, Some(0)] {
+            let (_tmp, mut engine, handle, store) = approval_deadline_fixture(seconds);
+            let session = engine.session.id.clone();
+            let mut task = tokio::spawn(async move {
+                engine
+                    .request_tool_approval(
+                        "unbounded-card",
+                        "exec_shell",
+                        approval_event("unbounded-card"),
+                    )
+                    .await
+            });
+            assert!(matches!(
+                handle.rx_event.write().await.recv().await,
+                Some(Event::ApprovalRequired { .. })
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1100), &mut task)
+                    .await
+                    .is_err()
+            );
+            handle
+                .approve_tool_call("unbounded-card")
+                .await
+                .expect("current answer");
+            assert!(matches!(
+                task.await.expect("approval wait task"),
+                Ok(ApprovalResult::Approved(_))
+            ));
+            assert_eq!(
+                store.replay(&session).expect("receipts").completed[0].outcome,
+                ApprovalOutcome::ApprovedOnce
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn current_approval_before_configured_deadline_still_grants() {
+        let (_tmp, mut engine, handle, store) = approval_deadline_fixture(Some(1));
+        let session = engine.session.id.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .request_tool_approval("current-card", "exec_shell", approval_event("current-card"))
+                .await
+        });
+        assert!(matches!(
+            handle.rx_event.write().await.recv().await,
+            Some(Event::ApprovalRequired { .. })
+        ));
+        handle
+            .approve_tool_call("current-card")
+            .await
+            .expect("current answer");
+        assert!(matches!(
+            task.await.expect("approval task"),
+            Ok(ApprovalResult::Approved(_))
+        ));
+        let replay = store.replay(&session).expect("approval receipts");
+        assert_eq!(replay.completed.len(), 1);
+        assert_eq!(replay.completed[0].outcome, ApprovalOutcome::ApprovedOnce);
+        assert!(replay.unmatched_asks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_allow_cannot_win_an_expired_approval_or_cancellation() {
+        for exit in 0..3 {
+            let (_tmp, mut engine, handle, store) = approval_deadline_fixture(Some(1));
+            let session = engine.session.id.clone();
+            engine
+                .commit_approval_receipt(ApprovalReceipt::asked("deadline-race", "exec_shell"))
+                .await
+                .expect("durable ask");
+            let withdraw = CancellationToken::new();
+            let wait = engine.await_tool_approval("deadline-race", Some(&withdraw));
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(wait.as_mut()).is_pending());
+            // Keep the wait unpolled until both its absolute deadline and the
+            // inbox are ready; this exercises select-ready ordering directly.
+            tokio::time::sleep(Duration::from_millis(1010)).await;
+            handle
+                .approve_tool_call("deadline-race")
+                .await
+                .expect("queue late allow");
+            match exit {
+                1 => handle.cancel(),
+                2 => withdraw.cancel(),
+                _ => {}
+            }
+            let outcome = wait.await;
+            let expected = if exit == 0 {
+                assert!(matches!(outcome, Ok(ApprovalResult::TimedOut)));
+                ApprovalOutcome::Timeout
+            } else {
+                assert!(
+                    outcome.is_err(),
+                    "cancellation/withdrawal wins over expiry and allow"
+                );
+                ApprovalOutcome::Cancelled
+            };
+            let replay = store.replay(&session).expect("approval receipts");
+            assert_eq!(replay.completed.len(), 1);
+            assert_eq!(replay.completed[0].outcome, expected);
+            assert!(replay.unmatched_asks.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_receipt_failure_never_returns_a_settled_result() {
+        let (_tmp, mut engine, _handle, store) = approval_deadline_fixture(Some(1));
+        let session = engine.session.id.clone();
+        engine
+            .commit_approval_receipt(ApprovalReceipt::asked("timeout-write-fails", "exec_shell"))
+            .await
+            .expect("durable ask");
+        let log = store
+            .sessions_dir()
+            .join(session)
+            .join("approval_receipts.jsonl");
+        std::fs::remove_file(&log).expect("remove durable ask log");
+        std::fs::create_dir(&log).expect("replace log with unwritable directory");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.await_tool_approval("timeout-write-fails", None),
+        )
+        .await
+        .expect("bounded wait");
+        assert!(
+            outcome.is_err(),
+            "a failed durable timeout receipt must not return a settled decision"
+        );
     }
 
     /// Every closed outcome is persisted with the decider the handle was given,

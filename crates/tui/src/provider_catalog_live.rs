@@ -516,10 +516,21 @@ fn storage_provider(kind: ProviderKind, identity: &str) -> String {
 /// gateways, plus custom hosts whose private roster no snapshot can serve
 /// (#6289 widened). The active-provider refresh and the picker's freshness
 /// receipt both gate on this one predicate, so they cannot drift apart.
+#[cfg(test)]
+#[test]
+fn orcarouter_and_existing_custom_routes_own_live_catalogs() {
+    assert!(provider_owns_live_catalog(ProviderKind::Orcarouter));
+    assert!(provider_owns_live_catalog(ProviderKind::Custom));
+    assert!(provider_owns_live_catalog(ProviderKind::Openrouter));
+    assert!(provider_owns_live_catalog(ProviderKind::Ollama));
+    assert!(!provider_owns_live_catalog(ProviderKind::Openai));
+}
+
 pub(crate) fn provider_owns_live_catalog(provider: ProviderKind) -> bool {
     matches!(
         provider,
         ProviderKind::Openrouter
+            | ProviderKind::Orcarouter
             | ProviderKind::Telecomjs
             | ProviderKind::Edenai
             | ProviderKind::Zenmux

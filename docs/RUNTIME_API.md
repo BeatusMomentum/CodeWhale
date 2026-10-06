@@ -302,12 +302,17 @@ Routes:
     type change read as `updated`; the diff runs with `--no-renames`, so a move
     is a delete plus a create). `added`/`removed` are `null` for a binary path.
   - `size` and `revision` are the span's **end**, never the work tree as it is
-    now, so a client's `expected_hash` is the revision that change produced.
+    now. `revision` is bare SHA-256 hex; pass `sha256:` followed by that hex as
+    `file-revert`'s `expected_hash`, or `absent` for a path deleted by the call.
     Both are `null` when the path was deleted here or is too large to read.
   - `diff` is the patch between the two restore points, cut at 64 KiB on a char
     boundary (`diff_truncated` says so). It is `null` when there is nothing to
     render: a binary path, a change with no content delta, or no patch.
-  - `state: "unavailable"` means the span will never resolve, and `reason`
+  - `state: "pending"` means the recorded call is queued or in progress and
+    its snapshot pair is incomplete. `reason` is `null` and `files` is empty;
+    read again after settlement. Once both receipts exist, the state is
+    `captured`, including when the call changed nothing.
+  - `state: "unavailable"` means the settled span cannot be resolved, and `reason`
     says why: `call_not_bounded` (the call took no receipt — the engine judged
     it read-only, or the turn predates receipts), `post_snapshot_missing` (the
     opening receipt exists and the closing one was lost), `pre_snapshot_missing`,
@@ -327,6 +332,7 @@ Routes:
 | --- | --- |
 | 404 | Unknown thread or turn, a turn of another thread, or a `tool_call_id` this turn has no item or receipt for. |
 | 400 | `limit` outside `1..=1000`. |
+| 500 | A runtime item record could not be read or parsed, or an operational failure occurred reading the snapshot repository; this is not evidence that the call was unbounded or snapshots were pruned. |
 
 The artifact routes answer:
 

@@ -1497,11 +1497,28 @@ impl SnapshotRepo {
     /// the object it names. A caller about to diff two trees asks this first,
     /// so "these restore points are gone" is answered with the pruning it is
     /// rather than as a git failure over an object nobody can bring back.
-    pub fn has_tree(&self, id: &SnapshotId) -> bool {
+    /// IO and repository failures remain errors rather than evidence of pruning.
+    pub fn has_tree(&self, id: &SnapshotId) -> io::Result<bool> {
         let spec = format!("{}^{{tree}}", id.as_str());
-        run_git(&self.git_dir, &self.work_tree, &["cat-file", "-e", &spec])
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        let output = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &spec,
+            ],
+        )?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(io_other(format!(
+                "git tree lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
     }
 
     /// The unified diff of one path between snapshots `from` and `to`, as
@@ -4815,12 +4832,29 @@ mod tests {
         let taken = repo.take_snapshot("tool:call-1", None).expect("snapshot");
 
         assert!(
-            repo.has_tree(&taken.tree),
+            repo.has_tree(&taken.tree).expect("tree lookup"),
             "the snapshot's own tree resolves"
         );
         // Valid hex, never written: exactly what a pruned receipt names.
         let pruned = SnapshotId::parse(&"deadbeef".repeat(5)).unwrap();
-        assert!(!repo.has_tree(&pruned));
+        assert!(!repo.has_tree(&pruned).expect("missing tree lookup"));
+    }
+
+    #[test]
+    fn has_tree_reports_broken_repository_metadata_as_an_error() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha").unwrap();
+        let taken = repo.take_snapshot("tool:call-1", None).expect("snapshot");
+        std::fs::write(
+            repo.git_dir().join("HEAD"),
+            b"invalid snapshot repository metadata\n",
+        )
+        .unwrap();
+        let error = repo
+            .has_tree(&taken.tree)
+            .expect_err("broken repo is not pruning");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     /// A patch larger than the caller's bound is cut on a char boundary and

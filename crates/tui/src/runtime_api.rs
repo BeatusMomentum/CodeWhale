@@ -4940,75 +4940,85 @@ async fn get_skill_detail(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<SkillDetailResponse>, ApiError> {
-    let (skills_dir, mode) = {
-        let config = state.config.read();
-        let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
-        (skills_dir, mode)
-    };
-    let plugin_registry = state
-        .plugin_discovery
-        .registry_for_workspace(&state.workspace);
-    let (registry, directories) = discover_skills_for_runtime_api(
-        &state.workspace,
-        &skills_dir,
-        mode,
-        Some(plugin_registry.as_ref()),
-    );
-    let Some(skill) = registry.get(&name) else {
-        return Err(ApiError::not_found(format!(
-            "skill '{name}' not found in searched directories: {}",
-            format_skill_search_paths(&directories)
-        )));
-    };
-
-    // Only the checks the listing does not need: this route hands the body to
-    // a client, so a native skill whose file has gone must fail rather than
-    // serve the cached instructions, and a plugin must still hold the
-    // authority its snapshot was reviewed under. Field derivation itself is
-    // `skill_entry_for`'s, shared with the listing.
-    match &skill.source {
-        crate::skills::SkillSource::Native if !skill.path.is_file() => {
+    // Discovery, plugin tree hashing/state locks, and skill-state refresh
+    // all read disk; keep this new route's work off the async server worker.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let (skills_dir, mode) = {
+            let config = state.config.read();
+            let skills_dir = resolve_skills_dir(&config, &state.workspace);
+            let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
+            (skills_dir, mode)
+        };
+        let plugin_registry = state
+            .plugin_discovery
+            .registry_for_workspace(&state.workspace);
+        let (registry, directories) = discover_skills_for_runtime_api(
+            &state.workspace,
+            &skills_dir,
+            mode,
+            Some(plugin_registry.as_ref()),
+        );
+        let Some(skill) = registry.get(&name) else {
             return Err(ApiError::not_found(format!(
-                "skill '{}' is registered at {} but that file no longer exists on disk",
-                skill.name,
-                skill.path.display()
+                "skill '{name}' not found in searched directories: {}",
+                format_skill_search_paths(&directories)
             )));
-        }
-        crate::skills::SkillSource::Plugin { authority, .. } => {
-            // The same gate the TUI's own activation path runs: a plugin whose
-            // trust or enablement changed since discovery must not hand its
-            // body to a client.
-            crate::plugins::registry::verify_plugin_component_authority(
-                authority,
-                crate::plugins::activation::PluginActivationCapability::Skills,
-            )
-            .map_err(|reason| {
-                ApiError::forbidden(format!(
-                    "plugin skill '{}' is no longer active: {reason}",
-                    skill.name
-                ))
-            })?;
-            if authority.workspace != state.workspace {
-                return Err(ApiError::forbidden(format!(
-                    "plugin skill '{}' belongs to a different workspace",
-                    skill.name
+        };
+
+        // Only the checks the listing does not need: this route hands the body to
+        // a client, so a native skill whose file has gone must fail rather than
+        // serve the cached instructions, and a plugin must still hold the
+        // authority its snapshot was reviewed under. Field derivation itself is
+        // `skill_entry_for`'s, shared with the listing.
+        match &skill.source {
+            crate::skills::SkillSource::Native if !skill.path.is_file() => {
+                return Err(ApiError::not_found(format!(
+                    "skill '{}' is registered at {} but that file no longer exists on disk",
+                    skill.name,
+                    skill.path.display()
                 )));
             }
+            crate::skills::SkillSource::Plugin { authority, .. } => {
+                // The same gate the TUI's own activation path runs: a plugin whose
+                // trust or enablement changed since discovery must not hand its
+                // body to a client.
+                crate::plugins::registry::verify_plugin_component_authority(
+                    authority,
+                    crate::plugins::activation::PluginActivationCapability::Skills,
+                )
+                .map_err(|reason| {
+                    ApiError::forbidden(format!(
+                        "plugin skill '{}' is no longer active: {reason}",
+                        skill.name
+                    ))
+                })?;
+                if authority.workspace != state.workspace {
+                    return Err(ApiError::forbidden(format!(
+                        "plugin skill '{}' belongs to a different workspace",
+                        skill.name
+                    )));
+                }
+            }
+            crate::skills::SkillSource::Native => {}
         }
-        crate::skills::SkillSource::Native => {}
-    }
 
-    let mut skill_state = state.skill_state.lock().await;
-    skill_state
-        .refresh()
-        .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
-    let enabled =
-        skill_state.is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
-    Ok(Json(SkillDetailResponse {
-        skill: skill_entry_for(skill, enabled, &skills_dir),
-        body: skill.body.clone(),
-    }))
+        let mut skill_state = state.skill_state.blocking_lock();
+        skill_state
+            .refresh()
+            .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
+        let enabled = skill_state
+            .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+        Ok(Json(SkillDetailResponse {
+            skill: skill_entry_for(skill, enabled, &skills_dir),
+            body: skill.body.clone(),
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("skill detail read task failed: {error}")))?
 }
 
 // ─── Skill lifecycle helpers ────────────────────────────────────────────────

@@ -1655,6 +1655,7 @@ pub(crate) async fn handle_view_events(
                     }
                 };
                 if result.is_ok() {
+                    note_human_decision_delivered(app, &tool_id);
                     app.retire_action_notices(Some(&tool_id));
                 }
             }
@@ -2802,6 +2803,16 @@ pub(crate) async fn handle_view_events(
                 complete_provider_picker_onboarding_if_switched(
                     app,
                     ProviderKind::OpenaiCodex,
+                    switched,
+                );
+            }
+            ViewEvent::ProviderPickerOrcarouterOAuthRequested => {
+                let switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config)
+                        .await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Orcarouter,
                     switched,
                 );
             }

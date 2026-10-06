@@ -69,14 +69,13 @@ impl ImageAnalyzeTool {
         }
     }
 
-    async fn read_image_file(path: &Path) -> Result<(String, String), ToolError> {
+    async fn read_image_file(path: &Path) -> Result<(Vec<u8>, String), ToolError> {
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| ToolError::execution_failed(format!("Failed to read image file: {e}")))?;
 
         let mime_type = Self::detect_mime_type(path)?;
-        let base64_data = BASE64.encode(&bytes);
-        Ok((base64_data, mime_type))
+        Ok((bytes, mime_type))
     }
 
     fn resolve_image_path(workspace: &Path, image_path: &str) -> Result<PathBuf, ToolError> {
@@ -107,15 +106,17 @@ impl ImageAnalyzeTool {
         Ok(resolved)
     }
 
-    /// Real pixel dimensions plus the format label derived from the same
-    /// extension decision as `detect_mime_type`. Header-only probe; returns
-    /// `None` when the header cannot be parsed (including BMP, whose decoder
-    /// is not compiled in) so callers can omit the metadata instead of
-    /// failing the tool. Animated GIF/WebP yield the first frame's size.
-    fn image_dimensions(path: &Path) -> Option<(u32, u32, String)> {
-        let mime_type = Self::detect_mime_type(path).ok()?;
+    /// Header-only dimensions of the same bytes sent to the vision model,
+    /// using the extension-derived MIME type. Run on a blocking worker; omit
+    /// metadata for unparsable containers (including unsupported BMP).
+    /// Animated GIF/WebP yield the first frame's size.
+    fn image_dimensions(bytes: &[u8], mime_type: &str) -> Option<(u32, u32, String)> {
         let format = mime_type.strip_prefix("image/")?.to_string();
-        let (width, height) = image::image_dimensions(path).ok()?;
+        let reader = image::ImageReader::with_format(
+            std::io::Cursor::new(bytes),
+            image::ImageFormat::from_mime_type(mime_type)?,
+        );
+        let (width, height) = reader.into_dimensions().ok()?;
         Some((width, height, format))
     }
 
@@ -276,10 +277,16 @@ impl ToolSpec for ImageAnalyzeTool {
             .unwrap_or("Describe this image in detail.");
 
         let resolved_path = Self::resolve_image_path(&context.workspace, image_path)?;
-        // Metadata probe; a parse failure degrades to omitted fields, never
-        // to a tool error — the vision request itself does not depend on it.
-        let dimensions = Self::image_dimensions(&resolved_path);
-        let (image_data, mime_type) = Self::read_image_file(&resolved_path).await?;
+        let (image_bytes, mime_type) = Self::read_image_file(&resolved_path).await?;
+        let dimension_mime_type = mime_type.clone();
+        // Header parsing and encoding stay off the async worker and use one
+        // file snapshot. A failed probe omits metadata without failing vision.
+        let (image_data, dimensions) = tokio::task::spawn_blocking(move || {
+            let dimensions = Self::image_dimensions(&image_bytes, &dimension_mime_type);
+            (BASE64.encode(&image_bytes), dimensions)
+        })
+        .await
+        .map_err(|e| ToolError::execution_failed(format!("Failed to prepare image file: {e}")))?;
 
         let payload = self.request_payload(prompt, &image_data, &mime_type);
 
@@ -800,6 +807,27 @@ mod tests {
                 Some(format),
                 "{name} format must match the mime-derived label"
             );
+            let requests = server.received_requests().await.expect("recorded requests");
+            let request: Value = requests
+                .last()
+                .expect("vision request")
+                .body_json()
+                .unwrap();
+            let image_url = request["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .expect("uploaded image URL");
+            let uploaded = BASE64
+                .decode(
+                    image_url
+                        .strip_prefix(&format!("data:image/{format};base64,"))
+                        .expect("uploaded image MIME type matches metadata"),
+                )
+                .expect("uploaded image base64");
+            assert_eq!(
+                ImageAnalyzeTool::image_dimensions(&uploaded, &format!("image/{format}")),
+                Some((width, height, format.to_string())),
+                "{name} metadata must describe the actual uploaded bytes"
+            );
         }
     }
 
@@ -832,10 +860,9 @@ mod tests {
     }
 
     #[test]
-    fn image_dimensions_omits_bmp_because_decoder_feature_is_off() {
-        // Minimal well-formed 1x1 24-bit BMP: even valid BMP input must
-        // degrade to `None` (no panic, no error) while the `bmp` feature of
-        // the `image` dependency is not enabled.
+    fn image_dimensions_respects_the_available_bmp_decoder() {
+        // Workspace feature unification can enable BMP on some platforms.
+        // Report its dimensions when supported; otherwise omit metadata.
         const MINIMAL_BMP: &[u8] = &[
             b'B', b'M', //
             0x3a, 0x00, 0x00,
@@ -855,9 +882,32 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // important colors
             0x00, 0x00, 0x00, 0x00, // single BGR pixel plus 1 pad byte
         ];
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("tiny.bmp");
-        std::fs::write(&path, MINIMAL_BMP).expect("write fixture");
-        assert_eq!(ImageAnalyzeTool::image_dimensions(&path), None);
+        let decoder = image::ImageReader::with_format(
+            std::io::Cursor::new(MINIMAL_BMP),
+            image::ImageFormat::Bmp,
+        )
+        .into_decoder();
+        match decoder {
+            Ok(decoder) => {
+                assert_eq!(image::ImageDecoder::dimensions(&decoder), (1, 1));
+                assert_eq!(
+                    ImageAnalyzeTool::image_dimensions(MINIMAL_BMP, "image/bmp"),
+                    Some((1, 1, "bmp".to_string()))
+                );
+            }
+            Err(image::ImageError::Unsupported(error)) => {
+                assert!(matches!(
+                    error.kind(),
+                    image::error::UnsupportedErrorKind::Format(
+                        image::error::ImageFormatHint::Exact(image::ImageFormat::Bmp)
+                    )
+                ));
+                assert_eq!(
+                    ImageAnalyzeTool::image_dimensions(MINIMAL_BMP, "image/bmp"),
+                    None
+                );
+            }
+            Err(error) => panic!("invalid BMP fixture: {error}"),
+        }
     }
 }

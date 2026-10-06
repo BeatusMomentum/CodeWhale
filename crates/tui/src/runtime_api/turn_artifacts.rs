@@ -20,7 +20,8 @@ use super::workspace::{
 };
 use super::{ApiError, RuntimeApiState, map_thread_err};
 use crate::runtime_threads::{
-    CallWorkspaceSpan, FileChangeKind, TurnArtifactKind, TurnArtifactRef, TurnArtifactsView,
+    CallWorkspaceSpan, FileChangeKind, RuntimeStoreRecordFailure, RuntimeStoreRecordKind,
+    TurnArtifactKind, TurnArtifactRef, TurnArtifactsView, TurnItemLifecycleStatus,
     TurnWorkspaceArtifacts,
 };
 
@@ -327,8 +328,8 @@ pub(super) struct CallChangesResponse {
     tool_call_id: String,
     tool_name: Option<String>,
     /// `captured` when the call's two restore points exist and `files` is
-    /// authoritative; `unavailable` when the span will never resolve, with
-    /// `reason` saying why.
+    /// authoritative; `pending` while its recorded item is active and the
+    /// pair is incomplete; `unavailable` after settlement, with `reason`.
     state: &'static str,
     reason: Option<&'static str>,
     files: Vec<CallChangeFile>,
@@ -352,7 +353,8 @@ pub(super) struct CallChangesResponse {
 /// the turn delta says. Snapshots exclude what they exclude (`node_modules/`,
 /// `.gitignore` entries, binary and media extensions), and a path they never
 /// track cannot appear here. A call the engine judged read-only has no
-/// receipts at all and answers `call_not_bounded`; a call whose closing
+/// receipts at all and answers `call_not_bounded` after settlement. An active
+/// item without a complete pair answers `pending`; a settled call whose closing
 /// snapshot was lost answers `post_snapshot_missing`; one whose receipts name
 /// trees the store no longer holds (pruned, or a store that is gone) answers
 /// `snapshots_pruned`. All three are `unavailable` rather than an empty list,
@@ -372,7 +374,15 @@ pub(super) async fn list_call_changes(
         .runtime_threads
         .turn_call_span(&thread_id, &turn_id, &tool_call_id)
         .await
-        .map_err(map_thread_err)?
+        .map_err(|error| {
+            if RuntimeStoreRecordFailure::from_error(&error)
+                .is_some_and(|failure| failure.record_kind == RuntimeStoreRecordKind::Item)
+            {
+                ApiError::internal(error.to_string())
+            } else {
+                map_thread_err(error)
+            }
+        })?
         .ok_or_else(|| {
             ApiError::not_found(format!(
                 "no call '{tool_call_id}' is recorded on turn '{turn_id}' of this thread"
@@ -385,12 +395,18 @@ pub(super) async fn list_call_changes(
     ) {
         (Some(pre), Some(post)) => (pre, post),
         (pre, post) => {
+            if matches!(
+                span.item_status,
+                Some(TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress)
+            ) {
+                return Ok(Json(empty_call_changes(&span, "pending", None)));
+            }
             let reason = match (pre.is_some(), post.is_some()) {
                 (true, false) => "post_snapshot_missing",
                 (false, true) => "pre_snapshot_missing",
                 _ => "call_not_bounded",
             };
-            return Ok(Json(unavailable_call_changes(&span, reason)));
+            return Ok(Json(empty_call_changes(&span, "unavailable", Some(reason))));
         }
     };
 
@@ -422,7 +438,11 @@ pub(super) async fn list_call_changes(
         // error a client should report as a failure — the paths the receipt
         // recorded are still on the turn, and the caller keeps them.
         CallSpanOutcome::Pruned => {
-            return Ok(Json(unavailable_call_changes(&span, "snapshots_pruned")));
+            return Ok(Json(empty_call_changes(
+                &span,
+                "unavailable",
+                Some("snapshots_pruned"),
+            )));
         }
     };
 
@@ -438,14 +458,18 @@ pub(super) async fn list_call_changes(
     }))
 }
 
-fn unavailable_call_changes(span: &CallWorkspaceSpan, reason: &'static str) -> CallChangesResponse {
+fn empty_call_changes(
+    span: &CallWorkspaceSpan,
+    state: &'static str,
+    reason: Option<&'static str>,
+) -> CallChangesResponse {
     CallChangesResponse {
         thread_id: span.thread_id.clone(),
         turn_id: span.turn_id.clone(),
         tool_call_id: span.tool_call_id.clone(),
         tool_name: span.tool_name.clone(),
-        state: "unavailable",
-        reason: Some(reason),
+        state,
+        reason,
         files: Vec::new(),
         truncated: false,
     }
@@ -496,7 +520,11 @@ fn call_span_files(
     // Asked before the diff: git's answer to a pruned object is a failure of
     // the whole command, and a caller has to tell "these were pruned" apart
     // from "this repo is broken".
-    if !repo.has_tree(&pre) || !repo.has_tree(&post) {
+    let has_tree = |id: &crate::snapshot::SnapshotId| {
+        repo.has_tree(id)
+            .map_err(|error| ApiError::internal(format!("snapshot tree lookup failed: {error}")))
+    };
+    if !has_tree(&pre)? || !has_tree(&post)? {
         return Ok(CallSpanOutcome::Pruned);
     }
     let (changes, truncated) = repo

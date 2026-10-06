@@ -983,6 +983,12 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
 
 #[derive(Default)]
 struct TestServerOverrides {
+    automation_handles: Option<
+        oneshot::Sender<(
+            crate::automation_manager::SharedAutomationManager,
+            crate::task_manager::SharedTaskManager,
+        )>,
+    >,
     /// Publish the exact manager using the production owner/frontend factory.
     owner_socket: Option<PathBuf>,
     /// Capture the actual owner's service table for cache/lifetime assertions.
@@ -1269,6 +1275,9 @@ async fn build_test_server(
         root.join("automations"),
     )?));
     runtime_threads.attach_automation_manager(automations.clone());
+    if let Some(sender) = overrides.automation_handles {
+        let _ = sender.send((automations.clone(), manager.clone()));
+    }
 
     let auth_required = runtime_token.is_some();
     let sub_agent_manager = overrides
@@ -2436,9 +2445,25 @@ async fn workspace_file_search_auth_matching_and_bounds() -> Result<()> {
 
 #[tokio::test]
 async fn workspace_and_automation_endpoints_work() -> Result<()> {
-    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+    let root = tempfile::tempdir()?;
+    let (automation_tx, automation_rx) = oneshot::channel();
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.path().to_path_buf(),
+            root.path().join("sessions"),
+            None,
+            false,
+            root.path().join("workspace"),
+            TestServerOverrides {
+                automation_handles: Some(automation_tx),
+                ..Default::default()
+            },
+        )
+        .await?
+    else {
         return Ok(());
     };
+    let (automations, tasks) = automation_rx.await?;
     let client = crate::tls::reqwest_client();
 
     let workspace: serde_json::Value = client
@@ -2539,6 +2564,48 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         "expected at least one run entry"
     );
 
+    // The admitted occurrence must survive deletion until its real task and
+    // the production scheduler have settled its durable run receipt.
+    let refused = client
+        .delete(format!("http://{addr}/v1/automations/{automation_id}"))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await?.contains("still active"));
+    let task_id = run_now["task_id"].as_str().context("missing task id")?;
+    let run_id = run_now["id"].as_str().context("missing run id")?;
+    let task = crate::task_manager::wait_for_terminal_state(
+        &tasks,
+        task_id,
+        ci_scaled(Duration::from_secs(15)),
+    )
+    .await?;
+    assert_eq!(task.status, crate::task_manager::TaskStatus::Completed);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let scheduler = spawn_scheduler(
+        automations.clone(),
+        tasks,
+        cancel.clone(),
+        crate::automation_manager::AutomationSchedulerConfig::default(),
+    );
+    tokio::time::timeout(ci_scaled(Duration::from_secs(15)), async {
+        loop {
+            let runs = automations.lock().await.list_runs(&automation_id, None)?;
+            if runs.iter().any(|run| {
+                run.id == run_id
+                    && run.status == crate::automation_manager::AutomationRunStatus::Completed
+            }) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("automation scheduler did not settle the completed task")??;
+    cancel.cancel();
+    scheduler.await?;
+
     let _deleted: serde_json::Value = client
         .delete(format!("http://{addr}/v1/automations/{automation_id}"))
         .send()
@@ -2553,6 +2620,12 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         .await?
         .status();
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    let archived = automations
+        .lock()
+        .await
+        .list_archived_runs(&automation_id)?;
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].task_id.as_deref(), Some(task_id));
 
     handle.abort();
     Ok(())
@@ -20829,6 +20902,44 @@ async fn call_change_route_reads_one_calls_workspace_span() -> Result<()> {
         })
     };
 
+    // The item's persisted lifecycle owns the wait: an opening receipt with
+    // no partner is normal while queued or running, not a permanent loss.
+    let mut active_turn = half_turn.clone();
+    active_turn.id = "turn_call_active".to_string();
+    active_turn.status = RuntimeTurnStatus::InProgress;
+    active_turn.item_ids = vec!["item_active".to_string()];
+    active_turn.workspace = None;
+    store.save_turn(&active_turn)?;
+    let mut active_item = half_item.clone();
+    active_item.id = "item_active".to_string();
+    active_item.turn_id = active_turn.id.clone();
+    for status in [
+        TurnItemLifecycleStatus::Queued,
+        TurnItemLifecycleStatus::InProgress,
+    ] {
+        active_item.status = status;
+        store.save_item(&active_item)?;
+        let pending = get(&thread.id, &active_turn.id, "call_half").await?;
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["reason"], Value::Null);
+        assert_eq!(pending["files"].as_array().unwrap().len(), 0);
+    }
+    active_turn
+        .workspace_snapshots
+        .push(serde_json::from_value(json!({
+            "kind": "post_tool", "snapshot_id": post_tool.id.as_str(),
+            "tree_id": post_tool.tree.as_str(), "session_id": thread.id,
+            "tool_call_id": "call_half", "changed_paths": ["out.md", "script.py"],
+        }))?);
+    active_turn.status = RuntimeTurnStatus::Completed;
+    active_item.status = TurnItemLifecycleStatus::Completed;
+    store.save_item(&active_item)?;
+    store.save_turn(&active_turn)?;
+    let settled = get(&thread.id, &active_turn.id, "call_half").await?;
+    assert_eq!(settled["state"], "captured");
+    assert_eq!(settled["reason"], Value::Null);
+    assert_eq!(settled["files"].as_array().unwrap().len(), 2);
+
     let body = get(&thread.id, "turn_call_changes", SHELL_CALL).await?;
     assert_eq!(body["state"], "captured");
     assert_eq!(body["reason"], Value::Null);
@@ -20911,20 +21022,50 @@ async fn call_change_route_reads_one_calls_workspace_span() -> Result<()> {
     assert_eq!(half["state"], "unavailable");
     assert_eq!(half["reason"], "post_snapshot_missing");
 
+    // A corrupt item cannot turn a known call into an unavailable span.
+    let item_path = tmp
+        .path()
+        // This harness roots the Runtime store at <root>/runtime/runtime.
+        .join("runtime")
+        .join("runtime")
+        .join("runtime")
+        .join("items")
+        .join(format!("{}.json", half_item.id));
+    let saved_item = fs::read(&item_path)?;
+    fs::write(&item_path, b"invalid runtime item JSON\n")?;
+    let response = client
+        .get(url(&thread.id, "turn_call_half", "call_half"))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await;
+    fs::write(&item_path, saved_item)?;
+    let response = response?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await?;
+    assert!(
+        error.to_string().contains("Failed to parse item"),
+        "{error}"
+    );
+
     // A call this turn never ran, an unknown turn, and a turn of another
     // thread are 404s rather than empty answers.
-    for (turn_id, call) in [
-        ("turn_call_changes", "call_never"),
-        ("turn_missing", "call_shell"),
-        ("turn_call_half", "call_shell"),
+    for (thread_id, turn_id, call) in [
+        (thread.id.as_str(), "turn_call_changes", "call_never"),
+        (thread.id.as_str(), "turn_missing", "call_shell"),
+        (thread.id.as_str(), "turn_call_half", "call_shell"),
+        ("thread_missing", "turn_call_changes", SHELL_CALL),
     ] {
         let status = client
-            .get(url(&thread.id, turn_id, call))
+            .get(url(thread_id, turn_id, call))
             .bearer_auth("call-changes-token")
             .send()
             .await?
             .status();
-        assert_eq!(status, StatusCode::NOT_FOUND, "{turn_id}/{call}");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{thread_id}/{turn_id}/{call}"
+        );
     }
     let status = client
         .get(format!(
@@ -20936,6 +21077,25 @@ async fn call_change_route_reads_one_calls_workspace_span() -> Result<()> {
         .await?
         .status();
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A store is present, but git cannot read its metadata. Preserve the
+    // operational failure rather than telling clients these trees were pruned.
+    let head = repo.git_dir().join("HEAD");
+    let saved_head = fs::read(&head)?;
+    fs::write(&head, b"invalid snapshot repository metadata\n")?;
+    let response = client
+        .get(url(&thread.id, "turn_call_changes", SHELL_CALL))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await;
+    fs::write(&head, saved_head)?;
+    let response = response?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await?;
+    assert!(
+        error.to_string().contains("snapshot tree lookup failed"),
+        "{error}"
+    );
 
     handle.abort();
     Ok(())

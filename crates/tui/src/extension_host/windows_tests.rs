@@ -8,6 +8,95 @@ use crate::plugins::activation::TestPolicyGuard;
 use crate::tools::spec::ToolContext;
 use serde_json::json;
 
+const ACL_LOCK_FIXTURE_DIR: &str = "CODEWHALE_WINDOWS_ACL_LOCK_FIXTURE_DIR";
+
+#[test]
+fn windows_acl_edit_guard_fixture() {
+    let Some(root) = std::env::var_os(ACL_LOCK_FIXTURE_DIR).map(PathBuf::from) else {
+        return;
+    };
+    fs::write(root.join("ready"), b"ready").unwrap();
+    let _guard = AclEditGuard::acquire().unwrap();
+    fs::write(root.join("acquired"), b"acquired").unwrap();
+}
+
+#[test]
+fn windows_acl_edit_guard_serializes_processes() {
+    // Retain the owned child even during an assertion panic. This fixture
+    // starts no descendants; cleanup never targets any other process.
+    struct FixtureChild(std::process::Child);
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let ready = root.path().join("ready");
+    let acquired = root.path().join("acquired");
+    let guard = AclEditGuard::acquire().unwrap();
+    let mut child = FixtureChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "extension_host::windows::tests::windows_acl_edit_guard_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            // The unique marker directory is supplied only to this child.
+            // No process-global environment mutation or env lock is needed.
+            .env(ACL_LOCK_FIXTURE_DIR, root.path())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "ACL fixture exited before its ready marker; exact fixture must run"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ACL fixture was not ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let held_until = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < held_until {
+        assert!(
+            !acquired.exists(),
+            "child acquired the parent's held ACL lock"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "ACL fixture exited while the parent still held the lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!acquired.exists(), "child acquired before parent release");
+    drop(guard);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "ACL fixture failed: {status}");
+            assert!(
+                acquired.exists(),
+                "fixture exited without acquiring the lock"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ACL fixture did not acquire and exit after parent release"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn runtime(choice: ExtensionHostRuntime, override_path: Option<&Path>) -> Option<HostRuntime> {
     let resolution = crate::dependencies::resolve_extension_host_runtime(
         choice,

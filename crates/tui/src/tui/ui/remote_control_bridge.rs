@@ -271,6 +271,7 @@ pub(crate) async fn drain_remote_control_events(
                         };
                         match result {
                             Ok(()) => {
+                                note_human_decision_delivered(app, &tool_id);
                                 let _ = app.remote_control.take_pending_approval(&gate);
                                 app.retire_action_notices(Some(&tool_id));
                                 // First decision wins: the web answered this

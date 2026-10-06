@@ -10697,7 +10697,7 @@ impl RuntimeThreadManager {
             };
             let pre = recorded(crate::snapshot::WorkspaceSnapshotKind::Tool);
             let post = recorded(crate::snapshot::WorkspaceSnapshotKind::PostTool);
-            let item = manager.item_for_call(&turn, &tool_call_id);
+            let item = manager.item_for_call(&turn, &tool_call_id)?;
             // A call the turn recorded no item for is a call this turn never
             // ran: the caller asked about the wrong turn. A call with an item
             // but no receipt is the read-only case — known, and bounded by
@@ -10716,6 +10716,7 @@ impl RuntimeThreadManager {
                 turn_id,
                 tool_call_id,
                 tool_name,
+                item_status: item.as_ref().map(|item| item.status),
                 pre_tool_snapshot_id: pre.map(|receipt| receipt.tree_id.clone()),
                 post_tool_snapshot_id: post.map(|receipt| receipt.tree_id.clone()),
                 thread_workspace: thread.workspace,
@@ -10730,17 +10731,24 @@ impl RuntimeThreadManager {
     /// `tool_use_id` is the identity the engine also labels the call's
     /// `tool:<call_id>` restore point with, so this is how a receipt is tied
     /// back to the tool that ran.
-    fn item_for_call(&self, turn: &TurnRecord, tool_call_id: &str) -> Option<TurnItemRecord> {
-        turn.item_ids
-            .iter()
-            .filter_map(|item_id| self.store.load_item(item_id).ok())
-            .find(|item| {
-                item.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("tool_use_id"))
-                    .and_then(Value::as_str)
-                    == Some(tool_call_id)
-            })
+    fn item_for_call(
+        &self,
+        turn: &TurnRecord,
+        tool_call_id: &str,
+    ) -> Result<Option<TurnItemRecord>> {
+        for item_id in &turn.item_ids {
+            let item = self.store.load_item(item_id)?;
+            if item
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("tool_use_id"))
+                .and_then(Value::as_str)
+                == Some(tool_call_id)
+            {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn get_thread(&self, id: &str) -> Result<ThreadRecord> {
@@ -19518,9 +19526,11 @@ pub struct CallWorkspaceSpan {
     pub turn_id: String,
     pub tool_call_id: String,
     pub tool_name: Option<String>,
+    /// The persisted item owns whether this call is still awaiting settlement.
+    pub item_status: Option<TurnItemLifecycleStatus>,
     pub pre_tool_snapshot_id: Option<String>,
-    /// `None` when the closing snapshot failed or was gated: the span's
-    /// changes are then unknown, not empty.
+    /// `None` while the call is active, or when the closing snapshot failed
+    /// or was gated: the span's changes are then unknown, not empty.
     pub post_tool_snapshot_id: Option<String>,
     pub thread_workspace: PathBuf,
 }

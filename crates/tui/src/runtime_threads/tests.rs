@@ -13223,8 +13223,7 @@ async fn user_input_terminal_tool_result_does_not_resurrect_rejected_inflight_an
     let events = manager.events_since(&thread.id, None)?;
     let last = events
         .iter()
-        .filter(|event| event.event.starts_with("user_input."))
-        .last()
+        .rfind(|event| event.event.starts_with("user_input."))
         .unwrap();
     assert_eq!(last.event, "user_input.canceled");
     assert!(

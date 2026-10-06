@@ -15827,7 +15827,7 @@ fn user_input_timeout_retires_only_matching_question_even_when_completion_is_fil
         result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
     };
     assert!(suppress_engine_event_after_local_cancel(&completion));
-    observe_user_input_settlement(&mut app, &completion);
+    observe_human_request_settlement(&mut app, &completion);
     assert!(app.pending_user_input_prompt.is_none());
     assert!(!app.view_stack.contains_kind(ModalKind::UserInput));
     assert!(app.view_stack.contains_approval_id("unrelated-approval"));
@@ -15851,8 +15851,8 @@ fn user_input_completion_preserves_newer_question_and_dispatch() {
         result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
     };
     // Neither a previous request nor a wrapping call's different id owns it.
-    observe_user_input_settlement(&mut app, &completion("input-old"));
-    observe_user_input_settlement(&mut app, &completion("outer-call"));
+    observe_human_request_settlement(&mut app, &completion("input-old"));
+    observe_human_request_settlement(&mut app, &completion("outer-call"));
     apply_user_input_submission_result(&mut app, "input-old", Ok(()));
     assert_eq!(app.turn_last_activity_at, Some(activity));
     assert_eq!(
@@ -15862,7 +15862,7 @@ fn user_input_completion_preserves_newer_question_and_dispatch() {
         Some("input-new")
     );
     app.suppress_stream_events_until_turn_complete = true;
-    observe_user_input_settlement(
+    observe_human_request_settlement(
         &mut app,
         &EngineEvent::TurnComplete {
             usage: Usage::default(),
@@ -15887,7 +15887,7 @@ fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
         app.runtime_turn_status = Some("in_progress".into());
         install_pending_question(&mut app, "input-boundary");
         app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
-            "keep-approval",
+            "parent-approval",
             "exec_shell",
             "Review command",
             &serde_json::json!({"command": "git status"}),
@@ -15896,7 +15896,7 @@ fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
         match boundary {
             "cancel" => mark_active_turn_cancelled_locally(&mut app),
             "disconnect" => assert!(recover_engine_event_disconnect(&mut app)),
-            _ => observe_user_input_settlement(
+            _ => observe_human_request_settlement(
                 &mut app,
                 &EngineEvent::TurnComplete {
                     usage: Usage::default(),
@@ -15919,7 +15919,7 @@ fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
             "{boundary}"
         );
         assert!(
-            app.view_stack.contains_approval_id("keep-approval"),
+            !app.view_stack.contains_approval_id("parent-approval"),
             "{boundary}"
         );
         assert!(
@@ -33753,4 +33753,172 @@ fn a_foreground_shell_wait_is_one_tool_card_not_also_a_background_job() {
     foreground.background = true;
     project_shell_jobs(&mut app, &mut entries, &[foreground]);
     assert_eq!(entries.len(), 1);
+}
+
+fn human_wait_test_app(running_tool: bool) -> App {
+    let mut app = create_test_app();
+    let started = Instant::now() - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(60);
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    app.turn_started_at = Some(started);
+    app.turn_last_activity_at = Some(started);
+    if running_tool {
+        let mut active = ActiveCell::new();
+        active.push_tool(
+            "human-wait-call",
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "exec_shell".into(),
+                status: ToolStatus::Running,
+                input_summary: None,
+                output: None,
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })),
+        );
+        app.active_cell = Some(active);
+    }
+    app
+}
+
+fn add_human_wait_approval(app: &mut App, id: &str) {
+    push_approval_request_view(
+        app,
+        id,
+        "exec_shell",
+        "Review this command",
+        &serde_json::json!({"command":"pwd"}),
+        "key",
+        "group",
+        None,
+        crate::config::ApprovalDefaultSelection::Deny,
+        None,
+    );
+}
+
+#[test]
+fn turn_liveness_keeps_buried_indefinite_approvals_alive_until_withdrawn() {
+    for running_tool in [false, true] {
+        let mut app = human_wait_test_app(running_tool);
+        add_human_wait_approval(&mut app, "human-wait-call");
+        app.view_stack.push(HelpView::default());
+        assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+        assert!(app.is_loading);
+        assert!(crate::tui::pending_requests::observe_engine_event(
+            &mut app,
+            &EngineEvent::ApprovalWithdrawn {
+                id: "human-wait-call".into()
+            }
+        ));
+        assert!(!app.view_stack.contains_approval_id("human-wait-call"));
+        assert!(reconcile_turn_liveness(&mut app, Instant::now(), false));
+    }
+}
+
+#[test]
+fn turn_liveness_keeps_elevation_alive_and_retires_its_exact_card() {
+    let mut app = human_wait_test_app(true);
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(
+                "human-wait-call",
+                "exec_shell",
+                "denied",
+            ),
+            app.ui_locale,
+        ));
+    app.view_stack.push(HelpView::default());
+    assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+    assert!(crate::tui::pending_requests::observe_engine_event(
+        &mut app,
+        &EngineEvent::ApprovalWithdrawn {
+            id: "human-wait-call".into()
+        }
+    ));
+    assert!(!app.view_stack.contains_kind(ModalKind::Elevation));
+    assert!(reconcile_turn_liveness(&mut app, Instant::now(), false));
+}
+
+#[test]
+fn turn_liveness_scopes_hidden_child_decisions_to_the_current_session() {
+    let id = "agent:child-wait:approval:boot:1";
+    for foreign in [false, true] {
+        let mut app = human_wait_test_app(true);
+        app.current_session_id = Some("current-session".into());
+        app.child_agent_sessions.insert(
+            "child-wait".into(),
+            if foreign {
+                "another-session"
+            } else {
+                "current-session"
+            }
+            .into(),
+        );
+        crate::tui::pending_requests::record(
+            &mut app,
+            id,
+            crate::tui::pending_requests::PendingChildRequest {
+                agent_id: "child-wait".into(),
+                tool_name: "exec_shell".into(),
+                description: "Review child command".into(),
+                input: serde_json::json!({"command":"pwd"}),
+                approval_key: "key".into(),
+                approval_grouping_key: "group".into(),
+                intent_summary: None,
+                requested_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            reconcile_turn_liveness(&mut app, Instant::now(), false),
+            foreign
+        );
+    }
+}
+
+#[test]
+fn human_decision_delivery_gives_work_a_new_window_without_disabling_recovery() {
+    let mut app = human_wait_test_app(true);
+    note_human_decision_delivered(&mut app, "human-wait-call");
+    let activity = app.turn_last_activity_at.expect("reply activity");
+    assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+    assert!(reconcile_turn_liveness(
+        &mut app,
+        activity + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1),
+        false
+    ));
+}
+
+#[test]
+fn human_decision_from_another_session_does_not_refresh_this_turn() {
+    let mut app = human_wait_test_app(true);
+    let before = app.turn_last_activity_at;
+    app.current_session_id = Some("current-session".into());
+    app.child_agent_sessions
+        .insert("child-wait".into(), "another-session".into());
+    note_human_decision_delivered(&mut app, "agent:child-wait:approval:boot:1");
+    assert_eq!(app.turn_last_activity_at, before);
+}
+
+#[test]
+fn ended_parent_turn_retires_approvals_and_elevations_but_keeps_child_requests() {
+    let mut app = human_wait_test_app(true);
+    add_human_wait_approval(&mut app, "parent-card");
+    add_human_wait_approval(&mut app, "agent:child-wait:approval:boot:1");
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(
+                "parent-elevation",
+                "exec_shell",
+                "denied",
+            ),
+            app.ui_locale,
+        ));
+    settle_pending_human_requests(&mut app);
+    assert!(!app.view_stack.contains_approval_id("parent-card"));
+    assert!(!app.view_stack.contains_approval_id("parent-elevation"));
+    assert!(
+        app.view_stack
+            .contains_approval_id("agent:child-wait:approval:boot:1")
+    );
 }

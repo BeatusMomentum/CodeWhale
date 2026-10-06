@@ -540,6 +540,23 @@ enum TuiAuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    /// Sign in to OrcaRouter with OAuth 2.0 + PKCE; run again to switch accounts.
+    #[command(name = "orcarouter")]
+    Orcarouter,
+    /// Revoke the saved OrcaRouter credential. The OrcaRouter console also
+    /// revokes every key it issued to this app in one click.
+    #[command(name = "orcarouter-revoke")]
+    OrcarouterRevoke,
+    /// Sign in to a provider contributed by an enabled, reviewed plugin.
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove credentials for one plugin provider without changing trust.
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
 }
 
 const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
@@ -1961,6 +1978,8 @@ fn run_with_args(options: RuntimeOptions, args: Vec<String>) -> Result<()> {
     let plugin_registry = plugin_registry
         .expect("plugin discovery initialization must precede workspace dotenv loading");
 
+    crate::plugins::providers::install_startup_registry(plugin_registry.clone());
+
     // The interactive runtime intentionally carries a large state machine:
     // terminal rendering, modal dispatch, provider setup, and fleet/workflow
     // events all share one async owner. Debug builds retain enough stack
@@ -2479,6 +2498,36 @@ async fn run_async_main_dispatch(
                 TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::Chatgpt => run_chatgpt_pkce_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::ChatgptRevoke => run_chatgpt_pkce_revoke(cli.config.as_deref()),
+                TuiAuthCommand::Orcarouter => run_orcarouter_pkce_auth(cli.config.as_deref()).await,
+                TuiAuthCommand::OrcarouterRevoke => run_orcarouter_revoke(cli.config.as_deref()),
+                TuiAuthCommand::PluginLogin { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    crate::oauth::plugin_oauth_login(
+                        provider,
+                        entry.base_url.clone().unwrap(),
+                        entry.oauth.clone().unwrap(),
+                        entry.plugin_authority.clone().unwrap(),
+                    )
+                    .await
+                }
+                TuiAuthCommand::PluginLogout { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    let policy = crate::plugins::activation::extension_host_policy_enabled();
+                    tokio::task::spawn_blocking(move || {
+                        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+                        crate::plugins::registry::verify_plugin_component_authority(
+                            entry.plugin_authority.as_ref().unwrap(),
+                            crate::plugins::activation::PluginActivationCapability::Providers,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        crate::oauth::plugin_oauth_logout(
+                            &provider,
+                            entry.base_url.as_deref().unwrap(),
+                            entry.oauth.as_ref().unwrap(),
+                        )
+                    })
+                    .await?
+                }
             },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -9244,6 +9293,23 @@ pub(crate) fn initialize_cloud_facts(config: &Config) {
     }
 }
 
+async fn plugin_auth_entry_from_cli(
+    cli: &Cli,
+    provider: &str,
+) -> Result<crate::config::ProviderConfig> {
+    let path = cli.config.clone();
+    let profile = effective_config_profile(cli);
+    let options = cli.options.clone();
+    let provider = provider.to_owned();
+    let policy = crate::plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+        let config = load_config_with_cli_preferences(path, profile.as_deref(), &options)?;
+        crate::plugins::providers::plugin_auth_entry(&config, &provider)
+    })
+    .await?
+}
+
 fn load_config_from_cli(cli: &Cli) -> Result<Config> {
     load_config_from_cli_with_effective_profile(cli).map(|(config, _)| config)
 }
@@ -9270,7 +9336,7 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
     Ok(config)
 }
 
-/// Select the plugin activation policy (v3, or v4 with the experimental
+/// Select the plugin activation policy (v5, or v6 with the experimental
 /// extension host) and the host's runtime settings, once per process, before
 /// any plugin discovery. Later config reloads never flip either.
 fn install_extension_host_boot_config(config: &Config) {
@@ -9309,21 +9375,31 @@ fn effective_config_profile(cli: &Cli) -> Option<String> {
 
 fn load_config_from_cli_with_effective_profile(cli: &Cli) -> Result<(Config, Option<String>)> {
     let profile = effective_config_profile(cli);
-    let mut config = Config::load(cli.config.clone(), profile.as_deref())?;
+    let config =
+        load_config_with_cli_preferences(cli.config.clone(), profile.as_deref(), &cli.options)?;
+    Ok((config, profile))
+}
+
+fn load_config_with_cli_preferences(
+    path: Option<PathBuf>,
+    profile: Option<&str>,
+    options: &RuntimeOptions,
+) -> Result<Config> {
+    let mut config = Config::load(path, profile)?;
     // Config loading is shared by diagnostics and mutating runtimes. Read the
     // saved preference without migrating or creating state here; interactive
     // startup performs any permitted migration later through `Settings::load`.
     if let Ok(settings) = crate::settings::Settings::load_read_only() {
         apply_saved_reasoning_preference(&mut config, &settings);
     }
-    cli.options.apply_features(&mut config)?;
+    options.apply_features(&mut config)?;
     install_extension_host_boot_config(&config);
     // Install the foreign-instruction opt-in before anything can load project
     // context. This is the single funnel every runtime goes through — TUI,
     // exec, ACP, and the app-server passthrough all resolve config here — so
     // the loader never has to be handed the setting at each of its call sites.
     install_foreign_instruction_imports(&config);
-    Ok((config, profile))
+    Ok(config)
 }
 
 /// Apply the selected v2 Fleet's operator to a fresh root session.
@@ -9522,6 +9598,62 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
 fn run_chatgpt_pkce_revoke(config_path: Option<&Path>) -> Result<()> {
     crate::oauth::revoke_owned_login(crate::oauth::OAuthProvider::Chatgpt, config_path, None)?;
     println!("Removed Codewhale's saved ChatGPT sign-in.");
+    Ok(())
+}
+
+/// OrcaRouter account sign-in: OAuth 2.0 + PKCE on a loopback redirect,
+/// exchanged for a durable `sk-orca-...` key.
+///
+/// This is the "OrcaRouter - Auth" entry point. It never replaces the
+/// API-key path (`codewhale auth set --provider orcarouter`); both land in the
+/// same credential slot and are independently usable.
+async fn run_orcarouter_pkce_auth(config_path: Option<&Path>) -> Result<()> {
+    let inputs = crate::oauth::OrcaLoginInputs::from_env();
+    if inputs.auth_base == crate::oauth::ORCAROUTER_AUTH_BASE
+        && std::env::var_os("ORCA_AUTH_BASE_URL").is_none()
+    {
+        println!(
+            "Signing in to OrcaRouter at {} (consent is granted on the OrcaRouter site).",
+            crate::oauth::ORCAROUTER_AUTH_BASE
+        );
+    }
+    let api_base = inputs.api_base.clone();
+    if api_base != crate::oauth::ORCAROUTER_API_BASE {
+        println!("OrcaRouter inference and model discovery will use {api_base}.");
+    }
+    let mut challenge = crate::oauth::cli_challenge_writer()?;
+    let credential = tokio::task::spawn_blocking(move || {
+        crate::oauth::orcarouter_pkce_login(&inputs, challenge.as_mut())
+    })
+    .await
+    .context("OrcaRouter PKCE login worker failed")??;
+    let saved = crate::oauth::activate_orcarouter_credential(&credential, config_path)?;
+    println!(
+        "OrcaRouter is ready; stored the key in {}",
+        saved.describe()
+    );
+    if !credential.scope_satisfies_purpose() {
+        println!(
+            "Note: OrcaRouter granted scope \"{}\"; this client asked for \"{}\". The narrower grant is reused as-is.",
+            credential.granted_scope(),
+            crate::oauth::ORCAROUTER_SCOPE
+        );
+    }
+    println!(
+        "Revoke access any time at https://www.orcarouter.ai/console/authorized-apps. To switch accounts, run `codewhale auth orcarouter` again."
+    );
+    Ok(())
+}
+
+/// Clear the saved OrcaRouter credential from the secret store and config.
+fn run_orcarouter_revoke(config_path: Option<&Path>) -> Result<()> {
+    let mut store = codewhale_config::ConfigStore::load(config_path.map(Path::to_path_buf))?;
+    let Some(secrets) = crate::config::credential_secret_store() else {
+        anyhow::bail!("no credential store is available in this environment");
+    };
+    let provider = codewhale_config::ProviderKind::Orcarouter;
+    codewhale_config::credentials::clear_provider_api_key(&mut store, &secrets, provider)?;
+    println!("Removed Codewhale's saved OrcaRouter credential.");
     Ok(())
 }
 

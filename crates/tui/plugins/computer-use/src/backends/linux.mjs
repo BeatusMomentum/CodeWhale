@@ -563,8 +563,16 @@ print(json.dumps({"found": True, "reason": None, "element": {
       const src = lastRaster?.file;
       if (!src) throw new ExecError("no screenshot taken yet on this computer — call screenshot first");
       const out = outputPath(explicitOut ?? path.join(recordingsDir(), `zoom-${crypto.randomBytes(4).toString("hex")}.png`));
-      await runOk("ffmpeg", ["-y", "-loglevel", "error", "-i", src, "-vf", `crop=${Math.round(region[2])}:${Math.round(region[3])}:${Math.round(region[0])}:${Math.round(region[1])}`, out], { timeoutMs: 20_000 });
-      return { file: out, bytes: fs.statSync(out).size, region, source: src };
+      const cropped = await run("ffmpeg", ["-y", "-loglevel", "error", "-i", src, "-vf", `crop=${Math.round(region[2])}:${Math.round(region[3])}:${Math.round(region[0])}:${Math.round(region[1])}`, out], { timeoutMs: 20_000 });
+      if (cropped.aborted) throw Object.assign(new ExecError("computer request cancelled", cropped), { code: "cancelled" });
+      if (cropped.timedOut) throw new ExecError("timeout after 20000ms: ffmpeg", cropped);
+      if (cropped.code !== 0) throw new ExecError(`ffmpeg exited ${cropped.code}: ${(cropped.stderr || cropped.stdout || "").trim().slice(0, 300)}`, cropped);
+      const parent = lastRaster;
+      const [x, y, w, h] = region.map(Math.round);
+      lastRaster = { file: out, bytes: fs.statSync(out).size, region, source: src,
+        points: { x: (parent.points?.x ?? 0) + x / parent.scale, y: (parent.points?.y ?? 0) + y / parent.scale, w: w / parent.scale, h: h / parent.scale },
+        pixels: { w, h }, scale: parent.scale, capturedAt: new Date().toISOString() };
+      return { ...lastRaster };
     },
     left_click: ({ target, strategy }) => { assertNum(target.x, "x"); assertNum(target.y, "y"); assertEventStrategy(strategy); return inputChain(target.x, target.y, () => clickButton(1, 1)); },
     double_click: ({ target }) => inputChain(target.x, target.y, () => clickButton(1, 2)),

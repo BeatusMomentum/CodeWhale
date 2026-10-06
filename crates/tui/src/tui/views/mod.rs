@@ -929,6 +929,10 @@ pub enum ViewEvent {
     ProviderPickerXaiOAuthRequested,
     /// Emitted by provider/setup UI when native ChatGPT PKCE sign-in is requested.
     ProviderPickerChatgptOAuthRequested,
+    /// Emitted by provider/setup UI when OrcaRouter OAuth 2.0 + PKCE sign-in is
+    /// requested. The picker only emits this after the user chose "Connect with
+    /// OrcaRouter" from the two-option OrcaRouter auth screen.
+    ProviderPickerOrcarouterOAuthRequested,
     /// Emitted only after the picker showed owner, exact path, and the full
     /// read-only side-effect contract and the user explicitly confirmed it.
     ProviderPickerExternalConsentConfirmed {
@@ -1330,6 +1334,13 @@ impl ViewStack {
         self.views
             .iter()
             .any(|view| view.approval_request_id() == Some(id))
+    }
+
+    pub fn approval_request_ids(&self) -> Vec<String> {
+        self.views
+            .iter()
+            .filter_map(|view| view.approval_request_id().map(str::to_owned))
+            .collect()
     }
 
     /// The approval id of the top view, when it is an approval card.

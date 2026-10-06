@@ -242,11 +242,12 @@ test("zoom binds a child raster that keeps parent scale and shifted origin", asy
 });
 
 test("screenshot and zoom never forward a caller-named source file", async () => {
-  await tool("screenshot", { source: "/etc/hosts" });
+  const shot = await tool("screenshot", { source: "/etc/hosts" });
   assert.equal(Object.hasOwn(calls("screenshot").at(-1).args, "source"), false);
   const z = await tool("zoom", { region: [0, 0, 10, 10], source: "/etc/hosts" });
   assert.equal(z.ok, true, JSON.stringify(z.error));
-  assert.equal(Object.hasOwn(calls("zoom").at(-1).args, "source"), false);
+  assert.equal(calls("zoom").at(-1).args.source, shot.file, "only the server-bound capture is forwarded");
+  assert.notEqual(calls("zoom").at(-1).args.source, "/etc/hosts");
 });
 
 test("zoom without a bound raster fails with no_raster", async () => {

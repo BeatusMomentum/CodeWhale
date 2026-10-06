@@ -39,9 +39,9 @@ async fn await_user_input_acceptance(
             .send(decision)
             .await
             .map_err(|_| anyhow::anyhow!("Engine is not accepting user input"))?;
-        Ok::<_, anyhow::Error>((&mut accepted).await.map_err(|_| {
+        (&mut accepted).await.map_err(|_| {
             anyhow::anyhow!("Engine ended the user input request before accepting this decision")
-        })?)
+        })
     })
     .await;
     let accepted = match delivery {

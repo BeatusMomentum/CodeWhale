@@ -39,6 +39,12 @@ notes, and relevant issue/PR comments.
 
 **Merged or adapted contributions**
 
+- **[gaord](https://github.com/gaord)** — exposed call-specific workspace changes to Runtime clients ([#6817](https://github.com/codewhale-hq/Codewhale/pull/6817)) and canonical skill-detail/review routes ([#6869](https://github.com/codewhale-hq/Codewhale/pull/6869)).
+- **[asto18089](https://github.com/asto18089)** — fixed preferred search-language selection ([#6860](https://github.com/codewhale-hq/Codewhale/pull/6860)), image metadata for model input ([#6858](https://github.com/codewhale-hq/Codewhale/pull/6858)), automation deletion wording and retained-run cleanup ([#6864](https://github.com/codewhale-hq/Codewhale/pull/6864)), and compaction-anchor regression coverage ([#6857](https://github.com/codewhale-hq/Codewhale/pull/6857)).
+- **[aboimpinto](https://github.com/aboimpinto)** — extracted portable config/status/permission command contracts while preserving host-owned mutation and queue-worker readiness ([#6832](https://github.com/codewhale-hq/Codewhale/pull/6832)).
+- **[hodeswildsmith455-boop](https://github.com/hodeswildsmith455-boop)** — added OrcaRouter account sign-in with PKCE and its live chat catalog ([#6867](https://github.com/codewhale-hq/Codewhale/pull/6867)).
+- **[LIghtJUNction](https://github.com/LIghtJUNction)** — added reviewed plugin-provided AI routes with host-owned OAuth PKCE credentials and request-time authority checks ([#6805](https://github.com/codewhale-hq/Codewhale/pull/6805)).
+- **[AdityaVG13](https://github.com/AdityaVG13)** — supplied the discovery-cache priority correction adapted from [#6393](https://github.com/codewhale-hq/Codewhale/pull/6393); highest-ranked tools survive cache overflow. The broader echo and fork-inheritance draft remains open.
 - **[Guan0923](https://github.com/Guan0923)** — accepted case-insensitive HTTP(S) schemes in `config doctor` without rewriting the configured URL ([#6819](https://github.com/codewhale-hq/Codewhale/pull/6819)).
 - **[harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host descriptor, with its billing basis recorded as unreviewed rather than guessed ([#6408](https://github.com/codewhale-hq/Codewhale/pull/6408)).
 - **[asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving the original contributor commits ([#6799](https://github.com/codewhale-hq/Codewhale/pull/6799)).
@@ -56,6 +62,7 @@ notes, and relevant issue/PR comments.
 
 **Reports and reproductions**
 
+- **[7jrxt42BxFZo4iAnN4CX](https://github.com/7jrxt42BxFZo4iAnN4CX)** — reported indefinite human questions being cancelled by the TUI hung-tool watchdog and supplied the timer evidence ([#6872](https://github.com/codewhale-hq/Codewhale/issues/6872)).
 - **[cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/codewhale-hq/Codewhale/issues/6695)).
 - **[BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/codewhale-hq/Codewhale/issues/6616)); the report also surfaced that no bundled descriptor's links reached the setup form.
 - **[jayanthvee](https://github.com/jayanthvee)** — reported and diagnosed that killing the npm launcher's `node.exe` ends Windows sessions without cleanup, with reproductions and fix directions ([#6827](https://github.com/codewhale-hq/Codewhale/issues/6827)).

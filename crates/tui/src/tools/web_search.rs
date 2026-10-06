@@ -3370,7 +3370,8 @@ fn is_plausible_locale_tag(tag: &str) -> bool {
     }
     let mut subtags = tag.split(['-', '_']);
     let primary = subtags.next().unwrap_or_default();
-    if primary.is_empty() || !primary.chars().all(|c| c.is_ascii_alphabetic()) {
+    if primary.is_empty() || primary.len() > 8 || !primary.chars().all(|c| c.is_ascii_alphabetic())
+    {
         return false;
     }
     subtags.all(|subtag| {
@@ -4985,6 +4986,19 @@ mod tests {
         );
         // The Han fallback is untouched by the shape check.
         assert_eq!(scrape_market(None, "凹语言 编程").as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn oversized_primary_locale_is_ignored_even_with_han_fallback() {
+        let locale = Some("abcdefghij-US");
+        assert_eq!(scrape_market(locale, "rust async"), None);
+        assert!(bing_locale_was_ignored(locale));
+        assert!(ddg_locale_was_ignored(locale, None));
+
+        // A query-derived market must not hide the invalid explicit knob.
+        let market = scrape_market(locale, "中国 的 首都");
+        assert_eq!(market.as_deref(), Some("zh-CN"));
+        assert!(ddg_locale_was_ignored(locale, market.as_deref()));
     }
 
     #[test]

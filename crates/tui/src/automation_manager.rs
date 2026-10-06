@@ -1438,10 +1438,10 @@ impl AutomationManager {
                 );
             }
 
-            // Archive before removing the live paths: `write_json_atomic`
-            // lands each record in the archive first, so a crash mid-delete
-            // leaves the history intact (the leftover live copy is invisible
-            // once the automation is gone and is dropped with the live tree).
+            // Archive before removing live receipts, and remove the
+            // definition last. A crash or cleanup failure leaves the
+            // definition available to retry; retained archive copies survive
+            // even when some live receipts have already been removed.
             let terminal: Vec<AutomationRunRecord> = runs
                 .into_iter()
                 .filter(|run| {
@@ -1458,9 +1458,6 @@ impl AutomationManager {
             }
             self.enforce_archive_retention(id)?;
 
-            let path = self.automation_path(id)?;
-            fs::remove_file(&path)
-                .with_context(|| format!("Failed to delete automation {}", path.display()))?;
             for run in &terminal {
                 self.delete_run(run)?;
             }
@@ -1473,6 +1470,9 @@ impl AutomationManager {
                     )
                 })?;
             }
+            let path = self.automation_path(id)?;
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete automation {}", path.display()))?;
             Ok(existing)
         })
     }
@@ -4371,6 +4371,7 @@ mod tests {
         let settled = AutomationRunRecord {
             id: Uuid::new_v4().to_string(),
             status: AutomationRunStatus::Completed,
+            created_at: run.created_at - Duration::minutes(1),
             ended_at: Some(Utc::now() - Duration::minutes(1)),
             ..run.clone()
         };
@@ -4410,9 +4411,41 @@ mod tests {
         settled_run.started_at = Some(Utc::now());
         settled_run.ended_at = Some(Utc::now());
         manager.save_run(&settled_run).expect("settle run");
+
+        // A sortable record shadows its legacy path while listing. Make the
+        // older receipt's legacy path a directory so live cleanup fails only
+        // after both records are archived and the newer receipt is removed.
+        let blocked_legacy = manager
+            .legacy_run_path(&created.id, &settled.id)
+            .expect("legacy path");
+        fs::create_dir(&blocked_legacy).expect("block legacy cleanup");
+        let failed = manager
+            .delete_automation(&created.id)
+            .expect_err("live cleanup must fail");
+        assert!(failed.to_string().contains("Failed to delete run"));
+        assert!(
+            manager.get_automation(&created.id).is_ok(),
+            "the definition must survive partial cleanup so deletion can retry"
+        );
+        assert!(
+            !manager
+                .run_path(&settled_run)
+                .expect("newer run path")
+                .exists(),
+            "a newer receipt was already removed before the failure"
+        );
+        assert_eq!(
+            manager
+                .list_archived_runs(&created.id)
+                .expect("partial archive")
+                .len(),
+            2,
+            "both terminal records reached the archive before any live removal"
+        );
+        fs::remove_dir(&blocked_legacy).expect("unblock cleanup");
         manager
             .delete_automation(&created.id)
-            .expect("delete automation");
+            .expect("retry deletion after partial cleanup");
 
         assert!(manager.get_automation(&created.id).is_err());
         assert!(

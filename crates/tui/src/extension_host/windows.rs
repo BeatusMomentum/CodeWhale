@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{GRANT_ACCESS, REVOKE_ACCESS};
 use windows_sys::Win32::Security::Isolation::{
@@ -30,8 +30,9 @@ use windows_sys::Win32::Security::Isolation::{
 use windows_sys::Win32::Security::{
     ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, GetTokenInformation,
     OBJECT_INHERIT_ACE, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-    TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_QUERY, TokenAppContainerSid,
-    TokenCapabilities, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer,
+    TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_STATISTICS,
+    TokenAppContainerSid, TokenCapabilities, TokenIsAppContainer,
+    TokenIsLessPrivilegedAppContainer, TokenStatistics,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
@@ -40,12 +41,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_WAIT};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ReleaseMutex, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
@@ -63,9 +64,83 @@ const MAX_GRANT_ENTRIES: usize = 65_536;
 const MAX_GRANT_SCOPES: usize = 1024;
 /// Empty Bun config in the granted runtime-copy directory (see sandbox_args).
 const EMPTY_BUN_CONFIG: &str = "empty-bunfig.toml";
-// Serialize Core's read/merge/write ACL operations across old-profile cleanup
-// and a new host admission. Never overwrite a concurrently admitted profile.
-static ACL_EDITS: Mutex<()> = Mutex::new(());
+const ACL_EDIT_WAIT_MS: u32 = 30_000;
+
+// A kernel mutex covers admission and retirement in every Core process in
+// this Windows logon/session. A process-local mutex cannot protect the shared
+// host home's read/merge/write DACL transactions from another Core process.
+struct AclEditGuard {
+    mutex: OwnedHandle,
+    // Windows mutex ownership belongs to the acquiring thread.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl AclEditGuard {
+    fn acquire() -> io::Result<Self> {
+        let mut token = null_mut();
+        // SAFETY: the process pseudo-handle is valid and token is an out pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut statistics = TOKEN_STATISTICS::default();
+        let mut read = 0;
+        // SAFETY: the aligned SDK struct and size match this fixed token query.
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenStatistics,
+                (&mut statistics as *mut TOKEN_STATISTICS).cast(),
+                size_of::<TOKEN_STATISTICS>() as u32,
+                &mut read,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if read != size_of::<TOKEN_STATISTICS>() as u32 {
+            return Err(io::Error::other("invalid ACL lock logon identity"));
+        }
+        let logon = statistics.AuthenticationId;
+        let name = wide(OsStr::new(&format!(
+            r"Local\Codewhale.Native.AclEdits.{:08x}{:08x}",
+            logon.HighPart, logon.LowPart,
+        )))?;
+        // Default creator DACL, non-inheritable handle: never add a Native
+        // profile or AppContainer-group grant to Core's synchronization.
+        let mutex = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+        if mutex.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mutex = unsafe { OwnedHandle::from_raw_handle(mutex) };
+        match unsafe { WaitForSingleObject(mutex.as_raw_handle(), ACL_EDIT_WAIT_MS) } {
+            // Abandonment also acquires ownership. No cached transaction state
+            // is trusted: callers pin each object and reread/validate its actual
+            // kernel DACL before editing, including after a prior owner crashed.
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self {
+                mutex,
+                _thread_bound: std::marker::PhantomData,
+            }),
+            WAIT_TIMEOUT => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Native ACL edit lock timed out",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+impl Drop for AclEditGuard {
+    fn drop(&mut self) {
+        // SAFETY: this thread acquired the mutex and the handle is still owned.
+        if unsafe { ReleaseMutex(self.mutex.as_raw_handle()) } == 0 {
+            tracing::warn!(
+                "Native ACL edit lock release failed: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct NativeSandbox {
@@ -234,7 +309,7 @@ impl Drop for RetiredProfile {
 }
 
 fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
-    let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+    let _serial = AclEditGuard::acquire()?;
     if !root.try_exists()? {
         return Ok(());
     }
@@ -472,7 +547,7 @@ impl NativeSandbox {
     }
 
     fn grant_tree(&self, root: &Path, writable: bool) -> io::Result<()> {
-        let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+        let _serial = AclEditGuard::acquire()?;
         let root_pin = WindowsDirectory::open_acl(root)?;
         self.profile
             .remember(root, root_pin.acl_handle()?, GrantKind::Tree)?;
@@ -529,7 +604,7 @@ impl NativeSandbox {
     /// Read/list/traverse on exactly one directory object. Not inherited:
     /// each child keeps only the grants it is given explicitly.
     fn grant_directory(&self, directory: &Path) -> io::Result<()> {
-        let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+        let _serial = AclEditGuard::acquire()?;
         let pin = WindowsDirectory::open_acl(directory)?;
         self.profile
             .remember(directory, pin.acl_handle()?, GrantKind::Directory)?;
@@ -542,7 +617,7 @@ impl NativeSandbox {
     }
 
     fn grant_file(&self, path: &Path, access: u32, remember: bool) -> io::Result<()> {
-        let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+        let _serial = AclEditGuard::acquire()?;
         let pin = WindowsDirectory::open(
             path.parent()
                 .ok_or_else(|| io::Error::other("file has no parent"))?,
@@ -550,7 +625,7 @@ impl NativeSandbox {
         self.grant_pinned_file(&pin, path, access, remember)
     }
 
-    // The owning grant entrypoint holds ACL_EDITS. Tree files reuse the parent
+    // The owning grant entrypoint holds AclEditGuard. Tree files reuse the parent
     // chain rather than reopen pinned directory objects. The
     // child_path comparison is only a lexical invariant; the protection is the
     // held no-write/no-delete parent chain plus acl_file's no-follow,
@@ -1212,7 +1287,7 @@ fn edit_acl(
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
     };
-    // The owning grant/retirement entrypoint holds ACL_EDITS while opening
+    // The owning grant/retirement entrypoint holds AclEditGuard while opening
     // and editing its exact objects, including all shared pinned ancestors.
     let grant = mode == GRANT_ACCESS;
     if !grant && mode != REVOKE_ACCESS {

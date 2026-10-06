@@ -80,6 +80,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("mcp.json"),
     bundle_file!("commands/computer.md"),
     bundle_file!("skills/computer-use/SKILL.md"),
+    bundle_file!("skills/computer-use/references/operating-details.md"),
     bundle_file!("skills/computer-use/references/quick-reference.md"),
     bundle_file!("skills/computer-use/references/refusal-codes.md"),
     bundle_file!("skills/recording/SKILL.md"),
