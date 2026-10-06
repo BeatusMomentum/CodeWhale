@@ -1194,7 +1194,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   timeout_seconds = 300
   ```
 
-- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 只在 `prefer_bwrap = true` 且 `/usr/bin/bwrap` 可执行时使用 bubblewrap；没有这一选择加入时，它会报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
+- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 默认在 `/usr/bin/bwrap` 已安装且探测证明它能限制子进程时使用 bubblewrap；`prefer_bwrap = false` 退出并报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
 - 模式准入、hooks、已注册工具的要求、类型化规则、Auto-Review、仓库保护规则、人工审批和执行沙箱之间的跨层关系，定义在[授权顺序](../AUTHORIZATION_ORDER.md)中。
 - **读取拒绝列表。** 每一种沙箱档位——包括 `read-only`——都授予对整个文件系统的读取权限；这些档位的区别在于它们可以*写入*什么，以及能否访问网络。读取拒绝列表会收窄这一点：
   - `sandbox_read_denylist_defaults`（bool，默认 `true`）：应用内置的凭据存储集合——`~/.ssh`、`~/.gnupg`、云凭据目录（`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube` 等）、`~/.netrc`、`~/.npmrc`、`~/.git-credentials`、macOS 钥匙串、浏览器配置文件、Codewhale 自己的机密存储，以及 `.env` 文件（但不包括 `.env.example` 之类）。普通源码、`Cargo.toml`、`~/.gitconfig`、`~/.cargo` 和 `~/.npm` 保持可读，因此构建和测试仍能工作。设为 `false` 可恢复 0.9.12 之前的整盘读取行为。

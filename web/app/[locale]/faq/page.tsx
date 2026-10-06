@@ -257,7 +257,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         provider you select receives the prompt, project context, tool definitions,
         and tool results required for that turn. Use a loopback local-model route to
         keep model inference local.
-        OS command sandboxing is platform-specific: Codewhale uses <strong>Seatbelt</strong> on macOS when available. On Linux it uses <strong>bubblewrap</strong> only when <code className="inline">prefer_bwrap = true</code> and <code className="inline">/usr/bin/bwrap</code> is executable; otherwise commands have no Codewhale OS wrapper. Windows currently reports no OS sandbox.
+        OS command sandboxing is platform-specific: Codewhale uses <strong>Seatbelt</strong> on macOS when available. On Linux it uses <strong>bubblewrap</strong> by default whenever <code className="inline">/usr/bin/bwrap</code> is installed and a probe shows it works; <code className="inline">prefer_bwrap = false</code> opts out. Otherwise commands have no Codewhale OS wrapper. Windows currently reports no OS sandbox.
         Workspace boundaries default to <code className="inline">--workspace</code>. <code className="inline">/trust</code> lifts them.
         Permission posture is configurable per session.
       </>
@@ -618,7 +618,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         可用 <code className="inline">codewhale config set telemetry false</code> 或
         <code className="inline">CODEWHALE_TELEMETRY=0</code> 关闭）。也不要求经过托管中继。你选择的托管 provider 会收到本轮所需的
         prompt、项目上下文、工具定义与工具结果。若要让模型推理也保持本地，请使用回环地址上的本地模型路由。
-        OS 命令沙箱因平台而异：macOS 在可用时使用 <strong>Seatbelt</strong>。Linux 仅在 <code className="inline">prefer_bwrap = true</code> 且 <code className="inline">/usr/bin/bwrap</code> 可执行时使用 <strong>bubblewrap</strong>；否则命令没有 Codewhale OS 包装器。Windows 当前报告无 OS 沙箱。
+        OS 命令沙箱因平台而异：macOS 在可用时使用 <strong>Seatbelt</strong>。Linux 默认在 <code className="inline">/usr/bin/bwrap</code> 已安装且探测可用时使用 <strong>bubblewrap</strong>；<code className="inline">prefer_bwrap = false</code> 退出。否则命令没有 Codewhale OS 包装器。Windows 当前报告无 OS 沙箱。
         工作区边界默认为 <code className="inline">--workspace</code>。<code className="inline">/trust</code> 可解除边界。
         权限姿态可按会话配置。
       </>

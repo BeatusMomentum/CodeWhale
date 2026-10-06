@@ -1780,8 +1780,9 @@ pub struct App {
     pub configured_sandbox_network: Option<bool>,
     /// The sandbox backend this platform+config can actually enforce with,
     /// resolved once at startup. `None` means there is NO enforcement
-    /// available (default Linux without `prefer_bwrap`, and all Windows), so
-    /// surfaces must not claim the session is sandboxed (2026-08-04 audit).
+    /// available (Linux with `prefer_bwrap = false` or no working bwrap, and
+    /// all Windows), so surfaces must not claim the session is sandboxed
+    /// (2026-08-04 audit).
     pub sandbox_backend: Option<crate::sandbox::SandboxType>,
     /// Off-event-loop worker for durable Lane control writes. `/lane interrupt`
     /// submits here instead of tearing down a Runtime on the composer thread

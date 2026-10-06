@@ -277,7 +277,7 @@ owner = "crates/execpolicy/src/approval_mode.rs"
 [[feature]]
 id = "sandbox"
 name = "Command sandbox"
-summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is opt-in."
+summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is on by default once installed and verified."
 status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/SANDBOX.md"

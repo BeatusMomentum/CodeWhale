@@ -1039,7 +1039,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             || config.subagent_heartbeat_timeout_secs(),
             |identity| config.subagent_heartbeat_timeout_secs_for_provider(identity),
         )),
-        prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
+        prefer_bwrap: config.prefers_bwrap(),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: config.bwrap_ro_roots.clone(),
             device_roots: config.bwrap_dev_roots.clone(),

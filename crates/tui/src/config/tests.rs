@@ -2685,6 +2685,25 @@ fn legacy_prefer_bwrap_env_remains_a_compatible_alias() {
     assert_eq!(config.prefer_bwrap, Some(true));
 }
 
+#[test]
+fn prefers_bwrap_defaults_on_and_honors_explicit_opt_out() {
+    assert!(Config::default().prefers_bwrap());
+    assert!(
+        Config {
+            prefer_bwrap: Some(true),
+            ..Config::default()
+        }
+        .prefers_bwrap()
+    );
+    assert!(
+        !Config {
+            prefer_bwrap: Some(false),
+            ..Config::default()
+        }
+        .prefers_bwrap()
+    );
+}
+
 struct EnvGuard {
     // Seal path overrides through EnvVarGuard so default_config_path honors
     // this fixture instead of the isolated test root (#5355, #5359).

@@ -2349,10 +2349,14 @@ pub struct Config {
     /// Optional API key for the external sandbox backend (sent as Bearer token).
     #[serde(alias = "sandboxApiKey")]
     pub sandbox_api_key: Option<String>,
-    /// When true and `/usr/bin/bwrap` is executable on Linux, route exec_shell
-    /// through bubblewrap (#2184).
-    /// Defaults to false. Requires the `bubblewrap` package to be installed
-    /// separately — we do NOT vendor bwrap.
+    /// When true and bubblewrap actually works on this Linux host, route
+    /// sandboxed exec_shell commands through it (#2184).
+    /// Defaults to true — an unset key means sandboxed commands run under
+    /// bwrap whenever `/usr/bin/bwrap` is installed and can create its
+    /// namespaces. An explicit `prefer_bwrap = false` opts out and leaves
+    /// Linux commands unwrapped (the posture then reports policy-only).
+    /// Requires the `bubblewrap` package to be installed separately — we do
+    /// NOT vendor bwrap.
     #[serde(alias = "preferBwrap")]
     pub prefer_bwrap: Option<bool>,
     /// Additional host paths to bind read-only inside the bubblewrap sandbox
@@ -3683,6 +3687,17 @@ impl Config {
     #[must_use]
     pub fn effective_sandbox_denied_read_paths(&self) -> Vec<std::path::PathBuf> {
         self.read_denylist().subtree_paths()
+    }
+
+    /// Whether Linux shell commands prefer bubblewrap confinement.
+    ///
+    /// On by default: an unset `prefer_bwrap` means sandboxed commands use
+    /// the OS wrapper whenever `/usr/bin/bwrap` works on this host, matching
+    /// the Seatbelt behavior macOS already has. An explicit `false` opts out
+    /// and leaves Linux commands unwrapped.
+    #[must_use]
+    pub fn prefers_bwrap(&self) -> bool {
+        self.prefer_bwrap.unwrap_or(true)
     }
 
     #[must_use]

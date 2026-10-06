@@ -662,7 +662,8 @@ impl Default for EngineConfig {
             user_input_limits: crate::tools::user_input::UserInputLimits::default(),
             user_input_timeout: None,
             goal_max_steps: None,
-            prefer_bwrap: false,
+            // Mirrors `Config::prefers_bwrap`: on unless explicitly opted out.
+            prefer_bwrap: true,
             bwrap_extensions: crate::sandbox::BwrapMountExtensions::default(),
             // Fail-closed (F7): `Engine::new` unconditionally installs this
             // list process-wide via `read_guard::set_active`, so a default
