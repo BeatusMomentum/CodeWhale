@@ -2420,7 +2420,7 @@ fn run() -> Result<()> {
                 args.no_open,
                 args.timeout_seconds,
                 cli.profile.as_deref(),
-                &store,
+                &mut store,
             )
         }
         Some(Commands::Logout(args)) => {
@@ -2477,7 +2477,7 @@ fn run() -> Result<()> {
         },
         Some(Commands::Account(args)) => {
             cloud::reject_inline_api_key(cli.api_key.as_deref())?;
-            cloud::run(args, cli.profile.as_deref(), &store)
+            cloud::run(args, cli.profile.as_deref(), &mut store)
         }
         Some(Commands::Dispatch(args)) => dispatch::run(args),
         Some(Commands::McpServer) => {

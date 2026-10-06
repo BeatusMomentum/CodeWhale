@@ -2267,7 +2267,7 @@ enum KeyReadMode {
     HiddenPrompt(String),
 }
 
-pub(crate) fn run(args: CloudArgs, profile: Option<&str>, config: &ConfigStore) -> Result<()> {
+pub(crate) fn run(args: CloudArgs, profile: Option<&str>, config: &mut ConfigStore) -> Result<()> {
     let machine = machine::MachineKeyEnv::from_process_env();
     let requested_base = machine::resolve_api_base(
         args.api_base.as_deref(),
@@ -2324,7 +2324,7 @@ pub(crate) fn run_account_login(
     no_open: bool,
     timeout_seconds: u64,
     profile: Option<&str>,
-    config: &ConfigStore,
+    config: &mut ConfigStore,
 ) -> Result<()> {
     run(
         CloudArgs {
@@ -2348,12 +2348,34 @@ pub(crate) fn reject_inline_api_key(api_key: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// On account sign-in, point a never-configured local route at the managed
+/// Codewhale provider so chat works immediately. A provider the user chose
+/// explicitly is left alone.
+fn select_managed_route_on_login<W: Write>(config: &mut ConfigStore, out: &mut W) -> Result<()> {
+    if config.config.provider == ProviderKind::default() {
+        config.config.provider = ProviderKind::Codewhale;
+        config.config.model = Some("auto".to_string());
+        config.save()?;
+        writeln!(
+            out,
+            "Using your Codewhale account route (provider codewhale, model auto)."
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Keeping your configured {} route.",
+            config.config.provider.as_str()
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_with<T: CloudTransport, W: Write>(
     command: CloudCommand,
     profile: &str,
     api_base: &str,
-    config: &ConfigStore,
+    config: &mut ConfigStore,
     cloud_secrets: &Secrets,
     provider_secrets: &Secrets,
     machine: &machine::MachineKeyEnv,
@@ -2394,6 +2416,7 @@ fn run_with<T: CloudTransport, W: Write>(
                 client.poll_device(&device, Duration::from_secs(login.timeout_seconds), sleeper)?;
             let user = client.me()?;
             write_account(out, "Signed in to Codewhale.", profile, api_base, &user)?;
+            select_managed_route_on_login(config, out)?;
             Ok(())
         }
         CloudCommand::Status => match client.load_auth()? {
