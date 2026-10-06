@@ -803,6 +803,7 @@
   "ClearConversation": "会話履歴をクリアしました",
   "ClearConversationBusy": "何もクリアされませんでした（Work 状態またはランタイム処理が実行中です。待ってから /clear を再実行してください）",
   "ModelChanged": "モデルは {new} になりました（以前は {old}）。",
+  "ModelChangedSessionNote": "（このセッションのみ — /fleet save でこのチームを更新、/fleet save-as で新しいチームとして保存、/model save-default で起動時の既定として保存）",
   "LinksProjectTitle": "Codewhale とコミュニティ：",
   "LinksDocumentation": "ドキュメント：",
   "LinksCommunity": "コミュニティとコントリビューション：",

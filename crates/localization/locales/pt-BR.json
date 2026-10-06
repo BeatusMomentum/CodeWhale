@@ -803,6 +803,7 @@
   "ClearConversation": "Conversa limpa",
   "ClearConversationBusy": "Nada foi limpo (estado de Trabalho ou execução ativa ocupada; aguarde e tente /clear novamente)",
   "ModelChanged": "O modelo agora é {new} (antes {old}).",
+  "ModelChangedSessionNote": " (só nesta sessão — /fleet save atualiza esta equipe, /fleet save-as salva uma nova equipe, /model save-default salva como padrão de inicialização)",
   "LinksProjectTitle": "Codewhale e comunidade:",
   "LinksDocumentation": "Documentação:",
   "LinksCommunity": "Comunidade e contribuição:",

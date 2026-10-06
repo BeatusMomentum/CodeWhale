@@ -304,9 +304,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
                 .replace("{new}", "auto");
-            message.push_str(
-                " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-            );
+            message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
             return CommandResult::with_message_and_action(
                 message,
                 AppAction::UpdateCompaction(app.compaction_config()),
@@ -420,9 +418,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
             .replace("{new}", &model_id);
-        message.push_str(
-            " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
-        );
+        message.push_str(&tr(app.ui_locale, MessageId::ModelChangedSessionNote));
         CommandResult::with_message_and_action(
             message,
             AppAction::UpdateCompaction(app.compaction_config()),

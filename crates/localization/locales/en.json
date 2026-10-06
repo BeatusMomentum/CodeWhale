@@ -803,6 +803,7 @@
   "ClearConversation": "Conversation cleared",
   "ClearConversationBusy": "Nothing cleared — still busy. Try /clear again in a moment.",
   "ModelChanged": "Model is now {new} (was {old}).",
+  "ModelChangedSessionNote": " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
   "LinksProjectTitle": "Codewhale & community:",
   "LinksDocumentation": "Documentation:",
   "LinksCommunity": "Community & contribution:",

@@ -803,6 +803,7 @@
   "ClearConversation": "대화가 지워졌습니다",
   "ClearConversationBusy": "지우지 못했습니다 (작업 상태 또는 런타임 작업이 진행 중입니다. 잠시 후 /clear를 다시 시도하세요)",
   "ModelChanged": "모델이 이제 {new}입니다(이전: {old}).",
+  "ModelChangedSessionNote": " (이번 세션에만 적용 — /fleet save는 이 팀을 업데이트하고, /fleet save-as는 새 팀으로 저장하며, /model save-default는 시작 기본값으로 저장합니다)",
   "LinksProjectTitle": "Codewhale 및 커뮤니티:",
   "LinksDocumentation": "문서:",
   "LinksCommunity": "커뮤니티 및 기여:",

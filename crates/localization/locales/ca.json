@@ -786,6 +786,7 @@
   "ClearConversation": "Conversació esborrada",
   "ClearConversationBusy": "No s'ha esborrat res (l'estat de treball o el runtime està ocupat; espera i torna a provar /clear)",
   "ModelChanged": "El model ara és {new} (abans {old}).",
+  "ModelChangedSessionNote": " (només en aquesta sessió — /fleet save actualitza aquest equip, /fleet save-as en desa un de nou, /model save-default el desa com a valor per defecte d'arrencada)",
   "LinksProjectTitle": "Codewhale i comunitat:",
   "LinksDocumentation": "Documentació:",
   "LinksCommunity": "Comunitat i contribució:",

@@ -786,6 +786,7 @@
   "ClearConversation": "Диалог очищен",
   "ClearConversationBusy": "Ничего не очищено (состояние Work или фоновая работа заняты; подождите и повторите /clear)",
   "ModelChanged": "Модель теперь {new} (была {old}).",
+  "ModelChangedSessionNote": " (только для этого сеанса — /fleet save обновляет эту команду, /fleet save-as сохраняет новую команду, /model save-default сохраняет её как значение по умолчанию при запуске)",
   "LinksProjectTitle": "Codewhale и сообщество:",
   "LinksDocumentation": "Документация:",
   "LinksCommunity": "Сообщество и участие:",

@@ -803,6 +803,7 @@
   "ClearConversation": "对话已清空",
   "ClearConversationBusy": "未清空任何内容（工作状态或运行时任务正忙；请等待后重试 /clear）",
   "ModelChanged": "模型已切换为 {new}（原为 {old}）。",
+  "ModelChangedSessionNote": "（仅本次会话有效 — /fleet save 更新当前 Fleet，/fleet save-as 另存为新 Fleet，/model save-default 保存为启动默认值）",
   "LinksProjectTitle": "Codewhale 与社区：",
   "LinksDocumentation": "文档：",
   "LinksCommunity": "社区与贡献：",

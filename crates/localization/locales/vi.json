@@ -803,6 +803,7 @@
   "ClearConversation": "Đã xóa cuộc trò chuyện",
   "ClearConversationBusy": "Chưa xóa nội dung nào (trạng thái Công việc hoặc tác vụ thời gian chạy đang bận; hãy chờ rồi thử lại /clear)",
   "ModelChanged": "Mô hình hiện là {new} (trước đó là {old}).",
+  "ModelChangedSessionNote": " (chỉ trong phiên này — /fleet save cập nhật nhóm này, /fleet save-as lưu thành nhóm mới, /model save-default lưu làm mặc định khi khởi động)",
   "LinksProjectTitle": "Codewhale và cộng đồng:",
   "LinksDocumentation": "Tài liệu:",
   "LinksCommunity": "Cộng đồng và đóng góp:",

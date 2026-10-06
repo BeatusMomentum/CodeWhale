@@ -786,6 +786,7 @@
   "ClearConversation": "Percakapan dibersihkan",
   "ClearConversationBusy": "Tidak ada yang dibersihkan (status Work atau pekerjaan runtime sibuk; tunggu, lalu coba /clear lagi)",
   "ModelChanged": "Model sekarang {new} (sebelumnya {old}).",
+  "ModelChangedSessionNote": " (hanya untuk sesi ini — /fleet save memperbarui tim ini, /fleet save-as menyimpan tim baru, /model save-default menyimpannya sebagai default startup)",
   "LinksProjectTitle": "Codewhale & komunitas:",
   "LinksDocumentation": "Dokumentasi:",
   "LinksCommunity": "Komunitas & kontribusi:",
