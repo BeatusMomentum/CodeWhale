@@ -1565,7 +1565,7 @@ enum McpCommand {
         #[arg(long = "scope", requires = "url", value_delimiter = ',')]
         scopes: Vec<String>,
         /// Arguments for command-based servers
-        #[arg(long = "arg")]
+        #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Authenticate to a URL-based MCP server using OAuth
@@ -19849,5 +19849,24 @@ mod private_listing_tests {
         assert!(!url.contains("url-s10-synthetic"));
         assert!(!url.contains("query-s10-synthetic"));
         assert!(url.contains("team=core"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_add_arg_tests {
+    use super::*;
+    #[test]
+    fn mcp_add_arg_accepts_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "codewhale", "mcp", "add", "srv", "--command", "npx", "--arg", "-y",
+        ])
+        .expect("mcp add parses hyphen-led --arg values");
+        let Some(Commands::Mcp { command }) = cli.command else {
+            panic!("expected mcp command");
+        };
+        let McpCommand::Add { args, .. } = command else {
+            panic!("expected mcp add subcommand");
+        };
+        assert_eq!(args, vec!["-y".to_string()]);
     }
 }
