@@ -5910,21 +5910,35 @@ impl Engine {
             || (!provenance.can_authorize_work() && profile_constitution.is_none())
         {
             self.constitution_block.clone()
-        } else { match crate::profile_constitution::capture(
-            self.api_config.account_profile.as_deref(), profile_constitution,
-        ).await {
-            Ok(block) => block,
-            Err(error) => {
-                crate::cost_status::report_runtime_usage_batch(
-                    crate::cost_status::scope_token(), initial_usage_owner.as_deref(), &initial_routed_usage,
-                );
-                let _ = self.send_event(Event::error(ErrorEnvelope::new(
-                    ErrorCategory::InvalidInput, ErrorSeverity::Error, true,
-                    "profile_constitution_unavailable", error.to_string(),
-                ))).await;
-                return SendMessageOutcome::NotStarted { error: Some(error.to_string()) };
+        } else {
+            match crate::profile_constitution::capture(
+                self.api_config.account_profile.as_deref(),
+                profile_constitution,
+            )
+            .await
+            {
+                Ok(block) => block,
+                Err(error) => {
+                    crate::cost_status::report_runtime_usage_batch(
+                        crate::cost_status::scope_token(),
+                        initial_usage_owner.as_deref(),
+                        &initial_routed_usage,
+                    );
+                    let _ = self
+                        .send_event(Event::error(ErrorEnvelope::new(
+                            ErrorCategory::InvalidInput,
+                            ErrorSeverity::Error,
+                            true,
+                            "profile_constitution_unavailable",
+                            error.to_string(),
+                        )))
+                        .await;
+                    return SendMessageOutcome::NotStarted {
+                        error: Some(error.to_string()),
+                    };
+                }
             }
-        } };
+        };
         let admission_cancel = (!self.host_managed_turns()).then_some(&self.cancel_token);
         let admission = async {
             let terminal = streaming::reserve_event_capacity(
@@ -8377,15 +8391,27 @@ impl Engine {
     }
 
     async fn record_current_constitution(&mut self) {
-        let previous = self.session.messages.iter().rev().find(|message| {
-            crate::runtime_handoff::constitution_display(message).is_some()
-        });
-        if self.constitution_block.is_none() && previous.is_none() { return; }
-        let message = crate::runtime_handoff::constitution_runtime_message(self.constitution_block.as_deref());
-        if previous == Some(&message) { return; }
+        let previous = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| crate::runtime_handoff::constitution_display(message).is_some());
+        if self.constitution_block.is_none() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::constitution_runtime_message(
+            self.constitution_block.as_deref(),
+        );
+        if previous == Some(&message) {
+            return;
+        }
         self.add_session_message(message).await;
         let receipt = match self.constitution_block.as_deref() {
-            Some(block) if block.starts_with("Account profile constitution,") => block.lines().next().unwrap_or("Profile constitution applied."),
+            Some(block) if block.starts_with("Account profile constitution,") => block
+                .lines()
+                .next()
+                .unwrap_or("Profile constitution applied."),
             Some(_) => "Local constitution applied to this turn.",
             None => "Personal constitution withdrawn for this turn.",
         };

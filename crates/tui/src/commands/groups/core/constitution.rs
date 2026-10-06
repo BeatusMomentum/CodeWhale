@@ -116,10 +116,16 @@ fn open_review(app: &mut App) {
 
 fn open_preview(app: &mut App) {
     let locale = app.ui_locale;
-    let text = format!("{}\n\n{}", match locale {
-        Locale::ZhHans => "这是本机宪章预览。已登录账户的宪章（包括默认值）优先；请在账户设置中预览。",
-        _ => "This previews the local constitution. The signed-in profile constitution, including its defaults, takes precedence; preview it in account settings.",
-    }, preview_text(locale));
+    let text = format!(
+        "{}\n\n{}",
+        match locale {
+            Locale::ZhHans =>
+                "这是本机宪章预览。已登录账户的宪章（包括默认值）优先；请在账户设置中预览。",
+            _ =>
+                "This previews the local constitution. The signed-in profile constitution, including its defaults, takes precedence; preview it in account settings.",
+        },
+        preview_text(locale)
+    );
     open_pager(app, rendered_title(locale), &text);
 }
 

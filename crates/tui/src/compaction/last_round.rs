@@ -282,9 +282,11 @@ pub(super) fn replacement_messages(
         });
         retained.insert(0, snapshot.clone());
     }
-    if let Some(snapshot) = messages.iter().rev().find(|message| {
-        crate::runtime_handoff::constitution_display(message).is_some()
-    }) {
+    if let Some(snapshot) = messages
+        .iter()
+        .rev()
+        .find(|message| crate::runtime_handoff::constitution_display(message).is_some())
+    {
         retained.retain(|message| crate::runtime_handoff::constitution_display(message).is_none());
         retained.insert(0, snapshot.clone());
     }
@@ -763,9 +765,7 @@ mod tests {
     /// round, with long tool output shortened and marked.
     #[test]
     fn profile_constitution_compaction_keeps_only_the_complete_latest_snapshot() {
-        use crate::runtime_handoff::{
-            constitution_display, constitution_runtime_message,
-        };
+        use crate::runtime_handoff::{constitution_display, constitution_runtime_message};
         let old = constitution_runtime_message(Some("old instructions"));
         let current_text = "current instructions ".repeat(400);
         for current in [

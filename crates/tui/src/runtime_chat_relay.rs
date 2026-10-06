@@ -72,7 +72,8 @@ fn take_state_persist_failure(path: &Path) -> bool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RuntimeChatPrompt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_constitution: Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     #[serde(rename = "type")]

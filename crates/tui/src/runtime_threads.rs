@@ -4896,7 +4896,8 @@ pub struct UpdateThreadRequest {
 pub struct StartTurnRequest {
     /// Account-authorized data, rendered only by the Engine for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_constitution: Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     /// Narrowing assertion captured by an acknowledged selected frontend.
     /// A mismatch refuses; this field never changes a thread's workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]

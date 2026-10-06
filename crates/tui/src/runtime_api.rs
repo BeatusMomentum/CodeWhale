@@ -43,8 +43,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
-mod notification_delivery;
 mod constitution;
+mod notification_delivery;
 
 #[cfg(test)]
 use crate::dependencies::ExternalTool;
@@ -2652,8 +2652,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
         .route("/v1/constitution", get(constitution::get_constitution))
-        .route("/v1/constitution/preview", post(constitution::preview_constitution)
-            .layer(DefaultBodyLimit::max(32 * 1024)))
+        .route(
+            "/v1/constitution/preview",
+            post(constitution::preview_constitution).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",

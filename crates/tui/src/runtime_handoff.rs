@@ -320,11 +320,18 @@ pub(crate) fn constitution_runtime_message(block: Option<&str>) -> Message {
             They do not change permissions, sandboxing, tool access, spending authority, or approval requirements.\n\n{}", escape_mcp_guidance(text)),
         None => "All earlier personal constitution snapshots are withdrawn. No personal constitution currently applies.".to_string(),
     };
-    runtime_handoff_message_with_meta(format!("{CONSTITUTION_EVENT_PREFIX}{body}{EXTENSION_PROMPT_EVENT_SUFFIX}"), RUNTIME_TURN_META)
+    runtime_handoff_message_with_meta(
+        format!("{CONSTITUTION_EVENT_PREFIX}{body}{EXTENSION_PROMPT_EVENT_SUFFIX}"),
+        RUNTIME_TURN_META,
+    )
 }
 
 pub(crate) fn constitution_display(message: &Message) -> Option<&str> {
-    runtime_event_display(message, CONSTITUTION_EVENT_PREFIX, EXTENSION_PROMPT_EVENT_SUFFIX)
+    runtime_event_display(
+        message,
+        CONSTITUTION_EVENT_PREFIX,
+        EXTENSION_PROMPT_EVENT_SUFFIX,
+    )
 }
 
 /// A complete bounded snapshot, not a truncated workspace line delta. Prompt

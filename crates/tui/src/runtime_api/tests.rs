@@ -16,10 +16,10 @@ use uuid::Uuid;
 
 mod command_catalog;
 mod headless_catalog;
+mod profile_constitution;
 #[cfg(any(unix, windows))]
 mod runtime_store_convergence;
 mod workspace_instructions;
-mod profile_constitution;
 
 /// Scale a wait budget for shared CI runners.
 ///
