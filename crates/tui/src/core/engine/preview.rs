@@ -608,6 +608,12 @@ impl Engine {
         compaction: &crate::compaction::CompactionConfig,
     ) -> Vec<&'static str> {
         let mut reasons = Vec::new();
+        if crate::profile_constitution::account_is_present(self.api_config.account_profile.as_deref()).unwrap_or(true)
+            || self.constitution_block.as_deref().is_some_and(|block| block.starts_with("Account profile constitution,")) {
+            reasons.push("the account constitution is resolved at next-turn admission; preview its guidance in account settings");
+        } else if crate::prompts::load_user_constitution_block() != self.constitution_block {
+            reasons.push("the local constitution changed and will be recorded at next-turn admission");
+        }
 
         if !self.pending_lsp_blocks.is_empty() {
             reasons.push("pending LSP diagnostics would be injected as a synthetic message");

@@ -390,6 +390,7 @@ fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
     // so wire submitters observe `TurnStarted.submission_id` always absent
     // and cannot correlate submissions on that channel.
     wire_op::TurnSpec {
+        profile_constitution: spec.profile_constitution.as_ref().map(|snapshot| serde_json::json!(snapshot)),
         max_output_tokens: spec.max_output_tokens,
         content: spec.content.clone(),
         images: spec.images.clone(),

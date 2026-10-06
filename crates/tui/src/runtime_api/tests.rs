@@ -19,6 +19,7 @@ mod headless_catalog;
 #[cfg(any(unix, windows))]
 mod runtime_store_convergence;
 mod workspace_instructions;
+mod profile_constitution;
 
 /// Scale a wait budget for shared CI runners.
 ///

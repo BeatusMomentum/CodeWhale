@@ -72,6 +72,8 @@ fn take_state_persist_failure(path: &Path) -> bool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RuntimeChatPrompt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution: Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     #[serde(rename = "type")]
     pub command_type: String,
@@ -762,6 +764,7 @@ impl RuntimeChatRelayHost {
             .start_turn_with_reserved_id(
                 &binding.native_thread_id,
                 StartTurnRequest {
+                    profile_constitution: command.profile_constitution.clone(),
                     expected_workspace: None,
                     max_output_tokens: command.max_output_tokens,
                     prompt: command.prompt.clone(),
@@ -1224,6 +1227,9 @@ impl RuntimeChatPrompt {
             || self.prompt.contains('\0')
         {
             return Err("The Runtime Chat prompt is empty or oversized.".to_string());
+        }
+        if let Some(snapshot) = &self.profile_constitution {
+            snapshot.validate().map_err(|error| error.to_string())?;
         }
         if let Some(system_prompt) = self.system_prompt.as_deref()
             && (system_prompt.trim().is_empty()
@@ -1890,6 +1896,7 @@ mod tests {
     #[test]
     fn chat_command_shape_requires_empty_tools_and_exact_chat_modes() {
         let mut prompt = RuntimeChatPrompt {
+            profile_constitution: None,
             images: Vec::new(),
             max_output_tokens: None,
             command_type: "prompt.request".to_string(),
@@ -1947,6 +1954,7 @@ mod tests {
             .unwrap();
         host.authorize_run("run_fixture").unwrap();
         let prompt = RuntimeChatPrompt {
+            profile_constitution: None,
             images: Vec::new(),
             max_output_tokens: None,
             command_type: "prompt.request".to_string(),
@@ -2015,6 +2023,7 @@ mod tests {
             .unwrap_or_else(|| provider.as_str())
             .to_string();
         let prompt = RuntimeChatPrompt {
+            profile_constitution: None,
             images: Vec::new(),
             max_output_tokens: None,
             command_type: "prompt.request".to_string(),

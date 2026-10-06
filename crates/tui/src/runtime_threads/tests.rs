@@ -23332,3 +23332,31 @@ fn runtime_transport_retry_counts_default_old_bytes_and_preserve_new_receipts() 
         facts
     );
 }
+
+#[tokio::test]
+async fn profile_constitution_runtime_admission_binds_the_complete_snapshot_to_replay() -> Result<()> {
+    use codewhale_config::user_constitution::{ProfileConstitution, ProfileConstitutionSnapshot};
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager.create_thread(CreateThreadRequest::default()).await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let request = StartTurnRequest {
+        prompt: "Use this profile".into(), operation_key:Some("constitution-once".into()),
+        profile_constitution:Some(ProfileConstitutionSnapshot { account_id:"acct_fixture".into(), revision:4,
+            constitution:ProfileConstitution { notes:"Exact preference".into(), ..Default::default() } }),
+        ..Default::default()
+    };
+    let turn = manager.start_turn(&thread.id, request.clone()).await?;
+    let Some(Op::SendMessage(spec)) = harness.rx_op.recv().await else { bail!("missing Engine operation"); };
+    assert_eq!(spec.profile_constitution, request.profile_constitution);
+    assert_eq!(manager.start_turn(&thread.id, request.clone()).await?.id, turn.id);
+    let mut changed = request.clone();
+    changed.profile_constitution.as_mut().unwrap().constitution.notes = "New preference".into();
+    assert!(manager.start_turn(&thread.id, changed).await.is_err());
+    let mut changed = request.clone(); changed.profile_constitution = None;
+    assert!(manager.start_turn(&thread.id, changed).await.is_err());
+    assert!(harness.rx_op.try_recv().is_err());
+    harness.tx_event.send(EngineEvent::TurnComplete { usage:Usage::default(), parent_route_usage:Usage::default(),
+        routed_usage_dropped_records:0,status:TurnOutcomeStatus::Completed,error:None,tool_catalog:None,base_url:None }).await?;
+    wait_for_terminal_turn(&manager,&turn.id).await?;
+    Ok(())
+}

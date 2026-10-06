@@ -1292,6 +1292,7 @@ async fn deferred_tool_first_use_does_not_emit_a_retry_status() {
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "Map this project".to_string(),
             images: Vec::new(),

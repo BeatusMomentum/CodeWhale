@@ -958,6 +958,7 @@ pub struct Engine {
     /// Immutable contribution snapshot for the running turn. Re-delivery after
     /// compaction uses these same bytes, never a mid-turn host re-sampling.
     extension_prompt_block: Option<String>,
+    constitution_block: Option<String>,
     api_provider: ProviderKind,
     /// One captured admitted route. Presentation snapshots derive strings from
     /// it; a changed table cannot be blessed by reinterpreting those strings.
@@ -2235,6 +2236,7 @@ impl Engine {
             plugin_registry,
             extension_host,
             extension_prompt_block: None,
+            constitution_block: None,
             api_provider,
             api_provider_identity,
             active_route_limits,
@@ -3314,6 +3316,7 @@ impl Engine {
             .await;
         let _ = self
             .handle_send_message(TurnSpec {
+                profile_constitution: None,
                 content:
                     "[runtime] A background shell task finished; its completion evidence follows."
                         .to_string(),
@@ -3513,6 +3516,7 @@ impl Engine {
 
                         let _ = self
                             .handle_send_message(TurnSpec {
+                                profile_constitution: None,
                                 content,
                                 mode: self.current_mode,
                                 route: Box::new(route),
@@ -4133,6 +4137,7 @@ impl Engine {
                         let mode = self.current_mode;
                         let outcome = self
                             .handle_send_message(TurnSpec {
+                                profile_constitution: None,
                                 content: new_message.clone(),
                                 mode,
                                 route: Box::new(route),
@@ -4853,6 +4858,7 @@ impl Engine {
 
         let outcome = self
             .handle_send_message(TurnSpec {
+                profile_constitution: None,
                 content,
                 mode: self.current_mode,
                 route: Box::new(route),
@@ -5823,6 +5829,7 @@ impl Engine {
         autonomous: bool,
     ) -> SendMessageOutcome {
         let TurnSpec {
+            profile_constitution,
             max_output_tokens,
             content,
             images,
@@ -5897,6 +5904,27 @@ impl Engine {
         // any provider dispatch), so its admission waits for capacity instead
         // of refusing on cancellation. An interactive queued cancellation
         // keeps no lifecycle.
+        // Internal follow-ups belong to the already-admitted work. They must
+        // not replace its account preferences with the host operator's profile.
+        let constitution_block = if self.rlm_host.is_some()
+            || (!provenance.can_authorize_work() && profile_constitution.is_none())
+        {
+            self.constitution_block.clone()
+        } else { match crate::profile_constitution::capture(
+            self.api_config.account_profile.as_deref(), profile_constitution,
+        ).await {
+            Ok(block) => block,
+            Err(error) => {
+                crate::cost_status::report_runtime_usage_batch(
+                    crate::cost_status::scope_token(), initial_usage_owner.as_deref(), &initial_routed_usage,
+                );
+                let _ = self.send_event(Event::error(ErrorEnvelope::new(
+                    ErrorCategory::InvalidInput, ErrorSeverity::Error, true,
+                    "profile_constitution_unavailable", error.to_string(),
+                ))).await;
+                return SendMessageOutcome::NotStarted { error: Some(error.to_string()) };
+            }
+        } };
         let admission_cancel = (!self.host_managed_turns()).then_some(&self.cancel_token);
         let admission = async {
             let terminal = streaming::reserve_event_capacity(
@@ -6389,6 +6417,8 @@ impl Engine {
         } else {
             None
         };
+        self.constitution_block = constitution_block;
+        self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
 
         // Compose from the immutable values accepted for this turn. Preview
@@ -8344,6 +8374,22 @@ impl Engine {
         let block = self.extension_prompt_block.clone();
         self.record_extension_prompt_contributions(block.as_deref())
             .await;
+    }
+
+    async fn record_current_constitution(&mut self) {
+        let previous = self.session.messages.iter().rev().find(|message| {
+            crate::runtime_handoff::constitution_display(message).is_some()
+        });
+        if self.constitution_block.is_none() && previous.is_none() { return; }
+        let message = crate::runtime_handoff::constitution_runtime_message(self.constitution_block.as_deref());
+        if previous == Some(&message) { return; }
+        self.add_session_message(message).await;
+        let receipt = match self.constitution_block.as_deref() {
+            Some(block) if block.starts_with("Account profile constitution,") => block.lines().next().unwrap_or("Profile constitution applied."),
+            Some(_) => "Local constitution applied to this turn.",
+            None => "Personal constitution withdrawn for this turn.",
+        };
+        let _ = self.send_event(Event::status(receipt.to_owned())).await;
     }
 
     async fn record_extension_prompt_contributions(&mut self, block: Option<&str>) {

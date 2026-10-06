@@ -35,6 +35,7 @@ impl Engine {
         .await;
         self.record_mcp_server_instructions(&progress.tool_catalog)
             .await;
+        self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
 
         // R1: the cumulative per-turn wall-clock budget. Checked at the
@@ -742,6 +743,7 @@ impl Engine {
                 )),
             ));
         }
+        self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
         let estimated = turn
             .live_input_tokens_for_compaction(

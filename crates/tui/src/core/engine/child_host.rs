@@ -147,6 +147,7 @@ impl Engine {
             .validate_context(&state.authority.context())?;
         let posture = self.runtime_authority_snapshot();
         Ok(TurnSpec {
+            profile_constitution: None,
             content,
             images: Vec::new(),
             mode: posture.mode,

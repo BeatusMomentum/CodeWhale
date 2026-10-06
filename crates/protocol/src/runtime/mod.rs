@@ -74,6 +74,9 @@ pub struct RuntimeCapabilities {
     /// Per-turn maxOutputTokens is validated and intersected with the route ceiling.
     #[serde(default)]
     pub turn_output_token_limit: bool,
+    /// Account profile snapshots and Engine-owned constitution preview.
+    #[serde(default)]
+    pub profile_constitution: bool,
     pub turn_steer: bool,
     pub turn_interrupt: bool,
     pub event_replay: bool,
@@ -425,6 +428,7 @@ mod tests {
     fn runtime_capabilities_serializes_expected_shape() {
         let caps = RuntimeCapabilities {
             turn_output_token_limit: false,
+            profile_constitution: false,
             account_session: true,
             threads: true,
             thread_shell_consent: true,

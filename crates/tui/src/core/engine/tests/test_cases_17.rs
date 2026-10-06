@@ -545,6 +545,7 @@ async fn run_headless_turn_with_flaky_network(
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -896,6 +897,7 @@ async fn terminal_output_limit_followed_by_stream_error_is_charged_and_not_retri
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -989,6 +991,7 @@ async fn error_frame_turn_events(turns: Vec<Vec<StreamEvent>>) -> (Vec<Event>, u
     let run_task = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -1194,6 +1197,7 @@ async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -1447,6 +1451,7 @@ async fn run_interactive_turn_with_flaky_network(
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),

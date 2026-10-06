@@ -1222,9 +1222,8 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
         full_prompt = format!("{preamble}\n\n{full_prompt}");
     }
 
-    if let Some(user_constitution_block) = load_user_constitution_block() {
-        full_prompt = format!("{full_prompt}\n\n{user_constitution_block}");
-    }
+    // Personal preferences are captured once at turn admission and recorded in
+    // history, so live profile edits never mutate an in-flight prompt prefix.
 
     if session_context.project_context_pack_enabled
         && let Some(pack) = crate::project_context::generate_project_context_pack(workspace)
@@ -2529,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn user_global_constitution_block_is_injected_separately() {
+    fn user_global_constitution_is_captured_outside_the_stable_prefix() {
         let _env_guard = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
         let workspace = tmp.path().join("workspace");
@@ -2565,22 +2564,11 @@ mod tests {
                 },
             ));
 
-        let base_at = prompt.find("### Whose word wins").expect("base prompt");
-        let user_block_at = prompt
-            .find("<codewhale_user_constitution")
-            .expect("user constitution block");
-        let env_at = prompt.find("- lang:").expect("rendered environment block");
-        assert!(
-            base_at < user_block_at && user_block_at < env_at,
-            "user constitution should be its own layer after the base/project context and before volatile environment data"
-        );
-        assert!(prompt.contains("source=\"user-global\""));
-        assert!(prompt.contains("Maintains Codewhale release lanes."));
-        assert!(prompt.contains("Prefer live verification before claims."));
-        assert!(
-            !prompt.contains(&codewhale_home.display().to_string()),
-            "prompt should use the stable user-global source label, not a device-specific home path"
-        );
+        assert!(!prompt.contains("<codewhale_user_constitution"));
+        let block = load_user_constitution_block().expect("admission snapshot");
+        assert!(block.contains("Maintains Codewhale release lanes."));
+        assert!(block.contains("Prefer live verification before claims."));
+        assert!(!block.contains(&codewhale_home.display().to_string()));
     }
 
     #[test]

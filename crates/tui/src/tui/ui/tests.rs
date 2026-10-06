@@ -14787,6 +14787,7 @@ async fn dispatch_non_resume_message_preserves_paused_command_state() {
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content,
             goal_objective,
             ..
@@ -14828,6 +14829,7 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content,
             goal_objective,
             ..
@@ -28239,6 +28241,7 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
     let run = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content: "hello without a key".to_string(),
             images: Vec::new(),
             mode: AppMode::Agent,

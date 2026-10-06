@@ -92,6 +92,7 @@ async fn auto_review_asks_the_user_and_returns_the_answer() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "continue autonomously".to_string(),
             images: Vec::new(),
@@ -279,6 +280,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please run a background shell".to_string(),
             images: Vec::new(),
@@ -422,6 +424,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please run a background shell".to_string(),
             images: Vec::new(),
@@ -561,6 +564,7 @@ async fn yolo_mode_executes_publish_like_shell_without_prompt() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please publish this crate".to_string(),
             images: Vec::new(),
@@ -704,6 +708,7 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
 
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: "please open the PR".to_string(),
             images: Vec::new(),

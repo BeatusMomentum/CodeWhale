@@ -44,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 mod notification_delivery;
+mod constitution;
 
 #[cfg(test)]
 use crate::dependencies::ExternalTool;
@@ -1237,6 +1238,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         turn_operation_lookup: true,
         turn_image_inputs: true,
         turn_output_token_limit: true,
+        profile_constitution: true,
         turn_steer: true,
         turn_interrupt: true,
         event_replay: true,
@@ -2649,6 +2651,9 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
+        .route("/v1/constitution", get(constitution::get_constitution))
+        .route("/v1/constitution/preview", post(constitution::preview_constitution)
+            .layer(DefaultBodyLimit::max(32 * 1024)))
         .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",
@@ -5673,7 +5678,7 @@ fn runtime_account_info_for_request(
     }
 }
 
-fn runtime_account_api_base() -> String {
+pub(crate) fn runtime_account_api_base() -> String {
     std::env::var(ACCOUNT_API_BASE_ENV)
         .ok()
         .and_then(|value| normalize_runtime_account_api_base(&value))
@@ -7989,6 +7994,7 @@ async fn retry_thread_turn(
         .start_turn_from_stored_images(
             &forked_thread.id,
             StartTurnRequest {
+                profile_constitution: None,
                 expected_workspace: None,
                 max_output_tokens,
                 prompt: retry_prompt,
@@ -8920,6 +8926,7 @@ async fn stream_turn(
         .start_turn(
             &thread.id,
             StartTurnRequest {
+                profile_constitution: None,
                 max_output_tokens: req.max_output_tokens,
                 prompt,
                 images: req.images,
@@ -10310,6 +10317,7 @@ pub(crate) fn runtime_chat_relay_catalog(
                 "turn_operation_idempotency": true,
                 "turn_image_inputs": true,
                 "turn_output_token_limit": true,
+                "profile_constitution": true,
                 "tool_execution": false,
                 "stable_event_ids": true,
             },

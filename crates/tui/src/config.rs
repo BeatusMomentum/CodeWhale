@@ -2198,6 +2198,8 @@ pub(crate) struct AccountModelAccess {
 /// Resolved CLI configuration, including defaults and environment overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) account_profile: Option<String>,
     /// Diagnostic clones must never refresh or mutate plugin OAuth credentials.
     #[serde(skip)]
     pub(crate) plugin_oauth_read_only: bool,
@@ -4328,6 +4330,7 @@ impl Config {
         })?;
         let legacy_root = parsed.legacy_root.clone();
         let mut config = apply_profile(parsed, profile)?;
+        config.account_profile = profile.map(str::to_owned);
         config.legacy_root = legacy_root;
         Ok(config)
     }
@@ -4360,6 +4363,7 @@ impl Config {
         };
 
         // Scope and profile choices outrank device startup memory. Environment
+        config.account_profile = profile.map(str::to_owned);
         // and managed values are applied afterwards, so their models win too.
         if profile.is_none() && path.as_deref().is_some_and(is_home_config_path) {
             if let Ok(settings) =
@@ -10477,6 +10481,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         legacy_root: base.legacy_root,
         legacy_root_custom_generation: base.legacy_root_custom_generation,
         account_model_access: base.account_model_access,
+        account_profile: override_cfg.account_profile.or(base.account_profile),
         plugin_oauth_read_only: base.plugin_oauth_read_only || override_cfg.plugin_oauth_read_only,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
         runtime_thread_inference_unrelated: override_cfg.runtime_thread_inference_unrelated

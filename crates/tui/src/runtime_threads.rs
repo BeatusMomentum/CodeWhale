@@ -4894,6 +4894,9 @@ pub struct UpdateThreadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StartTurnRequest {
+    /// Account-authorized data, rendered only by the Engine for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution: Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     /// Narrowing assertion captured by an acknowledged selected frontend.
     /// A mismatch refuses; this field never changes a thread's workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8808,6 +8811,7 @@ impl RuntimeThreadManager {
         continuation_index: u32,
     ) -> Result<TurnRecord> {
         let req = StartTurnRequest {
+            profile_constitution: None,
             expected_workspace: None,
             max_output_tokens: None,
             prompt,
@@ -9337,6 +9341,7 @@ impl RuntimeThreadManager {
             .start_turn_with_source(
                 thread_id,
                 StartTurnRequest {
+                    profile_constitution: None,
                     expected_workspace: None,
                     max_output_tokens: None,
                     prompt,
@@ -14227,6 +14232,7 @@ impl RuntimeThreadManager {
         if req.max_output_tokens.is_some() && auto_model {
             bail!("maxOutputTokens requires an exact model; Auto routing is unsupported");
         }
+        if let Some(snapshot) = &req.profile_constitution { snapshot.validate()?; }
         let operation = if let Some(operation_key) = req.operation_key.as_deref() {
             validate_runtime_turn_operation_key(operation_key)?;
             let request_fingerprint = runtime_turn_request_fingerprint(
@@ -14249,6 +14255,13 @@ impl RuntimeThreadManager {
                     "domain": "codewhale:selected-workspace-turn:v1",
                     "historical_fingerprint": request_fingerprint,
                     "expected_workspace": workspace,
+                })).as_bytes())
+            } else { request_fingerprint };
+            let request_fingerprint = if let Some(snapshot) = &req.profile_constitution {
+                crate::hashing::sha256_hex(crate::client::canonical_json(&json!({
+                    "domain": "codewhale:profile-constitution-turn:v1",
+                    "historical_fingerprint": request_fingerprint,
+                    "profile_constitution": snapshot,
                 })).as_bytes())
             } else { request_fingerprint };
             let request_fingerprint=narrowing.request_fingerprint(request_fingerprint);
@@ -14536,6 +14549,7 @@ impl RuntimeThreadManager {
             .get(thread_id)
             .and_then(|state| state.hook_executor.clone());
         let op = Op::SendMessage (TurnSpec {
+            profile_constitution: req.profile_constitution,
             max_output_tokens,
             content: prompt,
             images: req.images,

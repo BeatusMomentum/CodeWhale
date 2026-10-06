@@ -2784,3 +2784,34 @@ matrix, no secrets leaked):
 scripts/release/app-server-smoke.sh --matrix        # dry-run plan
 bash scripts/release/app-server-smoke.test.sh       # parser self-test (fake binary)
 ```
+
+## Profile constitution
+
+`profile_constitution` in runtime capabilities enables profile snapshots on
+`POST /v1/threads/{id}/turns`. The optional `profile_constitution` field contains
+`{accountId, revision, constitution}`. `constitution` is exactly
+`{schemaVersion: 1, detail, initiative, collaboration, notes}`; choices are
+`brief|balanced|detailed`, `check|judgment|moving`, and `direct|critical|coach`.
+Notes are limited to 4,000 Unicode characters. Invalid data is refused.
+
+The authenticated account transport supplies the snapshot, which participates in
+the turn's replay identity. The Engine renders it through its existing personal
+constitution renderer and records it in native session history. The snapshot is
+unchanged across provider retries and compaction. A new snapshot fully replaces
+earlier personal preferences. Permissions and approval policy are unaffected.
+Internal follow-ups and RLM child calls inherit the admitted preferences;
+they do not re-read the host operator's account in the middle of that work.
+
+Without a supplied snapshot, the Engine reads the signed-in profile from the
+configured account service at turn admission. An unavailable or invalid signed-in
+profile stops admission with an actionable error. An account without saved
+preferences uses an explicit default snapshot; a signed-out account uses the
+existing local constitution. Hosted transports always supply the owning
+account snapshot, including defaults, so local preferences cannot leak between
+accounts.
+
+`GET /v1/constitution` reads the next-turn profile and its model guidance. It is
+not a receipt that an active turn adopted the edit. `POST /v1/constitution/preview`
+accepts a constitution document and returns `{modelGuidance, saved:false}` without
+saving anything. Both routes use normal Runtime authorization. Older runtimes
+must be upgraded before account transports submit profile-bearing turns.
