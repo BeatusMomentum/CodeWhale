@@ -3,9 +3,11 @@ use anyhow::{Context, Result, ensure};
 use codewhale_config::user_constitution::ProfileConstitutionSnapshot;
 use codewhale_secrets::account::{AccountSessionStore, secure_account_session_secrets};
 
-/// No cached cross-account fallback: unavailable or malformed signed-in profiles
-/// must be resolved before starting another turn. Signed-out/local use retains
-/// the existing local constitution.
+/// No cached cross-account fallback. An unavailable or malformed signed-in
+/// profile is an error here; interactive turn admission (`Engine`) then uses the
+/// signed-out local constitution and tells the person once, because local use
+/// with their own provider key never requires a Codewhale sign-in. A
+/// host-supplied snapshot (Runtime API) still fails its turn closed.
 pub(crate) async fn load(profile: Option<&str>) -> Result<Option<ProfileConstitutionSnapshot>> {
     let api_base = crate::runtime_api::runtime_account_api_base();
     let store = AccountSessionStore::new(secure_account_session_secrets()?, profile, &api_base);

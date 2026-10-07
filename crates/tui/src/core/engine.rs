@@ -959,6 +959,9 @@ pub struct Engine {
     /// compaction uses these same bytes, never a mid-turn host re-sampling.
     extension_prompt_block: Option<String>,
     constitution_block: Option<String>,
+    /// The local-fallback notice for an unavailable account profile is shown
+    /// once per engine; later turns only log it.
+    profile_constitution_fallback_noticed: bool,
     api_provider: ProviderKind,
     /// One captured admitted route. Presentation snapshots derive strings from
     /// it; a changed table cannot be blessed by reinterpreting those strings.
@@ -2237,6 +2240,7 @@ impl Engine {
             extension_host,
             extension_prompt_block: None,
             constitution_block: None,
+            profile_constitution_fallback_noticed: false,
             api_provider,
             api_provider_identity,
             active_route_limits,
@@ -5911,6 +5915,7 @@ impl Engine {
         {
             self.constitution_block.clone()
         } else {
+            let host_supplied = profile_constitution.is_some();
             match crate::profile_constitution::capture(
                 self.api_config.account_profile.as_deref(),
                 profile_constitution,
@@ -5918,6 +5923,25 @@ impl Engine {
             .await
             {
                 Ok(block) => block,
+                // Local use never depends on the Codewhale account: an expired
+                // sign-in or unreachable account service falls back to the
+                // signed-out local constitution, never another account's.
+                Err(error) if !host_supplied => {
+                    tracing::warn!(%error, "account profile constitution unavailable; using local constitution");
+                    if !self.profile_constitution_fallback_noticed {
+                        self.profile_constitution_fallback_noticed = true;
+                        let _ = self
+                            .send_event(Event::status(
+                                codewhale_localization::tr(
+                                    codewhale_localization::resolve_locale(&self.config.locale_tag),
+                                    codewhale_localization::MessageId::ProfileConstitutionUnavailableLocal,
+                                )
+                                .to_string(),
+                            ))
+                            .await;
+                    }
+                    crate::prompts::load_user_constitution_block()
+                }
                 Err(error) => {
                     crate::cost_status::report_runtime_usage_batch(
                         crate::cost_status::scope_token(),
