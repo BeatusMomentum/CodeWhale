@@ -270,7 +270,8 @@
     "std_fs": 1
   },
   "crates/tui/src/plugins/registry.rs": {
-    "path_canonicalize": 6
+    "path_canonicalize": 6,
+    "thread_sleep": 1
   },
   "crates/tui/src/plugins/runtime.rs": {
     "path_canonicalize": 2

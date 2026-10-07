@@ -8912,10 +8912,7 @@ consent_version = 1
                 while std::time::Instant::now() < deadline {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let mut raw = [0u8; 8192];
-                            let read = stream.read(&mut raw).unwrap_or(0);
-                            let head = String::from_utf8_lossy(&raw[..read]).to_string();
+                            let head = read_fixture_request(&mut stream);
                             seen.lock().unwrap().push(head.clone());
                             let request_line = head.lines().next().unwrap_or_default();
                             let mut parts = request_line.split_whitespace();
@@ -8985,6 +8982,37 @@ consent_version = 1
         }
     }
 
+    /// Read one whole request for the fake auth server: the head, then the
+    /// `Content-Length` bytes of body. The fixture's listener is non-blocking
+    /// and Windows and BSD sockets hand that mode to the accepted stream, so a
+    /// single `read` can return `WouldBlock` before the client has written a
+    /// byte. Answering that empty read puts a response on the wire ahead of
+    /// the request, which the client reports as "received unexpected message
+    /// from connection"; closing with the body still unread resets the
+    /// connection under the reply.
+    fn read_fixture_request(stream: &mut TcpStream) -> String {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while raw.len() < 64 * 1024 {
+            if let Some(head_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&raw[..head_end]);
+                let body_len = header_value(&head, "content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + body_len {
+                    break;
+                }
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => raw.extend_from_slice(&chunk[..read]),
+            }
+        }
+        String::from_utf8_lossy(&raw).to_string()
+    }
+
     /// The full connect adapter over a local fake auth server: the adapter
     /// binds its own loopback callback, the fake server redirects the code to
     /// exactly that callback with the adapter's own state, and the exchange
@@ -9048,6 +9076,31 @@ consent_version = 1
                 .eq_ignore_ascii_case(name)
                 .then(|| value.trim().to_string())
         })
+    }
+
+    /// The fake auth server must answer the request, not the accept: a client
+    /// that connects, pauses, and then sends its head and body in separate
+    /// segments still gets the exchange reply, and the server saw the body.
+    #[test]
+    fn fake_orca_auth_server_waits_for_a_late_fragmented_request() {
+        let auth = FakeOrcaAuthServer::start();
+        let mut stream = TcpStream::connect(("127.0.0.1", auth.port())).expect("connect");
+        // Longer than the fixture's accept poll, so it accepts an empty socket.
+        std::thread::sleep(Duration::from_millis(100));
+        let body = r#"{"code":"late-fragment"}"#;
+        write!(
+            stream,
+            "POST {ORCAROUTER_EXCHANGE_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(body.as_bytes()).expect("write body");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let recorded = auth.requests.lock().unwrap().join("\n");
+        assert!(recorded.contains("late-fragment"), "{recorded}");
     }
 
     #[test]
