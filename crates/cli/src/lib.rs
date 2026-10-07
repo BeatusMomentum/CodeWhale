@@ -343,7 +343,7 @@ New integrations should prefer `codewhale app-server`.")]
         after_help = "The browser receives a one-time loopback bootstrap capability, never the Runtime token.\nThe capability is exchanged for a bounded, process-local HttpOnly, SameSite=Strict web session and then invalidated."
     )]
     Web(WebArgs),
-    /// Sign in to manage your provider API keys in one place.
+    /// Sign in to your Codewhale account to manage provider API keys in one place.
     #[command(
         after_help = "Create an account at https://app.codewhale.net/register or sign in through the browser.\nSave a provider key with `codewhale account keys set deepseek`, then choose Codewhale in /provider to use it across your signed-in devices.\nSigning in does not upload existing local keys. Local use does not require an account."
     )]
@@ -9643,8 +9643,12 @@ verbosity = "concise"
             "login help must describe account sign-in: {help}"
         );
         assert!(
-            !help.to_lowercase().contains("api key"),
-            "login help must not advertise provider API keys: {help}"
+            help.contains("manage provider API keys"),
+            "login help must explain the account's immediate benefit: {help}"
+        );
+        assert!(
+            help.contains("Signing in does not upload existing local keys"),
+            "login help must explain the local-key upload boundary: {help}"
         );
     }
 

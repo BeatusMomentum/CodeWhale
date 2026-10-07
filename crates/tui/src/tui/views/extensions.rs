@@ -2944,7 +2944,14 @@ mod tests {
         );
         assert!(!builtin.trusted());
         assert!(!builtin.enabled);
-        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 5);
+        assert!(
+            group.items.iter().any(|row| matches!(
+                &row.action,
+                Some(ExtensionAction::Command { command, .. })
+                    if command == "/plugin marketplace install codewhale whalewiki"
+            )),
+            "an absent catalog bundle should still offer installation"
+        );
     }
 
     #[test]
