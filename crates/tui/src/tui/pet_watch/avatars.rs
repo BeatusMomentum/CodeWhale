@@ -39,35 +39,35 @@ impl Avatars {
         if let Some(Ok((key, encoded))) = received {
             self.image_pending = None;
             self.next_image = Some(now + Duration::from_secs(2));
-            if let Some(encoded) = encoded {
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&encoded) {
-                    if self.images.len() >= 4 {
-                        self.images.clear();
-                    }
-                    self.images.insert(key, bytes);
-                    changed = true;
+            if let Some(encoded) = encoded
+                && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&encoded)
+            {
+                if self.images.len() >= 4 {
+                    self.images.clear();
                 }
+                self.images.insert(key, bytes);
+                changed = true;
             }
         }
-        if self.image_pending.is_none() && self.next_image.is_none_or(|at| now >= at) {
-            if let Some((entry, page)) = self.wanted.take() {
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    let (tx, rx) = mpsc::channel();
-                    self.image_pending = Some(rx);
-                    let workspace = workspace.to_path_buf();
-                    let key = entry.image_key(page);
-                    runtime.spawn(async move {
-                        let png = crate::extension_host::avatars::atlas(
-                            workspace,
-                            entry.handle,
-                            page,
-                            &entry.content_hash,
-                        )
-                        .await;
-                        let _ = tx.send((key, png));
-                    });
-                }
-            }
+        if self.image_pending.is_none()
+            && self.next_image.is_none_or(|at| now >= at)
+            && let Some((entry, page)) = self.wanted.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let (tx, rx) = mpsc::channel();
+            self.image_pending = Some(rx);
+            let workspace = workspace.to_path_buf();
+            let key = entry.image_key(page);
+            runtime.spawn(async move {
+                let png = crate::extension_host::avatars::atlas(
+                    workspace,
+                    entry.handle,
+                    page,
+                    &entry.content_hash,
+                )
+                .await;
+                let _ = tx.send((key, png));
+            });
         }
 
         if self.workspace != workspace {
@@ -205,9 +205,8 @@ impl Avatars {
             return false;
         };
         if self.decoded.as_ref().is_none_or(|d| d.0 != cache_key) {
-            let decode = || -> Option<(String, Vec<u8>, usize, usize)> {
-                entry.pack.validate_png(&png).ok()?;
-                let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            self.decoded = entry.pack.validate_png(png).ok().and_then(|()| {
+                let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
                     .ok()?
                     .to_rgba8();
                 let (w, h) = (
@@ -229,8 +228,7 @@ impl Avatars {
                     );
                 }
                 Some((cache_key, pixels, w as usize, h as usize))
-            };
-            self.decoded = decode();
+            });
         }
         let Some((_, pixels, w, h)) = &self.decoded else {
             return false;
