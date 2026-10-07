@@ -20351,13 +20351,13 @@ async function parseErrorResponse(input) {
     const result = OAuthErrorResponseSchema.parse(JSON.parse(body));
     return OAuthError.fromResponse(result);
   } catch (error2) {
-    const errorMessage = `${statusCode ? `HTTP ${statusCode}: ` : ""}Invalid OAuth error response: ${error2}. Raw body: ${body}`;
+    const errorMessage = `${statusCode ? `HTTP ${statusCode}: ` : ""}OAuth error response details omitted`;
     return new OAuthError(OAuthErrorCode.ServerError, errorMessage);
   }
 }
 function warnCredentialInvalidation(provider, error2, invalidated) {
   const action = provider.invalidateCredentials === void 0 ? `retrying authorization without discarding the stored ${invalidated} (provider implements no invalidateCredentials())` : `invalidating the stored ${invalidated} and retrying authorization`;
-  console.warn(`[mcp-sdk] OAuth ${JSON.stringify(error2.code)} — ${action}. Cause: ${JSON.stringify(error2.message)}`);
+  console.warn(`[mcp-sdk] OAuth ${JSON.stringify(error2.code)} — ${action}; details omitted.`);
 }
 async function auth(provider, options) {
   try {
@@ -20525,7 +20525,7 @@ async function authInternal(provider, { serverUrl, authorizationCode, iss, scope
       });
     } catch (error2) {
       if (error2 instanceof InsecureTokenEndpointError) throw error2;
-      if (!(error2 instanceof OAuthError) || error2.code === OAuthErrorCode.ServerError) console.warn(`[mcp-sdk] Could not refresh OAuth tokens; falling back to a new authorization request. Cause: ${JSON.stringify(error2 instanceof Error ? error2.message : String(error2))}`);
+      if (!(error2 instanceof OAuthError) || error2.code === OAuthErrorCode.ServerError) console.warn("[mcp-sdk] Could not refresh OAuth tokens; falling back to a new authorization request.");
       else throw error2;
     }
     if (newTokens) {

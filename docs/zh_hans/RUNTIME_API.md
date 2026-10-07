@@ -910,7 +910,7 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 
 **线程**（持久运行时数据模型）
 - `GET /v1/threads?limit=50&include_archived=false&archived_only=false`
-- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false`
+- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false&thread_ids=<id>,<id>`
 - `GET /v1/threads/running`
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
@@ -923,6 +923,10 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
   （只读；形态见 [RECEIPTS.md](../RECEIPTS.md)）
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — 同上，针对一个回合；
   未知线程或不属于该线程的回合返回 `404`
+
+`thread_ids` 是逗号分隔的列表，最多 200 个 ID（每个 ID 最多 128 字节）。路由会在应用
+`limit` 前按精确 ID 过滤，并保留最新优先顺序。这只是选择过滤器，不是
+所有权或授权检查；Runtime bearer token 仍是访问边界。
 
 `POST /v1/threads` 除了提供商、模型、工作区与权限字段外，还接受可选的执行默认值：
 

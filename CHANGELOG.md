@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Weixin bridge threads belong to the account and chat that created them:
   resuming or listing another chat's thread is refused. An explicit `/new` after
   an account replacement keeps the old account's private receipt and never
-  replays its prompts automatically.
+  replays its prompts automatically. Replies never reuse another bot account's
+  Weixin context token, and `/threads` lists this chat's own older threads even
+  when other chats have newer ones.
 - Windows messaging bridges retry a briefly locked record replacement
   (EPERM/EACCES/EBUSY) with bounded delays and never delete the previous record
   first.

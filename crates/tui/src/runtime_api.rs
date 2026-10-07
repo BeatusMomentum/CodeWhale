@@ -960,6 +960,9 @@ struct ThreadSummaryQuery {
     limit: Option<usize>,
     search: Option<String>,
     include_archived: Option<bool>,
+    /// Comma-separated exact IDs let callers filter before applying the result
+    /// limit. One parameter, because axum's `Query` cannot collect repeated keys.
+    thread_ids: Option<String>,
     /// When `true`, returns archived threads only (overrides `include_archived`).
     /// Whalescale#260 / #563.
     archived_only: Option<bool>,
@@ -3072,16 +3075,41 @@ async fn list_threads_summary(
 ) -> Result<Json<Vec<ThreadSummary>>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let search = query.search.as_deref().map(str::to_ascii_lowercase);
+    let thread_ids = query
+        .thread_ids
+        .map(|ids| {
+            let ids = ids.split(',').map(str::to_owned).collect::<Vec<_>>();
+            if ids.is_empty()
+                || ids.len() > 200
+                || ids.iter().any(|id| {
+                    id.is_empty()
+                        || id.trim() != id
+                        || id.len() > 128
+                        || id.chars().any(char::is_control)
+                })
+            {
+                return Err(ApiError::bad_request(
+                    "thread_ids must be at most 200 comma-separated nonempty IDs of at most 128 bytes",
+                ));
+            }
+            Ok(ids.into_iter().collect::<BTreeSet<_>>())
+        })
+        .transpose()?;
     let filter = resolve_thread_filter(query.include_archived, query.archived_only);
     // `limit` bounds the rows this route returns, not how far a search looks.
     // Passing it to the store read as well matched only inside the newest
     // `limit` threads, so any older match — the row the caller typed the query
     // to find — was invisible. Unsearched listings keep the cheap bounded read;
-    // a search scans in newest-first order and stops at `limit` matches.
+    // a search or exact-ID filter scans in newest-first order and stops at
+    // `limit` matches.
     //
     // Match on the thread record *before* harvesting row facts. Preview is
     // filled only for rows that are returned; it is not a search key.
-    let scan_limit = if search.is_some() { None } else { Some(limit) };
+    let scan_limit = if search.is_some() || thread_ids.is_some() {
+        None
+    } else {
+        Some(limit)
+    };
     let threads = state
         .runtime_threads
         .list_threads(filter, scan_limit)
@@ -3092,6 +3120,11 @@ async fn list_threads_summary(
     for thread in threads {
         if rows.len() >= limit {
             break;
+        }
+        if let Some(thread_ids) = &thread_ids
+            && !thread_ids.contains(&thread.id)
+        {
+            continue;
         }
         if let Some(search) = &search
             && !state

@@ -14,8 +14,8 @@ CNB `main` matched canonical GitHub `main` during this audit. GitHub, npm and
 npmmirror's latest published version was **0.10.0**; the two registry wrapper
 tarballs had identical bytes and verified integrity. CNB's latest binary
 release remained **0.9.9**. Its `v0.10.0` source tag exists, but that tag build
-failed the release-note check before compilation and upload. The CNB0.10.0
-checksum manifest returned404; do not recommend forcing the CNB-only installer
+failed the release-note check before compilation and upload. The CNB 0.10.0
+checksum manifest returned 404; do not recommend forcing the CNB-only installer
 for that version. 0.10.1 remains a Main source candidate until publication.
 
 Check source identity, then the actual versioned release, assets and manifest.

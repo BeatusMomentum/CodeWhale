@@ -1056,7 +1056,7 @@ and live state comes only from a resumed thread's SSE stream.
 
 **Threads** (durable runtime data model)
 - `GET /v1/threads?limit=50&include_archived=false&archived_only=false`
-- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false`
+- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false&thread_ids=<id>,<id>`
 - `GET /v1/threads/running`
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
@@ -1069,6 +1069,11 @@ and live state comes only from a resumed thread's SSE stream.
   (read-only; shape in [RECEIPTS.md](RECEIPTS.md))
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same, for one turn;
   `404` for an unknown thread or a turn that is not this thread's
+
+`thread_ids` is a comma-separated list of up to 200 IDs (each at most 128 bytes).
+The route filters exact IDs before applying `limit`, preserving newest-first
+order. This is a selection filter, not an ownership or authorization check;
+the Runtime bearer token remains the access boundary.
 
 `POST /v1/threads` accepts optional execution defaults in addition to the
 provider, model, workspace, and permission fields:
