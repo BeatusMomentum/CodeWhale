@@ -183,11 +183,44 @@ allow_shell = true
 
 覆盖刻意很窄——它覆盖仓库维护者最可能想要跨贡献者标准化的字段。凭据、端点、provider 选择、MCP 配置、hooks、skills、重试、热栏绑定和 `instructions = [...]` 设置保持用户全局。如果仓库本地配置声明了 `api_key`、`base_url`、`providers`、`provider`、`mcp_config_path`、`notes_path`、`hotbar`、`allow_shell = true` 或 `instructions`，Codewhale 会忽略该键并保留用户的全局设置。
 
-合并的 `codewhale` 运行时为 DeepSeek 认证和模型默认值使用同一个配置文件。`codewhale auth set --provider deepseek` 把 key 保存到 `~/.codewhale/config.toml`(需要时在首次启动迁移旧 `~/.deepseek/config.toml`)，`codewhale --model deepseek-v4-flash` 作为 `CODEWHALE_MODEL` 转发给 TUI。分发器不再写入这些变量的 `DEEPSEEK_*` 孪生变量；你自己设置的 `DEEPSEEK_*` 值在对应的 `CODEWHALE_*` 未设置时仍作为旧别名读取。
+合并的 `codewhale` 运行时使用 `~/.codewhale/config.toml` 保存提供商和模型设置。
+`codewhale auth set --provider deepseek` 把密钥保存在本地机密存储中（默认是
+`~/.codewhale/secrets/` 下的私有文件；OS 钥匙串需显式选择），而不是写入该配置文件。
+需要时，首次启动会迁移旧 `~/.deepseek/config.toml`。
+`codewhale --model deepseek-v4-flash` 作为 `CODEWHALE_MODEL` 转发给 TUI。
+分发器不再写入对应的 `DEEPSEEK_*` 变量；用户自己设置的值在 `CODEWHALE_*`
+未设置时仍作为旧别名读取。
 
-`codewhale login` 登录 Codewhale 账号——它与 `codewhale account login` 是同一个浏览器设备流(device flow)，不是 provider-key 命令。Provider 凭据完全通过 `codewhale auth set --provider <provider>` 配置。
+### 账号提供商密钥
 
-该 provider 凭据与可选的管理产品账号是分开的。`codewhale account login` 启动 Codewhale 浏览器设备流；`codewhale account status` 和 `codewhale account logout` 检查或移除所选 `--profile` 的会话。账号会话优先使用 OS 凭据管理器，在无凭据管理器可用时自动回退到私有 `0600` Codewhale secrets 文件(无头主机、SSH、容器)。`codewhale account keys list|set|remove` 管理已登录账号的 BYOK 保险库(vault)，不显示机密值。更旧的 `codewhale cloud ...` 拼写仍是命令别名。
+Codewhale 账号的直接好处是：**在一个地方管理模型提供商的 API 密钥**。
+[注册](https://app.codewhale.net/register)或[登录](https://app.codewhale.net/login)后，
+可以在[提供商设置](https://app.codewhale.net/providers)中添加、更换或移除密钥，
+也可以使用终端：
+
+```bash
+codewhale login                         # 浏览器登录；也可用 account login
+codewhale account keys set deepseek      # 隐藏输入，添加或更换密钥
+codewhale account keys list              # 只显示配置状态，不显示密钥
+codewhale --provider codewhale           # 使用账号的模型通道
+```
+
+账号密钥保存在服务端，用于经过账号通道的请求。在另一台设备上登录并在
+`/provider` 中选择 Codewhale，即可使用这些密钥，无需再次粘贴。`/models`
+列出该账号可用的模型。更换账号中保存的密钥会影响此通道的后续请求，但不会改变
+独立的本地副本，也不会撤销提供商侧的密钥。`codewhale account keys remove deepseek`
+移除账号中保存的密钥。
+
+登录**不会**自动上传已有的本地密钥。若希望复制本地密钥，请明确使用
+`codewhale account keys set deepseek --from-local`。本地提供商仍通过
+`codewhale auth set --provider <provider>` 配置；使用本地密钥或本地模型不需要
+Codewhale 账号。登录会保留显式选择或已配置的本地提供商；需要切换到账号通道时，
+使用 `--provider codewhale`。
+
+账号会话与提供商密钥分开保存。`codewhale account status` 查看会话；
+`codewhale account logout` 移除所选 `--profile` 的账号会话，不删除提供商密钥。
+账号会话使用私有 `0600` Codewhale secrets 文件，按 profile 和账号 API 来源隔离，
+不使用 OS 钥匙串。旧的 `codewhale cloud ...` 仍是账号命令的别名。
 
 ### 可移植配置包（Portable config bundles）
 
@@ -217,7 +250,7 @@ allow_shell = true
 
 运行 `codewhale auth status` 检查活动 provider 的配置文件、OS 钥匙串后端、环境变量、胜出来源和末四位标签，而不打印 key 本身。该命令只探测活动 provider 的钥匙串条目。
 
-对于托管、通用 OpenAI 兼容、自托管、OpenAI Responses 或原生 Anthropic provider，设置 `provider = "<id>"` 或传 `codewhale --provider <id>`。规范的 provider ID 是 `deepseek`、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`orcarouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`arcee`、`siliconflow-CN`、`moonshot`、`sglang`、`vllm`、`ollama`、`ollama-cloud`、`huggingface`、`modelscope`、`together`、`qianfan`、`openai-codex`、`anthropic`、`openmodel`、`zai`、`stepfun`、`minimax`、`deepinfra`、`sakana`、`longcat`、`opencode-go`、`opencode-zen`、`meta`、`xai`、`mistral`、`telecomjs`、`modelstudio-token-plan`、`google`、`edenai`、`concentrate`、`codewhale` 和 `custom`(通过 `[providers.<name>]` 定义的用户自定义 OpenAI 兼容端点)。逐 provider 的 registry，包括线协议、认证变量、默认 base URL、模型 ID 和能力元数据，见 [PROVIDERS.md](PROVIDERS.md)。facade 把 provider 凭据保存到共享用户配置，并把解析后的 key、base URL、provider 和模型转发给 TUI 进程。使用 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` 或 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` 或 `codewhale auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"` 或 `codewhale auth set --provider wanjie-ark --api-key "YOUR_WANJIE_API_KEY"` 或 `codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_KEY"` 或 `codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"` 或 `codewhale auth set --provider siliconflow --api-key "YOUR_SILICONFLOW_API_KEY"` 或 `codewhale auth set --provider arcee --api-key "YOUR_ARCEE_API_KEY"` 或 [PROVIDERS.md](PROVIDERS.md) 中匹配的 provider ID，通过 facade 保存 provider key。通用 `openai` provider 默认 `https://api.openai.com/v1`,接受 `OPENAI_BASE_URL`，默认 `gpt-5.6`。自定义 OpenAI 兼容网关仍可显式选择自己的模型。`atlascloud` 默认 `https://api.atlascloud.ai/v1`,接受 `ATLASCLOUD_BASE_URL`，默认模型是 `deepseek-ai/deepseek-v4-flash`。`wanjie-ark` 指向 Wanjie Ark 的 OpenAI 兼容端点 `https://maas-openapi.wanjiedata.com/api/v1`,默认 `deepseek-reasoner`，并原样透传模型 ID，因为 Wanjie 模型访问按账号作用域。SGLang、vLLM 和 Ollama 是自托管的，默认可以不用 API key 运行。Ollama 默认 `http://localhost:11434/v1`,并原样发送 `codewhale-coder:1.3b` 或 `qwen2.5-coder:7b` 这样的模型标签。自托管 provider 和 loopback 自定义 URL(`localhost`、`127.0.0.1`、`[::1]`、`0.0.0.0`)不读取 secret store，除非显式请求 API key 认证；当本地服务器确实需要 bearer 认证时，用环境变量或配置文件 key。Ollama Cloud 是独立的托管 `ollama-cloud` provider。它默认 `https://ollama.com/v1` 和 `gpt-oss:120b`；用 `codewhale auth set --provider ollama-cloud` 保存它的 key。环境认证先读 `OLLAMA_CLOUD_API_KEY`，然后是 Ollama 官方的 `OLLAMA_API_KEY`。SiliconFlow 默认 `https://api.siliconflow.com/v1`,接受 `SILICONFLOW_BASE_URL`，默认用 `deepseek-ai/DeepSeek-V4-Pro`。`provider = "siliconflow-CN"` 选择中国区域默认 `https://api.siliconflow.cn/v1`,配 `[providers.siliconflow_cn]` 表和 `SILICONFLOW_API_KEY` 凭据槽位。Arcee AI 默认 `https://api.arcee.ai/api/v1`,接受 `ARCEE_BASE_URL`，对 Codewhale 智能体工作默认用 `trinity-large-thinking`。`trinity-large-preview` 也作为直接的 Arcee API 模型列出；OpenRouter 的 `arcee-ai/trinity-large-thinking` 仍是 OpenRouter 命名空间形式，而直接 Arcee provider 用裸的 `trinity-large-thinking` ID。直接的 Arcee 大模型 API 调用按 256K 上下文 BF16 服务跟踪；Thinking 具备推理能力，而 Preview 未标记为推理模型。
+对于托管、通用 OpenAI 兼容、自托管、OpenAI Responses 或原生 Anthropic provider，设置 `provider = "<id>"` 或传 `codewhale --provider <id>`。规范的 provider ID 是 `deepseek`、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`orcarouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`arcee`、`siliconflow-CN`、`moonshot`、`sglang`、`vllm`、`ollama`、`ollama-cloud`、`huggingface`、`modelscope`、`together`、`qianfan`、`openai-codex`、`anthropic`、`openmodel`、`zai`、`stepfun`、`minimax`、`deepinfra`、`sakana`、`longcat`、`opencode-go`、`opencode-zen`、`meta`、`xai`、`mistral`、`telecomjs`、`modelstudio-token-plan`、`google`、`edenai`、`concentrate`、`codewhale` 和 `custom`(通过 `[providers.<name>]` 定义的用户自定义 OpenAI 兼容端点)。逐 provider 的 registry，包括线协议、认证变量、默认 base URL、模型 ID 和能力元数据，见 [PROVIDERS.md](PROVIDERS.md)。facade 把 provider 凭据保存到本地机密存储，并把解析后的 key、base URL、provider 和模型转发给 TUI 进程。使用 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` 或 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` 或 `codewhale auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"` 或 `codewhale auth set --provider wanjie-ark --api-key "YOUR_WANJIE_API_KEY"` 或 `codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_KEY"` 或 `codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"` 或 `codewhale auth set --provider siliconflow --api-key "YOUR_SILICONFLOW_API_KEY"` 或 `codewhale auth set --provider arcee --api-key "YOUR_ARCEE_API_KEY"` 或 [PROVIDERS.md](PROVIDERS.md) 中匹配的 provider ID，通过 facade 保存 provider key。通用 `openai` provider 默认 `https://api.openai.com/v1`,接受 `OPENAI_BASE_URL`，默认 `gpt-5.6`。自定义 OpenAI 兼容网关仍可显式选择自己的模型。`atlascloud` 默认 `https://api.atlascloud.ai/v1`,接受 `ATLASCLOUD_BASE_URL`，默认模型是 `deepseek-ai/deepseek-v4-flash`。`wanjie-ark` 指向 Wanjie Ark 的 OpenAI 兼容端点 `https://maas-openapi.wanjiedata.com/api/v1`,默认 `deepseek-reasoner`，并原样透传模型 ID，因为 Wanjie 模型访问按账号作用域。SGLang、vLLM 和 Ollama 是自托管的，默认可以不用 API key 运行。Ollama 默认 `http://localhost:11434/v1`,并原样发送 `codewhale-coder:1.3b` 或 `qwen2.5-coder:7b` 这样的模型标签。自托管 provider 和 loopback 自定义 URL(`localhost`、`127.0.0.1`、`[::1]`、`0.0.0.0`)不读取 secret store，除非显式请求 API key 认证；当本地服务器确实需要 bearer 认证时，用环境变量或配置文件 key。Ollama Cloud 是独立的托管 `ollama-cloud` provider。它默认 `https://ollama.com/v1` 和 `gpt-oss:120b`；用 `codewhale auth set --provider ollama-cloud` 保存它的 key。环境认证先读 `OLLAMA_CLOUD_API_KEY`，然后是 Ollama 官方的 `OLLAMA_API_KEY`。SiliconFlow 默认 `https://api.siliconflow.com/v1`,接受 `SILICONFLOW_BASE_URL`，默认用 `deepseek-ai/DeepSeek-V4-Pro`。`provider = "siliconflow-CN"` 选择中国区域默认 `https://api.siliconflow.cn/v1`,配 `[providers.siliconflow_cn]` 表和 `SILICONFLOW_API_KEY` 凭据槽位。Arcee AI 默认 `https://api.arcee.ai/api/v1`,接受 `ARCEE_BASE_URL`，对 Codewhale 智能体工作默认用 `trinity-large-thinking`。`trinity-large-preview` 也作为直接的 Arcee API 模型列出；OpenRouter 的 `arcee-ai/trinity-large-thinking` 仍是 OpenRouter 命名空间形式，而直接 Arcee provider 用裸的 `trinity-large-thinking` ID。直接的 Arcee 大模型 API 调用按 256K 上下文 BF16 服务跟踪；Thinking 具备推理能力，而 Preview 未标记为推理模型。
 
 ### OpenRouter 提供商固定
 

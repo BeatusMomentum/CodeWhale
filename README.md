@@ -57,6 +57,13 @@ machine end up fighting over `PATH`.
 
 ## Quickstart
 
+**Your provider keys, managed in one place.** [Create a Codewhale account](https://app.codewhale.net/register)
+or run `codewhale login` to sign in. Save and update your API keys in your
+account, then use them through the Codewhale model route on your signed-in
+devices. [Set up account keys](docs/CONFIGURATION.md#account-provider-keys).
+Signing in does not upload existing local keys; local use remains available
+without an account.
+
 1. **Open your project.** Run `codewhale` in the folder you want to work on.
 2. **Connect a model.** Run `/provider` (or press `F3`) to add a hosted key or
    pick a local runtime. If Ollama is already running with a chat model,

@@ -11,9 +11,9 @@ works with many model providers. **DeepSeek** is the default.
 
 The command is `codewhale`. `codew` is a shorter alias for the same program.
 
-This guide was written by installing **v0.10.0** (released 2026-09-22) on a
-fresh **Ubuntu 24.04 x86_64** machine, on every path described here. Every
-command shown was run and its output checked (see the [install receipts](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)). Steps that
+The installation paths were first checked with **v0.10.0** (released 2026-09-22) on a
+fresh **Ubuntu 24.04 x86_64** machine. The dated
+[install receipts](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md) record the commands and output checked at that time. Steps that
 could not be run on that machine are marked **(untested on this VM: reason)**.
 macOS, Windows and Android are out of scope, apart from a few notes. A second
 pass re-ran the installer, manual-download, archive and npm paths, the no-key
@@ -26,6 +26,29 @@ Release or package. Between releases, `main` may already describe the next
 version (for example a v0.10.1 source candidate before its tag). A
 prebuilt candidate is available through the official installer only after its
 tag, checksums and release assets exist. Contributors can build `main` now.
+
+## One account for your provider keys
+
+[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login)
+to keep your model providers' API keys in one place. Add, replace or remove
+keys in your account's [Providers settings](https://app.codewhale.net/providers),
+or use the terminal commands below. On another device, sign in and select the
+Codewhale model route to use the same account keys without pasting them again.
+
+```bash
+codewhale login
+codewhale account keys set deepseek  # asks for the key without echoing it
+codewhale account keys list         # shows status, never the key itself
+codewhale --provider codewhale      # use your account's model route
+```
+
+The account setup here describes the 0.10.1 source candidate. Signing in does
+not upload existing local keys. To copy one deliberately, use
+`codewhale account keys set deepseek --from-local`. Account keys stay on the
+service; they are used for account-routed requests, not downloaded into each
+device's local key store. You can keep using local keys or a local model
+without an account. See [account key settings](CONFIGURATION.md#account-provider-keys)
+for updating keys and switching between these options.
 
 ## Test and contribute to current source
 

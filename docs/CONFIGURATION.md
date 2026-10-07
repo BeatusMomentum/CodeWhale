@@ -329,29 +329,50 @@ If a repo-local config declares `api_key`, `base_url`, `providers`, `provider`,
 `mcp_config_path`, `notes_path`, `hotbar`, `allow_shell = true`, or `instructions`,
 Codewhale ignores that key and keeps the user's global setting.
 
-The consolidated `codewhale` runtime uses one config file for DeepSeek auth
-and model defaults. `codewhale auth set --provider deepseek` saves
-the key to `~/.codewhale/config.toml` (migrating legacy `~/.deepseek/config.toml`
-on first launch when needed), and `codewhale --model deepseek-v4-flash` is
-forwarded to the TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes the
-`DEEPSEEK_*` twins of these variables; a `DEEPSEEK_*` value you set yourself is
-still read as a legacy alias when the `CODEWHALE_*` one is unset.
+The consolidated `codewhale` runtime uses `~/.codewhale/config.toml` for
+provider and model settings. `codewhale auth set --provider deepseek` saves
+the key in the local secret store (a private file under `~/.codewhale/secrets/`
+by default; the OS keychain is an explicit option), rather than writing it
+into that config file. Legacy `~/.deepseek/config.toml` is migrated on first
+launch when needed. `codewhale --model deepseek-v4-flash` is forwarded to the
+TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes `DEEPSEEK_*` twins;
+a value you set yourself remains a legacy alias when its `CODEWHALE_*`
+equivalent is unset.
 
-`codewhale login` signs in to the Codewhale account — it is the same browser
-device flow as `codewhale account login`, not a provider-key command. Provider
-credentials are configured exclusively through `codewhale auth set
---provider <provider>`.
+### Account provider keys
 
-That provider credential is distinct from the optional managed-product
-account. `codewhale account login` starts the Codewhale browser device flow;
-`codewhale account status` and `codewhale account logout` inspect or remove the
-session for the selected `--profile`. Account sessions prefer the OS
-credential manager and fall back automatically to the private `0600`
-Codewhale secrets file when no credential manager is available (headless
-hosts, SSH, containers).
-`codewhale account keys list|set|remove` manages the
-signed-in account's BYOK vault without displaying secret values. The older
-`codewhale cloud ...` spelling remains a command alias.
+A Codewhale account lets you **manage your provider API keys in one place**.
+[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login),
+then add, replace or remove keys in [Providers settings](https://app.codewhale.net/providers)
+or from the terminal:
+
+```bash
+codewhale login                         # browser sign-in; also: account login
+codewhale account keys set deepseek      # hidden prompt; add or replace a key
+codewhale account keys list              # configured status, never secret values
+codewhale --provider codewhale           # use the account's model route
+```
+
+Account keys stay on the service and are used for account-routed requests.
+Sign in on another device and choose Codewhale in `/provider` to use them
+without pasting keys again. `/models` lists models available to that account.
+Replacing a saved account key affects subsequent requests through this route;
+it does not change independent local copies or revoke keys at the provider.
+`codewhale account keys remove deepseek` removes the account's saved key.
+
+Login does **not** upload existing local keys. If you want to copy one, choose
+`codewhale account keys set deepseek --from-local` explicitly. Normal local
+provider setup remains `codewhale auth set --provider <provider>`; local keys
+and local models work without a Codewhale account. Signing in preserves an
+explicit or already configured local provider. Choose `--provider codewhale`
+when you want the account route instead.
+
+The account session is separate from provider keys. `codewhale account status`
+inspects it; `codewhale account logout` removes it for the selected `--profile`
+without removing your provider keys. Account sessions use the private `0600`
+Codewhale secrets file, scoped to the profile and account API origin; they do
+not use the OS keychain. The older `codewhale cloud ...` spelling remains an
+alias for account commands.
 
 ### Portable config bundles
 
@@ -468,7 +489,7 @@ Anthropic providers, set `provider = "<id>"` or pass
 For the provider-by-provider registry, including wire protocol, auth variables,
 default base URLs, model IDs, and capability metadata, see
 [PROVIDERS.md](PROVIDERS.md).
-The facade saves provider credentials to the shared user config and forwards
+The facade saves provider credentials in the local secret store and forwards
 the resolved key, base URL, provider, and model to the TUI process. Use
 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` or
 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` or
