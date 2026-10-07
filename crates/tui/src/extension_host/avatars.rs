@@ -296,10 +296,16 @@ mod tests {
             )
             .unwrap();
         let pack = codewhale_ratatui::whale_girl::pack().clone();
-        let png = codewhale_ratatui::whale_girl::ATLASES
-            .iter()
-            .map(|p| p.to_vec())
-            .collect::<Vec<_>>();
+        // Ownership does not depend on native artwork. Generate a valid page
+        // so the test also works from a package without repository-only PNGs.
+        let mut page = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(
+            u32::from(pack.columns) * u32::from(pack.tile_width),
+            u32::from(pack.rows) * u32::from(pack.tile_height),
+        )
+        .write_to(&mut page, image::ImageFormat::Png)
+        .unwrap();
+        let png = vec![page.into_inner(); pack.atlases.len()];
         assert!(
             registry.register(&params(a.clone())).is_err(),
             "synchronous admission cannot skip review"
