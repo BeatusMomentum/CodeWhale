@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configured approval expiry belongs to the held Engine request; hiding or covering its card cannot restart the deadline, and a late queued answer cannot approve an expired call.
 - Tool discovery keeps the highest-ranked matches when a result batch exceeds the existing cache bounds, preserving search order and the 16 KiB limit (adapted from @AdityaVG13's #6393).
 - Model-switch receipts now translate their session-only saving note in every complete locale pack; the three save commands remain directly usable (thanks @Lstarsky0, #6875).
+- Weixin bridge threads belong to the account and chat that created them:
+  resuming or listing another chat's thread is refused. An explicit `/new` after
+  an account replacement keeps the old account's private receipt and never
+  replays its prompts automatically.
+- Windows messaging bridges retry a briefly locked record replacement
+  (EPERM/EACCES/EBUSY) with bounded delays and never delete the previous record
+  first.
+- The website and README installation guides are generated from one shared
+  source, and the critical Simplified Chinese guides were re-reviewed against
+  current English.
 - A Codewhale sign-in that expired, or an account service that is unreachable,
   no longer blocks turns on your own provider key. The turn uses your local
   settings and Codewhale says once how to restore account preferences.
