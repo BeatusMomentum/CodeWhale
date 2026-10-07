@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configured approval expiry belongs to the held Engine request; hiding or covering its card cannot restart the deadline, and a late queued answer cannot approve an expired call.
 - Tool discovery keeps the highest-ranked matches when a result batch exceeds the existing cache bounds, preserving search order and the 16 KiB limit (adapted from @AdityaVG13's #6393).
 - Model-switch receipts now translate their session-only saving note in every complete locale pack; the three save commands remain directly usable (thanks @Lstarsky0, #6875).
+- A Codewhale sign-in that expired, or an account service that is unreachable,
+  no longer blocks turns on your own provider key. The turn uses your local
+  settings and Codewhale says once how to restore account preferences.
+- `codewhale login` keeps a DeepSeek route you chose, or one with a local key,
+  instead of switching it to the managed Codewhale provider.
 - The bundled `computer-use` plugin is 0.12.1, reconciled with canonical source
   `f585fbd256499622a725e5abadfc2382428c2797` while retaining Core's embedding
   manifest and version contract. Its image renderer lock now carries Sharp 0.35.5.
