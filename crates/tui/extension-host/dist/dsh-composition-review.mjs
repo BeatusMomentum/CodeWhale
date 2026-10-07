@@ -12190,6 +12190,14 @@ var init_storage = __esm({
   }
 });
 
+// src/shims/avatars.ts
+var init_avatars = __esm({
+  "src/shims/avatars.ts"() {
+    "use strict";
+    init_owned();
+  }
+});
+
 // src/tier.ts
 var init_tier = __esm({
   "src/tier.ts"() {
@@ -12224,6 +12232,7 @@ var init_root = __esm({
     init_prompt();
     init_storage();
     init_mcp();
+    init_avatars();
     init_skills();
     init_tier();
     init_commands();

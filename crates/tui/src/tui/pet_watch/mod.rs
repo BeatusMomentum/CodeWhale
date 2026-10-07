@@ -23,6 +23,7 @@ use std::{
 mod appearance;
 mod audio;
 mod audio_cursor;
+mod avatars;
 mod graphics;
 mod habitat;
 mod live;
@@ -41,6 +42,7 @@ pub enum Control {
 }
 #[derive(Default)]
 pub struct PetWatch {
+    avatars: avatars::Avatars,
     worker: Option<Worker>,
     session: Option<String>,
     active_turn_id: Option<String>,
@@ -69,6 +71,15 @@ pub struct PetWatch {
     result_scroll: u16,
 }
 impl PetWatch {
+    pub fn avatar_choices(&self) -> String {
+        self.avatars.choices()
+    }
+    pub fn select_avatar(&mut self, key: &str) -> bool {
+        self.avatars.select(key)
+    }
+    pub fn preview_avatar(&mut self, name: &str, view: bool) -> bool {
+        self.avatars.preview(name, view)
+    }
     pub fn set_sound(&mut self, enabled: bool) {
         self.sound_requested = enabled;
     }
@@ -94,6 +105,8 @@ impl PetWatch {
         self.work_enter_pending = false;
         self.work_complete = false;
         self.result_scroll = 0;
+        self.avatars.view = None;
+        self.avatars.action = None;
     }
     fn ensure(&mut self, session: Option<String>) {
         if self.session != session {
@@ -385,6 +398,9 @@ pub fn tick(app: &mut App, now: Instant) {
         && app.onboarding == crate::tui::app::OnboardingState::None
         && is_open(app);
     let motion = visible && crate::tui::underwater::decorative_shell_motion_enabled(app);
+    if visible && app.pet_watch.avatars.refresh(&app.workspace, now) {
+        app.needs_redraw = true;
+    }
     let waiting = matches!(
         ShellPhase::from_app(app),
         ShellPhase::Waiting | ShellPhase::Approval
@@ -452,7 +468,8 @@ pub fn tick(app: &mut App, now: Instant) {
             cell_width: cell.0,
             cell_height: cell.1,
             motion,
-            pixels: crate::tui::mark::kitty_graphics_supported()
+            pixels: matches!(state.avatars.key.as_str(), "" | "whale")
+                && crate::tui::mark::kitty_graphics_supported()
                 && app.synchronized_output_enabled
                 && std::env::var("CODEWHALE_PET_GRAPHICS").as_deref() != Ok("braille"),
             visible,
@@ -574,6 +591,33 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
         Block::default().style(Style::default().bg(Color::Rgb(bg[0], bg[1], bg[2]))),
         area,
     );
+    let (act, clock) = avatars::act(raster, app.is_loading);
+    let reduced = !crate::tui::underwater::decorative_shell_motion_enabled(app);
+    let tank = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    if app
+        .pet_watch
+        .avatars
+        .paint(tank, frame.buffer_mut(), act, clock, reduced)
+    {
+        let preview = app.pet_watch.avatars.action.as_deref().or(app
+            .pet_watch
+            .avatars
+            .view
+            .as_deref());
+        let label = preview.map_or(label.clone(), |p| format!("/pet action {p} · {label}"));
+        frame.render_widget(
+            Paragraph::new(label).style(chrome_style(&app.ui_theme, ChromeInk::Metadata)),
+            Rect {
+                y: area.bottom().saturating_sub(1),
+                height: 1,
+                ..area
+            },
+        );
+        return;
+    }
     if image {
         let tank = Rect {
             height: area.height.saturating_sub(1),

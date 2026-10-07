@@ -99,6 +99,7 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod avatars;
 mod computer_display;
 mod context;
 mod diagnostics;
@@ -2556,6 +2557,8 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/skills/{name}/audit", get(audit_skill_api))
         .route("/v1/apps/mcp/tools", get(list_mcp_tools))
         .route("/v1/apps/plugins", get(plugins::list_plugins))
+        .route("/v1/apps/avatars", get(avatars::list_avatars))
+        .route("/v1/apps/avatars/{handle}/atlases/{page}", get(avatars::get_atlas))
         .route(
             "/v1/apps/plugins/install",
             post(plugins::install_plugin_api),

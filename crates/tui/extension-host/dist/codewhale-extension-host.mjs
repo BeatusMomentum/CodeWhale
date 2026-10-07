@@ -13262,7 +13262,7 @@ var init_protocol_generated = __esm({
       },
       RegisterParams: {
         strict: true,
-        required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
+        required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "avatar_pack", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
         optional: { scope: { ref: "EntryRef" } }
       },
       RegisterSpecWire: {
@@ -13377,7 +13377,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "avatar_pack" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
@@ -13953,6 +13953,74 @@ var init_storage = __esm({
   }
 });
 
+// src/shims/avatars.ts
+function normalizeAvatarPack(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => key !== "path")) throw new TypeError("avatar pack supports only path");
+  const { path } = value;
+  if (typeof path !== "string" || !path || Buffer.byteLength(path, "utf8") > 256 || !path.endsWith(".json") || /[\\:\u0000-\u001f\u007f-\u009f]/u.test(path) || path.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new TypeError("avatar pack path must be a bounded bundle-relative path with normal slash-separated components");
+  }
+  return Object.freeze({ path });
+}
+function defineAvatarsService(host2) {
+  class AvatarsShim extends Service {
+    constructor(ctx) {
+      super(ctx, "avatars");
+    }
+    registerPack(definition) {
+      const ctx = this.ctx;
+      const owner = host2.ownerOf(ctx);
+      if (!owner) throw new Error("avatars.registerPack called outside an extension owner");
+      const root = normalizeAvatarPack(definition);
+      return ctx.effect(() => host2.avatarPacks.register(owner, root), `avatars.registerPack(${JSON.stringify(root.path)})`);
+    }
+  }
+  Object.freeze(AvatarsShim.prototype);
+  return AvatarsShim;
+}
+var MAX_AVATAR_PACKS_PER_OWNER, MAX_AVATAR_PACKS_PER_HOST, AvatarPacks;
+var init_avatars = __esm({
+  "src/shims/avatars.ts"() {
+    "use strict";
+    init_define_BUILTIN_MODULE_DIGESTS();
+    init_lib2();
+    init_owned();
+    MAX_AVATAR_PACKS_PER_OWNER = 4;
+    MAX_AVATAR_PACKS_PER_HOST = 16;
+    AvatarPacks = class {
+      registrations;
+      owners = /* @__PURE__ */ new Map();
+      count = 0;
+      constructor(rpc2, ownedBy, warn) {
+        this.registrations = new OwnedRegistrations(rpc2, "avatar_pack", ownedBy, warn);
+      }
+      register(owner, definition) {
+        if (owner.state !== "activating" && owner.state !== "active") throw new Error("avatar owner is not live");
+        const { path } = normalizeAvatarPack(definition);
+        const roots = this.owners.get(owner) ?? /* @__PURE__ */ new Map();
+        if (roots.has(path)) throw new Error("avatar pack is already registered; dispose it before registering it again");
+        if (roots.size >= MAX_AVATAR_PACKS_PER_OWNER || this.count >= MAX_AVATAR_PACKS_PER_HOST) throw new RangeError("avatar pack owner or host registration limit reached");
+        const undo = this.registrations.add({ owner, name: path, disposed: false }, { name: path, description: "" });
+        const dispose = () => {
+          if (roots.get(path) !== dispose) return;
+          roots.delete(path);
+          this.count--;
+          if (!roots.size) this.owners.delete(owner);
+          undo();
+        };
+        roots.set(path, dispose);
+        this.owners.set(owner, roots);
+        this.count++;
+        return dispose;
+      }
+      forget(owner) {
+        for (const dispose of [...this.owners.get(owner)?.values() ?? []]) dispose();
+        this.registrations.forget(owner);
+      }
+    };
+  }
+});
+
 // src/tier.ts
 function parseTier(argv) {
   let found;
@@ -14198,6 +14266,7 @@ var init_root = __esm({
     init_prompt();
     init_storage();
     init_mcp();
+    init_avatars();
     init_skills();
     init_tier();
     init_commands();
@@ -14222,10 +14291,11 @@ var init_root = __esm({
       "prompt",
       "storage",
       "skills",
+      "avatars",
       "mcp",
       "logger"
     ]);
-    PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "skills", "mcp", "logger", "events", "reflect", "registry"]);
+    PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "skills", "avatars", "mcp", "logger", "events", "reflect", "registry"]);
     ACTIVATE_DEADLINE_MS = 5e3;
     DISPOSE_DEADLINE_MS = 2e3;
     ownerStorage = new AsyncLocalStorage();
@@ -14261,6 +14331,7 @@ var init_root = __esm({
           (message, owner) => this.log("warn", message, owner)
         );
         this.mcpDefinitions = new McpDefinitions(rpc2, (owner) => owner.mcpDefinitions, (message, owner) => this.log("warn", message, owner));
+        this.avatarPacks = new AvatarPacks(rpc2, (owner) => owner.avatarPacks, (message, owner) => this.log("warn", message, owner));
         this.skillRoots = new SkillRoots(
           rpc2,
           (owner) => owner.skillRoots,
@@ -14333,6 +14404,7 @@ var init_root = __esm({
         });
         const ShellHooksShim = defineShellHooksService({ ownerOf: (ctx) => ctx[OWNER], registrations: this.shellRegistrations });
         const McpShim = defineMcpService({ ownerOf: (ctx) => ctx[OWNER], definitions: this.mcpDefinitions });
+        const AvatarsShim = defineAvatarsService({ ownerOf: (ctx) => ctx[OWNER], avatarPacks: this.avatarPacks });
         const SkillsShim = defineSkillsService({ ownerOf: (ctx) => ctx[OWNER], skillRoots: this.skillRoots });
         class StorageShim extends Service {
           constructor(ctx) {
@@ -14363,6 +14435,7 @@ var init_root = __esm({
         shimClasses.set("prompt", PromptShim);
         shimClasses.set("storage", StorageShim);
         shimClasses.set("skills", SkillsShim);
+        shimClasses.set("avatars", AvatarsShim);
         shimClasses.set("mcp", McpShim);
         shimClasses.set("shellHooks", ShellHooksShim);
         root.plugin(ToolsShim);
@@ -14370,6 +14443,7 @@ var init_root = __esm({
         root.plugin(PromptShim);
         root.plugin(StorageShim);
         root.plugin(SkillsShim);
+        root.plugin(AvatarsShim);
         root.plugin(McpShim);
         root.plugin(ShellHooksShim);
         shimClasses.set("loader", ReviewedLoader);
@@ -14385,6 +14459,7 @@ var init_root = __esm({
       hookRegistrations;
       promptSections;
       skillRoots;
+      avatarPacks;
       mcpDefinitions;
       log(level, msg, owner) {
         const params = { level, msg: msg.slice(0, 8192) };
@@ -14426,7 +14501,7 @@ var init_root = __esm({
         const scopeKey = params.scope === void 0 ? void 0 : `${params.scope.path}\0${params.scope.sha256}`;
         if (scopeKey !== void 0) {
           if (params.scope?.path !== params.entry.path || params.scope?.sha256 !== params.entry.sha256) return { status: "failed", diagnostic: "scope does not match the core-selected entry" };
-          parent ??= { ref: params.owner, pluginName: params.plugin_name, fibers: [], pendingRegistrations: /* @__PURE__ */ new Set(), refusals: [], tools: /* @__PURE__ */ new Map(), commands: /* @__PURE__ */ new Map(), hooks: /* @__PURE__ */ new Map(), shellHooks: /* @__PURE__ */ new Map(), promptSections: /* @__PURE__ */ new Map(), skillRoots: /* @__PURE__ */ new Map(), mcpDefinitions: /* @__PURE__ */ new Map(), entries: /* @__PURE__ */ new Set(), views: /* @__PURE__ */ new Map(), state: "active", ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir } };
+          parent ??= { ref: params.owner, pluginName: params.plugin_name, fibers: [], pendingRegistrations: /* @__PURE__ */ new Set(), refusals: [], tools: /* @__PURE__ */ new Map(), commands: /* @__PURE__ */ new Map(), hooks: /* @__PURE__ */ new Map(), shellHooks: /* @__PURE__ */ new Map(), promptSections: /* @__PURE__ */ new Map(), skillRoots: /* @__PURE__ */ new Map(), avatarPacks: /* @__PURE__ */ new Map(), mcpDefinitions: /* @__PURE__ */ new Map(), entries: /* @__PURE__ */ new Set(), views: /* @__PURE__ */ new Map(), state: "active", ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir } };
           if (parent.state !== "active" || parent.ref.plugin_id !== params.owner.plugin_id || parent.ref.generation !== params.owner.generation || parent.pluginName !== params.plugin_name) return { status: "failed", diagnostic: "scope owner was withdrawn" };
           parent.views ??= /* @__PURE__ */ new Map();
           this.owners.set(key, parent);
@@ -14455,6 +14530,7 @@ var init_root = __esm({
           shellHooks: /* @__PURE__ */ new Map(),
           promptSections: /* @__PURE__ */ new Map(),
           skillRoots: /* @__PURE__ */ new Map(),
+          avatarPacks: /* @__PURE__ */ new Map(),
           mcpDefinitions: /* @__PURE__ */ new Map(),
           entries: /* @__PURE__ */ new Set(),
           ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
@@ -14520,6 +14596,7 @@ var init_root = __esm({
             this.shellRegistrations.forget(owner);
             this.promptSections.forget(owner);
             this.skillRoots.forget(owner);
+            this.avatarPacks.forget(owner);
             this.mcpDefinitions.forget(owner);
             if (scopeKey === void 0) {
               if (this.owners.get(key) === owner) this.owners.delete(key);
@@ -14593,6 +14670,7 @@ var init_root = __esm({
           ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
           ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
           ...[...owner.mcpDefinitions.values()].map((server) => `mcp_server:${server.name}`),
+          ...[...owner.avatarPacks.values()].map((pack) => `avatar_pack:${pack.name}`),
           ...[...owner.skillRoots.values()].map((root) => `skill_root:${root.name}`)
         ];
         for (const fiber of owner.fibers) {
@@ -14604,6 +14682,7 @@ var init_root = __esm({
         this.shellRegistrations.forget(owner);
         this.promptSections.forget(owner);
         this.skillRoots.forget(owner);
+        this.avatarPacks.forget(owner);
         this.mcpDefinitions.forget(owner);
         if (scopeKey === void 0) this.owners.delete(ref2.owner_token);
         else parent?.views?.delete(scopeKey);
