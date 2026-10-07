@@ -9,7 +9,7 @@
     "prebuild": "node scripts/derive-facts.mjs && node scripts/derive-changelog.mjs && node scripts/derive-install.mjs",
     "build": "next build",
     "start": "next start",
-    "test": "vitest run",
+    "test": "node --test scripts/dependency-security.test.mjs && vitest run",
     "check": "npm run check:facts && npm run check:latest-release && npm run prebuild && npm run check:docs && npm run check:tokens && npm run lint && tsc --noEmit && npm run build",
     "check:facts": "node scripts/check-facts.mjs && node scripts/check-cloud-facts.mjs",
     "sync:latest-release": "node scripts/sync-latest-release.mjs",
@@ -27,7 +27,9 @@
     "preview": "npm run build:cloudflare && opennextjs-cloudflare populateCache local --config .cloudflare/opennext.json && node node_modules/wrangler/bin/cf-wrangler.js dev",
     "predeploy": "node scripts/check-kv-id.mjs",
     "deploy": "npm run build:cloudflare && opennextjs-cloudflare populateCache remote --config .cloudflare/opennext.json && cf deploy --prebuilt",
-    "cf-typegen": "cf workers types"
+    "cf-typegen": "cf workers types",
+    "postinstall": "node scripts/patch-braces.mjs",
+    "audit:dependencies": "node scripts/audit-dependencies.mjs"
   },
   "dependencies": {
     "next": "^16.3.6",
@@ -58,8 +60,9 @@
     "esbuild": "0.28.1",
     "nanoid": "^3.3.17",
     "postcss": "^8.5.18",
-    "sharp": "0.35.4",
+    "sharp": "0.35.5",
     "ws": "8.21.0",
-    "undici": "7.29.1"
+    "undici": "7.29.1",
+    "postcss-selector-parser": "7.1.6"
   }
 }
