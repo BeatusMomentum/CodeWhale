@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `codewhale login` keeps a DeepSeek route you chose, or one with a local key,
   instead of switching it to the managed Codewhale provider.
 - The bundled `computer-use` plugin is 0.12.1, reconciled with canonical source
-  `f585fbd256499622a725e5abadfc2382428c2797` while retaining Core's embedding
+  `724f9c422db1a51880dc81154dae70816c475ed8` while retaining Core's embedding
   manifest and version contract. Its image renderer lock now carries Sharp 0.35.5.
 - The bundled first-party catalog pins marketplace revision
   `6512f1dfaa91ee287e9f81ebabaf4909e8a371a3` and lists all 19 reviewed plugins,
@@ -49,6 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiles and tests on its Node 20 runtime. The website keeps one reviewed,
   hash-verified depth guard for an unpatched `braces` advisory
   (GHSA-vfj7-8cjw-p6xm); its raw audit findings are retained, not hidden.
+- Pasting through Windows Terminal (Ctrl+Shift+V) no longer drops emoji and
+  other characters outside the Basic Multilingual Plane. Release binaries and source builds carry
+  a small patch to crossterm 0.29.0 in `patches/` (the change proposed upstream
+  as crossterm-rs/crossterm#1073); a real Windows Terminal paste of 24 Unicode
+  lines is now a release gate.
+- Experimental extension host: reviewed Native plugins can register avatar
+  packs with `ctx.avatars.registerPack` (`/pet avatar [key]`, `/pet action|view
+  <name>`). `/plugin import dsh <package-dir>` reviews a DeepSeek Harness
+  bundle and now lists the Native host code it contains; `approve <dir>
+  <content-hash>` installs it disabled and untrusted. Trusted host plugins stay
+  trusted across a restart, enabling a second host plugin activates it without
+  `/plugin reload`, and the review no longer crashes the TUI.
 
 Codewhale v0.10.1 focuses on reliability and first-run behavior. Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are

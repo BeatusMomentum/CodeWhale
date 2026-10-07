@@ -3970,6 +3970,11 @@ impl CommandPluginContext for PluginAdapter<'_> {
         }
         let mut app = self.host.app.borrow_mut();
         std::sync::Arc::make_mut(&mut app.plugin_registry).enable(selector)?;
+        // Rediscover, as install and reload do: an in-place enable keeps the
+        // pinned Native selection, so a host plugin enabled after a preset
+        // catalog was already active would never be activated.
+        let workspace = app.workspace.clone();
+        app.plugin_registry = app.plugin_registry.rediscover_for_workspace(&workspace);
         app.refresh_skill_cache();
         Ok(())
     }
@@ -4212,6 +4217,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
                 remote_servers: conversion.remote_servers,
                 local_servers: conversion.local_servers,
                 network_hosts: conversion.network_hosts,
+                native_rows: conversion.native_rows,
                 requires_node: conversion.requires_node,
                 manual_ports: conversion
                     .outcomes

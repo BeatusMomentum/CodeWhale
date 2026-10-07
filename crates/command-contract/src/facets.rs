@@ -794,6 +794,8 @@ pub struct PluginDshPreview {
     pub remote_servers: Vec<String>,
     pub local_servers: Vec<String>,
     pub network_hosts: Vec<String>,
+    /// Rows that become Native host code (JavaScript run by the extension host).
+    pub native_rows: Vec<String>,
     pub requires_node: bool,
     /// One line per skipped row or patch operation (a manual port).
     pub manual_ports: Vec<String>,

@@ -2825,8 +2825,10 @@ Internal follow-ups and RLM child calls inherit the admitted preferences;
 they do not re-read the host operator's account in the middle of that work.
 
 Without a supplied snapshot, the Engine reads the signed-in profile from the
-configured account service at turn admission. An unavailable or invalid signed-in
-profile stops admission with an actionable error. An account without saved
+configured account service at turn admission. When that Engine-loaded profile is
+unavailable or invalid, the turn uses the signed-out local constitution and shows
+a notice once per session; an invalid host-supplied `profile_constitution` snapshot still fails
+the turn, and `GET /v1/constitution` still reports the error. An account without saved
 preferences uses an explicit default snapshot; a signed-out account uses the
 existing local constitution. Hosted transports always supply the owning
 account snapshot, including defaults, so local preferences cannot leak between

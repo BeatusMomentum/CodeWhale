@@ -2542,6 +2542,7 @@ async fn run_async_main_dispatch(
             }
             Commands::Exec(args) => {
                 let config = load_config_from_cli(&cli)?;
+                let plugin_registry = policy_current_registry(plugin_registry);
                 let workspace = cli.workspace.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 });
@@ -2894,6 +2895,7 @@ async fn run_async_main_dispatch(
                     io::stdout().is_terminal(),
                 )?;
                 let config = load_config_from_cli(&cli)?;
+                let plugin_registry = policy_current_registry(plugin_registry);
                 let prepared = prepare_interactive_config(&cli, &config, true)?;
                 let source_id = resolve_session_id(session_id, last, &prepared.workspace)?;
                 let (prepared, new_session_id) = prepare_mounted_session(
@@ -13060,6 +13062,26 @@ fn normalize_windows_config_path_str(path: &str) -> String {
     normalized.to_ascii_lowercase()
 }
 
+/// Startup discovery runs before config can select the extension-host policy,
+/// so it judged every reviewed Native plugin `CapabilitiesChanged`. Call this
+/// after the config load to re-judge under the installed policy, as
+/// `/plugin reload` does, so trusted host plugins survive a restart. With the
+/// flag off it returns the startup snapshot unchanged.
+///
+/// Known limits: plugin-declared providers keep the startup snapshot, and the
+/// `mcp`, `doctor`, `setup`, `pr`, `review` and workflow-tool subcommands do
+/// not call this yet.
+fn policy_current_registry(
+    registry: Arc<crate::plugins::PluginRegistry>,
+) -> Arc<crate::plugins::PluginRegistry> {
+    if crate::plugins::activation::extension_host_policy_enabled() {
+        let workspace = registry.workspace().to_path_buf();
+        registry.rediscover_for_workspace(&workspace)
+    } else {
+        registry
+    }
+}
+
 fn interactive_tui_allow_shell(yolo: bool, config: &Config) -> bool {
     yolo || config.interactive_allow_shell()
 }
@@ -13097,6 +13119,7 @@ async fn run_interactive_with_notice(
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
     tui::ui::require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
+    let plugin_registry = policy_current_registry(plugin_registry);
     let prepared = prepare_interactive_config(cli, config, resume_session_id.is_some())?;
     let (prepared, resume_session_id) = if let Some(selector) = resume_session_id {
         let (prepared, id) = prepare_mounted_session(

@@ -2577,10 +2577,11 @@ fn run_with<T: CloudTransport, W: Write>(
                 out,
                 "dry-run: remote settings import is not available; local config unchanged"
             )?;
-            // Show the invariant: Bearer custody stays in the OS keyring, never in config.toml.
+            // Show the invariant: account session tokens stay in the private
+            // Codewhale secrets file, never in config.toml.
             writeln!(
                 out,
-                "Secure custody: Bearer tokens remain in the OS keyring"
+                "Secure custody: account session tokens stay in the private Codewhale secrets file, never in config.toml"
             )?;
             Ok(())
         }
