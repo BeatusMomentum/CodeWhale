@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -57,6 +57,12 @@ instal·lacions a la mateixa màquina acaben disputant-se el `PATH`.
 </details>
 
 ## Inici ràpid
+
+**Les claus API dels teus proveïdors, en un sol lloc.** [Crea un compte de Codewhale](https://app.codewhale.net/register)
+o executa `codewhale login` per iniciar la sessió. Desa i actualitza les claus API al teu compte
+i fes-les servir a través de la ruta de models de Codewhale als dispositius on hagis iniciat la sessió.
+[Configura les claus del compte](docs/CONFIGURATION.md#account-provider-keys).
+Iniciar la sessió no puja les claus locals existents; pots continuar fent-ne un ús local sense compte.
 
 1. **Obre el teu projecte.** Executa `codewhale` a la carpeta on vols treballar.
 2. **Connecta un model.** Executa `/provider` (o prem `F3`) per afegir una clau

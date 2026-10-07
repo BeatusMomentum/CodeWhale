@@ -714,7 +714,7 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
 /// appearance studio, the native window, source selection, replay export and
 /// the single audio lease. The pet has no workbar panel.
 pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
-    const USAGE: &str = "Usage: /pet [on|off|status|appearance|window|source|export|sound on|off]";
+    const USAGE: &str = "Usage: /pet [on|off|status|appearance|window|source|export|sound on|off|avatar [key]|action [name|live]|view [name|live]]";
     use crate::tui::pet_watch::{self, Control};
     let words = arg
         .map(str::trim)
@@ -765,6 +765,21 @@ pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
             ),
             app.pet_watch.status()
         )),
+        ["avatar"] => CommandResult::message(app.pet_watch.avatar_choices()),
+        ["avatar", key] => {
+            if !app.pet_watch.select_avatar(key) {
+                return CommandResult::error(USAGE);
+            }
+            app.needs_redraw = true;
+            CommandResult::message(format!("/pet avatar {key}"))
+        }
+        [kind @ ("action" | "view"), name] => {
+            if !app.pet_watch.preview_avatar(name, *kind == "view") {
+                return CommandResult::error(USAGE);
+            }
+            app.needs_redraw = true;
+            CommandResult::message(format!("/pet {kind} {name}"))
+        }
         ["appearance"] => queued(app, Control::Browser),
         ["window"] => queued(app, Control::Window),
         ["source"] => queued(app, Control::Select),

@@ -1056,7 +1056,7 @@ and live state comes only from a resumed thread's SSE stream.
 
 **Threads** (durable runtime data model)
 - `GET /v1/threads?limit=50&include_archived=false&archived_only=false`
-- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false`
+- `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false&thread_ids=<id>,<id>`
 - `GET /v1/threads/running`
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
@@ -1069,6 +1069,11 @@ and live state comes only from a resumed thread's SSE stream.
   (read-only; shape in [RECEIPTS.md](RECEIPTS.md))
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same, for one turn;
   `404` for an unknown thread or a turn that is not this thread's
+
+`thread_ids` is a comma-separated list of up to 200 IDs (each at most 128 bytes).
+The route filters exact IDs before applying `limit`, preserving newest-first
+order. This is a selection filter, not an ownership or authorization check;
+the Runtime bearer token remains the access boundary.
 
 `POST /v1/threads` accepts optional execution defaults in addition to the
 provider, model, workspace, and permission fields:
@@ -2820,8 +2825,10 @@ Internal follow-ups and RLM child calls inherit the admitted preferences;
 they do not re-read the host operator's account in the middle of that work.
 
 Without a supplied snapshot, the Engine reads the signed-in profile from the
-configured account service at turn admission. An unavailable or invalid signed-in
-profile stops admission with an actionable error. An account without saved
+configured account service at turn admission. When that Engine-loaded profile is
+unavailable or invalid, the turn uses the signed-out local constitution and shows
+a notice once per session; an invalid host-supplied `profile_constitution` snapshot still fails
+the turn, and `GET /v1/constitution` still reports the error. An account without saved
 preferences uses an explicit default snapshot; a signed-out account uses the
 existing local constitution. Hosted transports always supply the owning
 account snapshot, including defaults, so local preferences cannot leak between

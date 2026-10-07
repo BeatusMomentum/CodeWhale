@@ -343,14 +343,17 @@ New integrations should prefer `codewhale app-server`.")]
         after_help = "The browser receives a one-time loopback bootstrap capability, never the Runtime token.\nThe capability is exchanged for a bounded, process-local HttpOnly, SameSite=Strict web session and then invalidated."
     )]
     Web(WebArgs),
-    /// Sign in to your Codewhale account (browser device flow).
+    /// Sign in to your Codewhale account to manage provider API keys in one place.
+    #[command(
+        after_help = "Create an account at https://app.codewhale.net/register or sign in through the browser.\nSave a provider key with `codewhale account keys set deepseek`, then choose Codewhale in /provider to use it across your signed-in devices.\nSigning in does not upload existing local keys. Local use does not require an account."
+    )]
     Login(LoginArgs),
     /// Remove saved authentication state (every provider key, OAuth login,
     /// the account session and the Daytona token). Asks before deleting.
     Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
-    /// Sign in to your Codewhale account and manage account-scoped provider keys.
+    /// Manage your Codewhale account and centrally stored provider keys.
     #[command(visible_alias = "cloud")]
     Account(cloud::CloudArgs),
     /// Offload a coding agent to the Codewhale cloud. Never spends or pushes without --confirm.
@@ -9640,8 +9643,12 @@ verbosity = "concise"
             "login help must describe account sign-in: {help}"
         );
         assert!(
-            !help.to_lowercase().contains("api key"),
-            "login help must not advertise provider API keys: {help}"
+            help.contains("manage provider API keys"),
+            "login help must explain the account's immediate benefit: {help}"
+        );
+        assert!(
+            help.contains("Signing in does not upload existing local keys"),
+            "login help must explain the local-key upload boundary: {help}"
         );
     }
 

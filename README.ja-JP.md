@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -56,6 +56,12 @@ Docker、Nix、Linux 上の Homebrew、Android/Termux、チェックサム検証
 </details>
 
 ## クイックスタート
+
+**プロバイダーの API キーを一か所で管理。** [Codewhale アカウントを作成](https://app.codewhale.net/register)するか、
+`codewhale login` を実行してログインしてください。API キーをアカウントに保存・更新すると、
+ログイン済みのデバイスから Codewhale のモデルルート経由で利用できます。
+[アカウントのキーを設定する](docs/CONFIGURATION.md#account-provider-keys)。
+ログインしても既存のローカルキーはアップロードされません。アカウントなしでもローカルで利用できます。
 
 1. **プロジェクトを開く。** 作業したいフォルダーで `codewhale` を実行します。
 2. **モデルを接続する。** `/provider`（または `F3`）を実行して、ホスト型のキーを追加するか、ローカルランタイムを選びます。

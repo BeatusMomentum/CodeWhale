@@ -136,3 +136,9 @@ codegen-units = 1
 # them as 2 columns, causing cell-offset rendering glitches. (#4479)
 [patch.crates-io]
 unicode-width = { path = "patches/unicode-width-0.2.2" }
+# Windows Terminal paste dropped every non-BMP character (emoji): upstream pairs a
+# surrogate half with its own key-up record. See patches/crossterm-0.29.0 parse.rs.
+# Same change as crossterm-rs/crossterm#1073 (open); drop this once a release carries it.
+# Also drops one redundant pair of parentheses and allows upstream warnings, because a
+# path crate is built under our `-D warnings`.
+crossterm = { path = "patches/crossterm-0.29.0" }

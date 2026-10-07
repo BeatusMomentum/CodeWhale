@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -57,6 +57,12 @@ auf einem Rechner streiten sich am Ende um den `PATH`.
 </details>
 
 ## Schnellstart
+
+**Die API-Schlüssel deiner Anbieter an einem Ort verwalten.** [Erstelle ein Codewhale-Konto](https://app.codewhale.net/register)
+oder führe `codewhale login` aus, um dich anzumelden. Speichere und aktualisiere deine API-Schlüssel im Konto
+und nutze sie über die Codewhale-Modellroute auf deinen angemeldeten Geräten.
+[Kontoschlüssel einrichten](docs/CONFIGURATION.md#account-provider-keys).
+Beim Anmelden werden vorhandene lokale Schlüssel nicht hochgeladen; die lokale Nutzung ist weiterhin ohne Konto möglich.
 
 1. **Öffne dein Projekt.** Starte `codewhale` in dem Ordner, an dem du arbeiten willst.
 2. **Verbinde ein Modell.** Starte `/provider` (oder drücke `F3`), um einen gehosteten Schlüssel

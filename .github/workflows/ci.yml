@@ -429,6 +429,11 @@ jobs:
         # `tsc` ever running in CI. `npm test` compiles first (tsc -p ./), so
         # this is the type-check gate for the extension too.
         run: npm test
+      # @vscode/vsce 4 is a build-only packager that requires Node >=22. The
+      # extension itself still compiles and tests on Node 20 above.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
       - name: Package VS Code extension
         run: npm run package
 
@@ -994,6 +999,19 @@ jobs:
         run: cargo build -p codewhale-cli --bin codewhale --all-features --locked
         env:
           RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && env.RUSTC_WRAPPER || '' }}
+      - name: Windows Terminal clipboard acceptance
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
+        timeout-minutes: 5
+        shell: pwsh
+        run: node scripts/release/windows-terminal-clipboard.mjs target/debug/codewhale.exe "${{ runner.temp }}/windows-clipboard"
+      - name: Retain Windows Terminal clipboard evidence
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' && needs.changes.outputs.heavy == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-clipboard-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-clipboard/
+          if-no-files-found: error
+          retention-days: 7
       - name: Run tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one
         # process per test, all runner cores busy, slow tests named instead
@@ -1281,9 +1299,9 @@ jobs:
     # leg was a ~28-minute hosted-Mac build on every main push while hosted
     # macOS is capped at 5 concurrent jobs; it stays in the manual
     # workflow_dispatch (full CI) matrix and in the release pipeline.
-    # A cold Windows build can take 29 minutes before the smoke even starts.
-    # Leave room for installation; bound the smoke itself independently below.
-    timeout-minutes: 45
+    # A cold Windows compile can take 42 minutes; leave room for cache save
+    # after the separately bounded five-minute install/entrypoint smoke test.
+    timeout-minutes: 60
     runs-on: ${{ needs.changes.outputs.heavy == 'true' && matrix.os || 'ubuntu-latest' }}
     strategy:
       matrix:

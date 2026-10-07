@@ -737,7 +737,15 @@ pub(crate) async fn run_exec_agent(
     let mut loaded_session_id = None;
     if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
-        if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
+        let saved_workspace = tokio::fs::canonicalize(&saved.metadata.workspace)
+            .await
+            .unwrap_or_else(|_| saved.metadata.workspace.clone());
+        let launch_workspace = tokio::fs::canonicalize(&workspace)
+            .await
+            .unwrap_or_else(|_| workspace.clone());
+        if !paths_equal_for_config(&saved_workspace, &launch_workspace)
+            && output_format == ExecOutputFormat::Text
+        {
             eprintln!(
                 "Warning: session {} was created in a different workspace ({}). Resuming anyway.",
                 truncate_id(&saved_id),

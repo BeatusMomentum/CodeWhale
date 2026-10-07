@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.1] - 2026-10-01
+## [0.10.1] - 2026-10-07
 
 ### Contributor integration and reliability
 
+- OAuth retry diagnostics omit provider-controlled error fields; account replacement stops before retired Weixin receipts exceed their storage limit, preserving uncertain work for local review.
+- Resuming a session through a symlink to the same workspace no longer shows a false workspace-change warning.
 - Runtime clients can read one tool call's actual workspace changes and reviewed skill details (thanks @gaord, #6817 and #6869). In-flight snapshot pairs remain pending; missing objects and corrupt repository metadata are distinguished.
 - Search accepts valid preferred locales, and image dimensions describe the same bytes sent to the model (thanks @asto18089, #6860 and #6858). Automation deletion keeps its definition until cleanup succeeds, and compaction preserves its original summary anchor (#6864 and #6857).
 - Config/status/permission commands share portable contracts while the host retains mutation authority; queue workers acknowledge a scheduled retry for temporary first-claim contention and fail honestly on corruption (thanks @aboimpinto, #6832).
@@ -18,9 +20,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configured approval expiry belongs to the held Engine request; hiding or covering its card cannot restart the deadline, and a late queued answer cannot approve an expired call.
 - Tool discovery keeps the highest-ranked matches when a result batch exceeds the existing cache bounds, preserving search order and the 16 KiB limit (adapted from @AdityaVG13's #6393).
 - Model-switch receipts now translate their session-only saving note in every complete locale pack; the three save commands remain directly usable (thanks @Lstarsky0, #6875).
+- Weixin bridge threads belong to the account and chat that created them:
+  resuming or listing another chat's thread is refused. An explicit `/new` after
+  an account replacement keeps the old account's private receipt and never
+  replays its prompts automatically. Replies never reuse another bot account's
+  Weixin context token, and `/threads` lists this chat's own older threads even
+  when other chats have newer ones.
+- Windows messaging bridges retry a briefly locked record replacement
+  (EPERM/EACCES/EBUSY) with bounded delays and never delete the previous record
+  first.
+- The website and README installation guides are generated from one shared
+  source, and the critical Simplified Chinese guides were re-reviewed against
+  current English.
+- A Codewhale sign-in that expired, or an account service that is unreachable,
+  no longer blocks turns on your own provider key. The turn uses your local
+  settings and Codewhale says once how to restore account preferences.
+- `codewhale login` keeps a DeepSeek route you chose, or one with a local key,
+  instead of switching it to the managed Codewhale provider.
 - The bundled `computer-use` plugin is 0.12.1, reconciled with canonical source
-  `a656f67455fc5639f28304fbf61075db3925058a` while retaining Core's embedding
-  manifest and version contract.
+  `724f9c422db1a51880dc81154dae70816c475ed8` while retaining Core's embedding
+  manifest and version contract. Its image renderer lock now carries Sharp 0.35.5.
+- The bundled first-party catalog pins marketplace revision
+  `6512f1dfaa91ee287e9f81ebabaf4909e8a371a3` and lists all 19 reviewed plugins,
+  up from 6. Every catalog plugin still installs disabled and untrusted until
+  you review it.
+- Every committed npm lockfile is audited in CI, including build tooling. The
+  VS Code extension packages with `@vscode/vsce` 4 on Node 22 while it still
+  compiles and tests on its Node 20 runtime. The website keeps one reviewed,
+  hash-verified depth guard for an unpatched `braces` advisory
+  (GHSA-vfj7-8cjw-p6xm); its raw audit findings are retained, not hidden.
+- Pasting through Windows Terminal (Ctrl+Shift+V) no longer drops emoji and
+  other characters outside the Basic Multilingual Plane. Release binaries and source builds carry
+  a small patch to crossterm 0.29.0 in `patches/` (the change proposed upstream
+  as crossterm-rs/crossterm#1073); a real Windows Terminal paste of 24 Unicode
+  lines is now a release gate.
+- Experimental extension host: reviewed Native plugins can register avatar
+  packs with `ctx.avatars.registerPack` (`/pet avatar [key]`, `/pet action|view
+  <name>`). `/plugin import dsh <package-dir>` reviews a DeepSeek Harness
+  bundle and now lists the Native host code it contains; `approve <dir>
+  <content-hash>` installs it disabled and untrusted. Trusted host plugins stay
+  trusted across a restart, enabling a second host plugin activates it without
+  `/plugin reload`, and the review no longer crashes the TUI.
 
 Codewhale v0.10.1 focuses on reliability and first-run behavior. Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are

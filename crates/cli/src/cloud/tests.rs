@@ -636,6 +636,37 @@ fn login_keeps_explicitly_configured_route() {
 }
 
 #[test]
+fn login_keeps_an_explicit_deepseek_route() {
+    // DeepSeek is the default provider; choosing it explicitly must survive sign-in.
+    let (temp, _) = test_config();
+    std::fs::write(temp.path().join("config.toml"), "provider = \"deepseek\"\n").unwrap();
+    let mut config = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    let (secrets, _) = test_secrets();
+    let output = run_login(&mut config, &secrets);
+    assert!(
+        output.contains("Keeping your configured deepseek route."),
+        "{output}"
+    );
+    let saved = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    assert_eq!(saved.config.provider, ProviderKind::Deepseek);
+    assert_eq!(saved.config.model, None);
+}
+
+#[test]
+fn login_keeps_the_default_route_when_it_has_a_local_key() {
+    let (temp, mut config) = test_config();
+    let (secrets, _) = test_secrets();
+    secrets.set("deepseek", "sk-local-never-print").unwrap();
+    let output = run_login(&mut config, &secrets);
+    assert!(
+        output.contains("Keeping your configured deepseek route."),
+        "{output}"
+    );
+    let saved = ConfigStore::load(Some(temp.path().join("config.toml"))).unwrap();
+    assert_eq!(saved.config.provider, ProviderKind::Deepseek);
+}
+
+#[test]
 fn cloud_sessions_are_isolated_by_profile_and_api_origin() {
     let (secrets, _) = test_secrets();
     let transport = FakeTransport::new(vec![]);

@@ -2,6 +2,7 @@
 
 > 英文原文：[CONFIGURATION.md](../CONFIGURATION.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐流传输、脚本工具及用户等待契约；其余段落保留原同步日期。
 > ChatGPT 登录相关内容于 2026-10-01 按当前实现更新。
 
 Codewhale 从 TOML 文件加环境变量读取配置。进程启动时，它还可能从工作区本地的 `.env` 文件加载字面(literal)的内置 provider 凭据。请以受跟踪的 `.env.example` 为模板；把它复制为 `.env`，然后只添加凭据值。
@@ -182,11 +183,44 @@ allow_shell = true
 
 覆盖刻意很窄——它覆盖仓库维护者最可能想要跨贡献者标准化的字段。凭据、端点、provider 选择、MCP 配置、hooks、skills、重试、热栏绑定和 `instructions = [...]` 设置保持用户全局。如果仓库本地配置声明了 `api_key`、`base_url`、`providers`、`provider`、`mcp_config_path`、`notes_path`、`hotbar`、`allow_shell = true` 或 `instructions`，Codewhale 会忽略该键并保留用户的全局设置。
 
-合并的 `codewhale` 运行时为 DeepSeek 认证和模型默认值使用同一个配置文件。`codewhale auth set --provider deepseek` 把 key 保存到 `~/.codewhale/config.toml`(需要时在首次启动迁移旧 `~/.deepseek/config.toml`)，`codewhale --model deepseek-v4-flash` 作为 `CODEWHALE_MODEL` 转发给 TUI。分发器不再写入这些变量的 `DEEPSEEK_*` 孪生变量；你自己设置的 `DEEPSEEK_*` 值在对应的 `CODEWHALE_*` 未设置时仍作为旧别名读取。
+合并的 `codewhale` 运行时使用 `~/.codewhale/config.toml` 保存提供商和模型设置。
+`codewhale auth set --provider deepseek` 把密钥保存在本地机密存储中（默认是
+`~/.codewhale/secrets/` 下的私有文件；OS 钥匙串需显式选择），而不是写入该配置文件。
+需要时，首次启动会迁移旧 `~/.deepseek/config.toml`。
+`codewhale --model deepseek-v4-flash` 作为 `CODEWHALE_MODEL` 转发给 TUI。
+分发器不再写入对应的 `DEEPSEEK_*` 变量；用户自己设置的值在 `CODEWHALE_*`
+未设置时仍作为旧别名读取。
 
-`codewhale login` 登录 Codewhale 账号——它与 `codewhale account login` 是同一个浏览器设备流(device flow)，不是 provider-key 命令。Provider 凭据完全通过 `codewhale auth set --provider <provider>` 配置。
+### 账号提供商密钥
 
-该 provider 凭据与可选的管理产品账号是分开的。`codewhale account login` 启动 Codewhale 浏览器设备流；`codewhale account status` 和 `codewhale account logout` 检查或移除所选 `--profile` 的会话。账号会话优先使用 OS 凭据管理器，在无凭据管理器可用时自动回退到私有 `0600` Codewhale secrets 文件(无头主机、SSH、容器)。`codewhale account keys list|set|remove` 管理已登录账号的 BYOK 保险库(vault)，不显示机密值。更旧的 `codewhale cloud ...` 拼写仍是命令别名。
+Codewhale 账号的直接好处是：**在一个地方管理模型提供商的 API 密钥**。
+[注册](https://app.codewhale.net/register)或[登录](https://app.codewhale.net/login)后，
+可以在[提供商设置](https://app.codewhale.net/providers)中添加、更换或移除密钥，
+也可以使用终端：
+
+```bash
+codewhale login                         # 浏览器登录；也可用 account login
+codewhale account keys set deepseek      # 隐藏输入，添加或更换密钥
+codewhale account keys list              # 只显示配置状态，不显示密钥
+codewhale --provider codewhale           # 使用账号的模型通道
+```
+
+账号密钥保存在服务端，用于经过账号通道的请求。在另一台设备上登录并在
+`/provider` 中选择 Codewhale，即可使用这些密钥，无需再次粘贴。`/models`
+列出该账号可用的模型。更换账号中保存的密钥会影响此通道的后续请求，但不会改变
+独立的本地副本，也不会撤销提供商侧的密钥。`codewhale account keys remove deepseek`
+移除账号中保存的密钥。
+
+登录**不会**自动上传已有的本地密钥。若希望复制本地密钥，请明确使用
+`codewhale account keys set deepseek --from-local`。本地提供商仍通过
+`codewhale auth set --provider <provider>` 配置；使用本地密钥或本地模型不需要
+Codewhale 账号。登录会保留显式选择或已配置的本地提供商；需要切换到账号通道时，
+使用 `--provider codewhale`。
+
+账号会话与提供商密钥分开保存。`codewhale account status` 查看会话；
+`codewhale account logout` 移除所选 `--profile` 的账号会话，不删除提供商密钥。
+账号会话使用私有 `0600` Codewhale secrets 文件，按 profile 和账号 API 来源隔离，
+不使用 OS 钥匙串。旧的 `codewhale cloud ...` 仍是账号命令的别名。
 
 ### 可移植配置包（Portable config bundles）
 
@@ -216,7 +250,7 @@ allow_shell = true
 
 运行 `codewhale auth status` 检查活动 provider 的配置文件、OS 钥匙串后端、环境变量、胜出来源和末四位标签，而不打印 key 本身。该命令只探测活动 provider 的钥匙串条目。
 
-对于托管、通用 OpenAI 兼容、自托管、OpenAI Responses 或原生 Anthropic provider，设置 `provider = "<id>"` 或传 `codewhale --provider <id>`。规范的 provider ID 是 `deepseek`、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`orcarouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`arcee`、`siliconflow-CN`、`moonshot`、`sglang`、`vllm`、`ollama`、`ollama-cloud`、`huggingface`、`modelscope`、`together`、`qianfan`、`openai-codex`、`anthropic`、`openmodel`、`zai`、`stepfun`、`minimax`、`deepinfra`、`sakana`、`longcat`、`opencode-go`、`opencode-zen`、`meta`、`xai`、`mistral`、`telecomjs`、`modelstudio-token-plan`、`google`、`edenai`、`concentrate`、`codewhale` 和 `custom`(通过 `[providers.<name>]` 定义的用户自定义 OpenAI 兼容端点)。逐 provider 的 registry，包括线协议、认证变量、默认 base URL、模型 ID 和能力元数据，见 [PROVIDERS.md](PROVIDERS.md)。facade 把 provider 凭据保存到共享用户配置，并把解析后的 key、base URL、provider 和模型转发给 TUI 进程。使用 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` 或 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` 或 `codewhale auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"` 或 `codewhale auth set --provider wanjie-ark --api-key "YOUR_WANJIE_API_KEY"` 或 `codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_KEY"` 或 `codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"` 或 `codewhale auth set --provider siliconflow --api-key "YOUR_SILICONFLOW_API_KEY"` 或 `codewhale auth set --provider arcee --api-key "YOUR_ARCEE_API_KEY"` 或 [PROVIDERS.md](PROVIDERS.md) 中匹配的 provider ID，通过 facade 保存 provider key。通用 `openai` provider 默认 `https://api.openai.com/v1`,接受 `OPENAI_BASE_URL`，默认 `gpt-5.6`。自定义 OpenAI 兼容网关仍可显式选择自己的模型。`atlascloud` 默认 `https://api.atlascloud.ai/v1`,接受 `ATLASCLOUD_BASE_URL`，默认模型是 `deepseek-ai/deepseek-v4-flash`。`wanjie-ark` 指向 Wanjie Ark 的 OpenAI 兼容端点 `https://maas-openapi.wanjiedata.com/api/v1`,默认 `deepseek-reasoner`，并原样透传模型 ID，因为 Wanjie 模型访问按账号作用域。SGLang、vLLM 和 Ollama 是自托管的，默认可以不用 API key 运行。Ollama 默认 `http://localhost:11434/v1`,并原样发送 `codewhale-coder:1.3b` 或 `qwen2.5-coder:7b` 这样的模型标签。自托管 provider 和 loopback 自定义 URL(`localhost`、`127.0.0.1`、`[::1]`、`0.0.0.0`)不读取 secret store，除非显式请求 API key 认证；当本地服务器确实需要 bearer 认证时，用环境变量或配置文件 key。Ollama Cloud 是独立的托管 `ollama-cloud` provider。它默认 `https://ollama.com/v1` 和 `gpt-oss:120b`；用 `codewhale auth set --provider ollama-cloud` 保存它的 key。环境认证先读 `OLLAMA_CLOUD_API_KEY`，然后是 Ollama 官方的 `OLLAMA_API_KEY`。SiliconFlow 默认 `https://api.siliconflow.com/v1`,接受 `SILICONFLOW_BASE_URL`，默认用 `deepseek-ai/DeepSeek-V4-Pro`。`provider = "siliconflow-CN"` 选择中国区域默认 `https://api.siliconflow.cn/v1`,配 `[providers.siliconflow_cn]` 表和 `SILICONFLOW_API_KEY` 凭据槽位。Arcee AI 默认 `https://api.arcee.ai/api/v1`,接受 `ARCEE_BASE_URL`，对 Codewhale 智能体工作默认用 `trinity-large-thinking`。`trinity-large-preview` 也作为直接的 Arcee API 模型列出；OpenRouter 的 `arcee-ai/trinity-large-thinking` 仍是 OpenRouter 命名空间形式，而直接 Arcee provider 用裸的 `trinity-large-thinking` ID。直接的 Arcee 大模型 API 调用按 256K 上下文 BF16 服务跟踪；Thinking 具备推理能力，而 Preview 未标记为推理模型。
+对于托管、通用 OpenAI 兼容、自托管、OpenAI Responses 或原生 Anthropic provider，设置 `provider = "<id>"` 或传 `codewhale --provider <id>`。规范的 provider ID 是 `deepseek`、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`orcarouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`arcee`、`siliconflow-CN`、`moonshot`、`sglang`、`vllm`、`ollama`、`ollama-cloud`、`huggingface`、`modelscope`、`together`、`qianfan`、`openai-codex`、`anthropic`、`openmodel`、`zai`、`stepfun`、`minimax`、`deepinfra`、`sakana`、`longcat`、`opencode-go`、`opencode-zen`、`meta`、`xai`、`mistral`、`telecomjs`、`modelstudio-token-plan`、`google`、`edenai`、`concentrate`、`codewhale` 和 `custom`(通过 `[providers.<name>]` 定义的用户自定义 OpenAI 兼容端点)。逐 provider 的 registry，包括线协议、认证变量、默认 base URL、模型 ID 和能力元数据，见 [PROVIDERS.md](PROVIDERS.md)。facade 把 provider 凭据保存到本地机密存储，并把解析后的 key、base URL、provider 和模型转发给 TUI 进程。使用 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` 或 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` 或 `codewhale auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"` 或 `codewhale auth set --provider wanjie-ark --api-key "YOUR_WANJIE_API_KEY"` 或 `codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_KEY"` 或 `codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"` 或 `codewhale auth set --provider siliconflow --api-key "YOUR_SILICONFLOW_API_KEY"` 或 `codewhale auth set --provider arcee --api-key "YOUR_ARCEE_API_KEY"` 或 [PROVIDERS.md](PROVIDERS.md) 中匹配的 provider ID，通过 facade 保存 provider key。通用 `openai` provider 默认 `https://api.openai.com/v1`,接受 `OPENAI_BASE_URL`，默认 `gpt-5.6`。自定义 OpenAI 兼容网关仍可显式选择自己的模型。`atlascloud` 默认 `https://api.atlascloud.ai/v1`,接受 `ATLASCLOUD_BASE_URL`，默认模型是 `deepseek-ai/deepseek-v4-flash`。`wanjie-ark` 指向 Wanjie Ark 的 OpenAI 兼容端点 `https://maas-openapi.wanjiedata.com/api/v1`,默认 `deepseek-reasoner`，并原样透传模型 ID，因为 Wanjie 模型访问按账号作用域。SGLang、vLLM 和 Ollama 是自托管的，默认可以不用 API key 运行。Ollama 默认 `http://localhost:11434/v1`,并原样发送 `codewhale-coder:1.3b` 或 `qwen2.5-coder:7b` 这样的模型标签。自托管 provider 和 loopback 自定义 URL(`localhost`、`127.0.0.1`、`[::1]`、`0.0.0.0`)不读取 secret store，除非显式请求 API key 认证；当本地服务器确实需要 bearer 认证时，用环境变量或配置文件 key。Ollama Cloud 是独立的托管 `ollama-cloud` provider。它默认 `https://ollama.com/v1` 和 `gpt-oss:120b`；用 `codewhale auth set --provider ollama-cloud` 保存它的 key。环境认证先读 `OLLAMA_CLOUD_API_KEY`，然后是 Ollama 官方的 `OLLAMA_API_KEY`。SiliconFlow 默认 `https://api.siliconflow.com/v1`,接受 `SILICONFLOW_BASE_URL`，默认用 `deepseek-ai/DeepSeek-V4-Pro`。`provider = "siliconflow-CN"` 选择中国区域默认 `https://api.siliconflow.cn/v1`,配 `[providers.siliconflow_cn]` 表和 `SILICONFLOW_API_KEY` 凭据槽位。Arcee AI 默认 `https://api.arcee.ai/api/v1`,接受 `ARCEE_BASE_URL`，对 Codewhale 智能体工作默认用 `trinity-large-thinking`。`trinity-large-preview` 也作为直接的 Arcee API 模型列出；OpenRouter 的 `arcee-ai/trinity-large-thinking` 仍是 OpenRouter 命名空间形式，而直接 Arcee provider 用裸的 `trinity-large-thinking` ID。直接的 Arcee 大模型 API 调用按 256K 上下文 BF16 服务跟踪；Thinking 具备推理能力，而 Preview 未标记为推理模型。
 
 ### OpenRouter 提供商固定
 
@@ -1373,6 +1407,42 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
 - `features.*`(可选)：功能标志覆盖(见下文)。
 
+### 流与传输设置
+
+`[stream]` 是模型流策略及其 HTTP 客户端的规范配置表。
+`codewhale config dump` 和 `codewhale config get stream` 显示运行时解析后的有效值，
+包括环境变量回退及范围限制；查看不会把默认值写入文件。例如：
+`codewhale config set stream.open_timeout_secs 120`、
+`codewhale config unset stream.open_timeout_secs`。单次运行的
+`--set stream.open_timeout_secs=120` 使用同一验证器。
+
+| `[stream]` 键 | 默认值 | 有效行为 | 旧 `[tui]` 回退键 |
+| --- | --- | --- | --- |
+| `open_timeout_secs` | 45 | 正数限制到 5–300；0 或省略时回退到环境变量/默认值 | `stream_open_timeout_secs` |
+| `chunk_timeout_secs` | 900 | 0 使用默认值；正数限制到 1–3600 | `stream_chunk_timeout_secs` |
+| `max_resumes` | 3 | 0 禁止重新发起整个请求；最大 10 | `stream_max_resumes` |
+| `max_transparent_retries` | 2 | 0 禁止输出任何内容前的重试；最大 10 | `stream_max_transparent_retries` |
+| `max_stream_errors` | 5 | 0 使用默认值；正数限制到 1–50 | `stream_max_errors` |
+| `max_duration_secs` | 1800 | 每条流的总时长；0 使用默认值，正数限制到 10–86400 秒 | `stream_max_duration_secs` |
+| `max_content_mb` | 10 | 每条流的内容上限；0 使用默认值，正数限制到 1–512 MiB | `stream_max_content_mb` |
+| `connect_timeout_secs` | 30 | TCP/TLS 建连；0 使用默认值，正数限制到 1–300 秒 | `connect_timeout_secs` |
+| `force_http1` | false | 布尔值；环境变量固定为真时始终启用 HTTP/1.1 | `force_http1` |
+| `tcp_keepalive_secs` | 30 | TCP 保活探测前的空闲时间；0 禁用，正数限制到 1–3600 秒 | 无 |
+| `http2_keep_alive_interval_secs` | 15 | 活跃 HTTP/2 连接的 PING 间隔；0 禁用，正数限制到 1–3600 秒 | 无 |
+| `http2_keep_alive_timeout_secs` | 20 | PING 确认期限；0 使用默认值，正数限制到 1–3600 秒 | 无 |
+
+每个显式规范字段都优先于旧 `[tui]` 字段，包括 `0` 与 `false`；省略规范字段则保留旧值。
+正数建连响应头等待时间优先于 `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`（再回退到
+`DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS`）；0 回退到这些变量。省略分块超时会使用
+`CODEWHALE_STREAM_IDLE_TIMEOUT_SECS`（再回退到 `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`），
+显式 0 则使用 900。`CODEWHALE_FORCE_HTTP1`（旧名 `DEEPSEEK_FORCE_HTTP1`）
+与配置做逻辑或，所以配置 `false` 不能取消环境变量固定的 `true`。Profile 逐字段合并此表。
+
+传输设置只影响新建的模型、目录和 HTTP/1 回退客户端，不会重建活跃客户端，
+也不控制 MCP 或其他网络服务。HTTP/2 PING 不作用于空闲连接池；固定 HTTP/1.1
+时 HTTP/2 设置无效。操作系统控制 TCP 探测细节；这些键不会关闭证书校验。
+`[retry]` 仍独立拥有 HTTP 请求退避计划。
+
 ### 工作区笔记
 
 `/note` 在当前工作区的 `.codewhale/notes.md` 管理一个简单的笔记文件(旧 `.deepseek/notes.md` 是尚不存在 `.codewhale/notes.md` 时的回退路径)。现有的 `/note <text>` 用法仍追加笔记。管理形式：
@@ -1635,6 +1705,37 @@ Codewhale 默认加载一个小型核心原生工具目录，把不太常见的�
 always_load = ["Git", "notify"]
 ```
 
+### 脚本工具与覆盖
+
+`~/.codewhale/tools/`（或 `[tools].plugin_dir`）内以 `# name:` 头声明的脚本成为
+模型可见工具，`/plugin tools` 列出它们。脚本从 stdin 读取工具 JSON 输入，
+向 stdout 写 JSON `ToolResult`，例如 `{"content":"...","success":true}`。
+
+```sh
+#!/usr/bin/env sh
+# name: word_count
+# description: Count words in the given text
+# schema: {"type":"object","properties":{"text":{"type":"string"}}}
+# approval: required
+```
+
+`# approval:` 支持 `suggest`（默认）或 `required`；两者都遵守会话审批设置。
+脚本不能自行批准：`approval: auto` 不再受支持，会采用默认值，并在运行时日志
+（`~/.codewhale/logs/`）及 `/plugin tools` 中说明。
+
+与已注册工具重名的脚本不会加载。`[tools.overrides]` 可以禁用内置工具，或以
+新名称添加 `script` / `command` 工具；不能用它们替换内置名称：
+
+```toml
+[tools.overrides]
+"Web" = { type = "disabled" }
+"audited_shell" = { type = "script", path = "audit-shell.sh" }
+"Bash" = { type = "script", path = "audit-shell.sh" } # 拒绝；Bash 仍生效
+```
+
+拒绝的键每个会话显示一次状态行并写入日志。要包装内置工具，请禁用它并用新名称
+注册包装器。覆盖仍可替换同名的普通脚本；相对 `path` 按插件目录解析。
+
 ### `request_user_input` 限制
 
 `request_user_input` 会向用户提出一小批选择题。两个上限都是可配置的（#5949）：当研究或规划工作流确实需要更多澄清时，调高 `user_input_max_questions`；当交互式分诊应保持简洁时，调低它。
@@ -1650,6 +1751,10 @@ user_input_max_options = 4     # default 4, clamped to 2..=10
 ### 用户输入等待超时
 
 `request_user_input` 的提问默认一直等待用户回答或取消（#6003）。省略 `user_input_timeout_seconds` 或设为 `0` 都不设置超时；正数则限定本次等待的秒数，超时后取消。大于 86,400 秒（24 小时）的值会被限制为 86,400 秒。无头的 `exec` 运行没有应答者，因此默认不提供 `request_user_input`：模型会报告该工具不存在并直接结束，而不是卡住。
+
+0.10.1 中，TUI 的挂起工具计时器识别真实的用户输入与审批等待（#6872）。等待时
+暂停该回合的看门狗；答案回到原调用，无需另输 `continue`。回答后重新计算活动等待
+基线。用户取消及正数审批/输入期限仍生效；它不会给正在执行的工具无限时间。
 
 ```toml
 [tools]

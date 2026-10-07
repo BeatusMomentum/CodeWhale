@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -59,6 +59,12 @@ Docker, Nix, Homebrew в Linux, Android/Termux, ручная загрузка с
 </details>
 
 ## Быстрый старт
+
+**Ключи API ваших провайдеров — в одном месте.** [Создайте аккаунт Codewhale](https://app.codewhale.net/register)
+или выполните `codewhale login`, чтобы войти. Сохраняйте и обновляйте ключи API в аккаунте,
+затем используйте их через маршрут моделей Codewhale на устройствах, где вы вошли в аккаунт.
+[Настройка ключей аккаунта](docs/CONFIGURATION.md#account-provider-keys).
+Вход не загружает существующие локальные ключи в аккаунт; локальная работа доступна и без аккаунта.
 
 1. **Откройте проект.** Запустите `codewhale` в папке, с которой хотите
    работать.

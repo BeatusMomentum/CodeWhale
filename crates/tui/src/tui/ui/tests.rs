@@ -33885,6 +33885,26 @@ fn extension_prompt_origin_keeps_denials_and_other_policy_holds() {
 }
 
 #[test]
+fn account_profile_fallback_notice_stays_in_the_transcript() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = App::new(create_test_options(), &Config::default());
+    let notice = app
+        .tr(MessageId::ProfileConstitutionUnavailableLocal)
+        .to_string();
+    let before = app.history.len();
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        notice.clone()
+    ));
+    assert!(!super::event_loop::apply_engine_status(
+        &mut app,
+        "Executing tools sequentially".into()
+    ));
+    assert_eq!(app.history.len(), before + 1);
+    assert!(matches!(&app.history[before], HistoryCell::System { content } if *content == notice));
+}
+
+#[test]
 fn engine_retry_status_receipts_survive_footer_overwrite_in_the_existing_transcript() {
     let _home = SettingsHomeGuard::new();
     let mut app = App::new(create_test_options(), &Config::default());

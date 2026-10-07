@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -59,6 +59,12 @@ một máy sẽ xung đột với nhau về `PATH`.
 </details>
 
 ## Bắt đầu nhanh
+
+**Quản lý khóa API của các nhà cung cấp ở một nơi.** [Tạo tài khoản Codewhale](https://app.codewhale.net/register)
+hoặc chạy `codewhale login` để đăng nhập. Lưu và cập nhật khóa API trong tài khoản,
+rồi sử dụng chúng qua tuyến mô hình Codewhale trên các thiết bị đã đăng nhập.
+[Thiết lập khóa trong tài khoản](docs/CONFIGURATION.md#account-provider-keys).
+Đăng nhập không tải các khóa cục bộ hiện có lên tài khoản; bạn vẫn có thể sử dụng cục bộ mà không cần tài khoản.
 
 1. **Mở dự án của bạn.** Chạy `codewhale` trong thư mục bạn muốn làm việc.
 2. **Kết nối mô hình.** Chạy `/provider` (hoặc nhấn `F3`) để thêm khóa của mô

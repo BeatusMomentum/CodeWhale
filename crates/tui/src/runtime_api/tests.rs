@@ -9314,6 +9314,107 @@ async fn list_threads_archived_only_filter_matches_only_archived() -> Result<()>
     Ok(())
 }
 
+/// The exact-ID filter must run before the result limit so an owned older
+/// thread remains visible even when newer threads belong to other callers.
+#[tokio::test]
+async fn list_thread_summary_filters_ids_before_limit() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let mut owned_ids = Vec::new();
+
+    for _ in 0..2 {
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        owned_ids.push(
+            created["id"]
+                .as_str()
+                .context("missing thread id")?
+                .to_string(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for _ in 0..8 {
+        client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let recent: serde_json::Value = client
+        .get(format!(
+            "http://{addr}/v1/threads/summary?limit=8&include_archived=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let recent_ids: Vec<&str> = recent
+        .as_array()
+        .context("summary must be an array")?
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    assert!(
+        owned_ids
+            .iter()
+            .all(|id| !recent_ids.contains(&id.as_str()))
+    );
+
+    let mut filtered_url = reqwest::Url::parse(&format!(
+        "http://{addr}/v1/threads/summary?limit=8&include_archived=true"
+    ))?;
+    filtered_url
+        .query_pairs_mut()
+        .append_pair("thread_ids", &owned_ids.join(","));
+    let filtered: serde_json::Value = client
+        .get(filtered_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let filtered_ids: Vec<&str> = filtered
+        .as_array()
+        .context("filtered summary must be an array")?
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    assert_eq!(filtered_ids.len(), owned_ids.len());
+    assert!(
+        owned_ids
+            .iter()
+            .all(|id| filtered_ids.contains(&id.as_str()))
+    );
+
+    let mut oversized_url =
+        reqwest::Url::parse(&format!("http://{addr}/v1/threads/summary?limit=8"))?;
+    oversized_url
+        .query_pairs_mut()
+        .append_pair("thread_ids", &vec!["fixture-id"; 201].join(","));
+    let rejected = client.get(oversized_url).send().await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let at_limit = format!(
+        "http://{addr}/v1/threads/summary?limit=8&thread_ids={}",
+        vec!["fixture-id"; 200].join(",")
+    );
+    assert_eq!(client.get(at_limit).send().await?.status(), StatusCode::OK);
+
+    handle.abort();
+    Ok(())
+}
+
 /// #564 / whalescale#261 — `GET /v1/usage` aggregates per-turn token +
 /// cost data. With no threads the response is well-formed and totals are
 /// zero with empty buckets (never a 404).

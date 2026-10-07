@@ -8249,7 +8249,10 @@ pub(super) fn route_key_to_view_stack(
 /// Keep only the Engine's retry receipts in the existing transcript. Ordinary
 /// status/footer behavior and internal/model-only status projection stay intact.
 pub(super) fn apply_engine_status(app: &mut App, message: String) -> bool {
-    let retain = crate::core::events::is_retry_status_receipt(&message);
+    // The account-profile fallback notice is sent once per engine; keep it in
+    // the transcript so the next turn's status line cannot erase it.
+    let retain = crate::core::events::is_retry_status_receipt(&message)
+        || app.tr(MessageId::ProfileConstitutionUnavailableLocal) == message.as_str();
     if retain {
         app.add_message(HistoryCell::System {
             content: message.clone(),

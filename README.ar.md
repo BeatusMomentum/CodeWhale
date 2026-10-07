@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -56,6 +56,12 @@ cargo install codewhale-cli --locked  # build from crates.io
 </details>
 
 ## البدء السريع
+
+**مفاتيح API لمزوّديك، في مكان واحد.** [أنشئ حساب Codewhale](https://app.codewhale.net/register)
+أو شغّل `codewhale login` لتسجيل الدخول. احفظ مفاتيح API وحدّثها في حسابك،
+ثم استخدمها عبر مسار النماذج في Codewhale على الأجهزة التي سجّلت الدخول عليها.
+[إعداد مفاتيح الحساب](docs/CONFIGURATION.md#account-provider-keys).
+تسجيل الدخول لا يرفع المفاتيح المحلية الموجودة؛ ويمكنك مواصلة الاستخدام المحلي دون حساب.
 
 1. **افتح مشروعك.** شغّل `codewhale` في المجلد الذي تريد العمل عليه.
 2. **اربط نموذجًا.** شغّل `/provider` (أو اضغط `F3`) لإضافة مفتاح مستضاف أو اختيار

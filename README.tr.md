@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -56,6 +56,12 @@ Tek bir yol seçin: aynı makinedeki birden fazla kurulum `PATH` üzerinde birbi
 </details>
 
 ## Hızlı başlangıç
+
+**Sağlayıcı API anahtarlarınızı tek bir yerden yönetin.** [Codewhale hesabı oluşturun](https://app.codewhale.net/register)
+veya oturum açmak için `codewhale login` komutunu çalıştırın. API anahtarlarınızı hesabınıza kaydedip güncelleyin,
+ardından oturum açtığınız cihazlarda Codewhale model rotası üzerinden kullanın.
+[Hesap anahtarlarını ayarlayın](docs/CONFIGURATION.md#account-provider-keys).
+Oturum açmak mevcut yerel anahtarları yüklemez; hesap olmadan da yerel kullanım mümkündür.
 
 1. **Projenizi açın.** Üzerinde çalışmak istediğiniz klasörde `codewhale` çalıştırın.
 2. **Bir model bağlayın.** Barındırılan bir anahtar eklemek veya yerel bir çalışma ortamı

@@ -97,7 +97,8 @@ Arbitrary background dragging remains unavailable. Rebuild Core to include
 the updated native helper; updating a separate marketplace checkout alone
 does not update an already-installed Core binary.
 
-This embedded source matches canonical 9a261c4. Windows controlled-desktop
+The canonical runtime revision is recorded in `../computer-use.upstream-sha`;
+this guide and package identity are specific to the Engine bundle. Windows controlled-desktop
 acceptance passed in upstream CI; signed Windows distribution, mixed-DPI/raw
 input and continuous keyboard coexistence remain unqualified. Core discovery
 and materialization tests do not constitute an installed model-driven trial.

@@ -2350,9 +2350,21 @@ pub(crate) fn reject_inline_api_key(api_key: Option<&str>) -> Result<()> {
 
 /// On account sign-in, point a never-configured local route at the managed
 /// Codewhale provider so chat works immediately. A provider the user chose
-/// explicitly is left alone.
-fn select_managed_route_on_login<W: Write>(config: &mut ConfigStore, out: &mut W) -> Result<()> {
-    if config.config.provider == ProviderKind::default() {
+/// explicitly, or one that already has a local key (config, secret store or
+/// environment), is left alone: the default provider is DeepSeek, so equality
+/// with the default cannot tell "never configured" from "chose DeepSeek".
+fn select_managed_route_on_login<W: Write>(
+    config: &mut ConfigStore,
+    provider_secrets: &Secrets,
+    out: &mut W,
+) -> Result<()> {
+    let explicit_provider = config
+        .original_body()
+        .and_then(|body| body.parse::<toml::Table>().ok())
+        .is_some_and(|table| table.contains_key("provider"));
+    let has_local_key =
+        resolve_local_key(config, provider_secrets, config.config.provider)?.is_some();
+    if config.config.provider == ProviderKind::default() && !explicit_provider && !has_local_key {
         config.config.provider = ProviderKind::Codewhale;
         config.config.model = Some("auto".to_string());
         config.save()?;
@@ -2416,7 +2428,7 @@ fn run_with<T: CloudTransport, W: Write>(
                 client.poll_device(&device, Duration::from_secs(login.timeout_seconds), sleeper)?;
             let user = client.me()?;
             write_account(out, "Signed in to Codewhale.", profile, api_base, &user)?;
-            select_managed_route_on_login(config, out)?;
+            select_managed_route_on_login(config, provider_secrets, out)?;
             Ok(())
         }
         CloudCommand::Status => match client.load_auth()? {
@@ -2565,10 +2577,11 @@ fn run_with<T: CloudTransport, W: Write>(
                 out,
                 "dry-run: remote settings import is not available; local config unchanged"
             )?;
-            // Show the invariant: Bearer custody stays in the OS keyring, never in config.toml.
+            // Show the invariant: account session tokens stay in the private
+            // Codewhale secrets file, never in config.toml.
             writeln!(
                 out,
-                "Secure custody: Bearer tokens remain in the OS keyring"
+                "Secure custody: account session tokens stay in the private Codewhale secrets file, never in config.toml"
             )?;
             Ok(())
         }
