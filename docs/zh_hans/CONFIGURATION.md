@@ -2,6 +2,7 @@
 
 > 英文原文：[CONFIGURATION.md](../CONFIGURATION.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐流传输、脚本工具及用户等待契约；其余段落保留原同步日期。
 > ChatGPT 登录相关内容于 2026-10-01 按当前实现更新。
 
 Codewhale 从 TOML 文件加环境变量读取配置。进程启动时，它还可能从工作区本地的 `.env` 文件加载字面(literal)的内置 provider 凭据。请以受跟踪的 `.env.example` 为模板；把它复制为 `.env`，然后只添加凭据值。
@@ -1373,6 +1374,42 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
 - `features.*`(可选)：功能标志覆盖(见下文)。
 
+### 流与传输设置
+
+`[stream]` 是模型流策略及其 HTTP 客户端的规范配置表。
+`codewhale config dump` 和 `codewhale config get stream` 显示运行时解析后的有效值，
+包括环境变量回退及范围限制；查看不会把默认值写入文件。例如：
+`codewhale config set stream.open_timeout_secs 120`、
+`codewhale config unset stream.open_timeout_secs`。单次运行的
+`--set stream.open_timeout_secs=120` 使用同一验证器。
+
+| `[stream]` 键 | 默认值 | 有效行为 | 旧 `[tui]` 回退键 |
+| --- | --- | --- | --- |
+| `open_timeout_secs` | 45 | 正数限制到 5–300；0 或省略时回退到环境变量/默认值 | `stream_open_timeout_secs` |
+| `chunk_timeout_secs` | 900 | 0 使用默认值；正数限制到 1–3600 | `stream_chunk_timeout_secs` |
+| `max_resumes` | 3 | 0 禁止重新发起整个请求；最大 10 | `stream_max_resumes` |
+| `max_transparent_retries` | 2 | 0 禁止输出任何内容前的重试；最大 10 | `stream_max_transparent_retries` |
+| `max_stream_errors` | 5 | 0 使用默认值；正数限制到 1–50 | `stream_max_errors` |
+| `max_duration_secs` | 1800 | 每条流的总时长；0 使用默认值，正数限制到 10–86400 秒 | `stream_max_duration_secs` |
+| `max_content_mb` | 10 | 每条流的内容上限；0 使用默认值，正数限制到 1–512 MiB | `stream_max_content_mb` |
+| `connect_timeout_secs` | 30 | TCP/TLS 建连；0 使用默认值，正数限制到 1–300 秒 | `connect_timeout_secs` |
+| `force_http1` | false | 布尔值；环境变量固定为真时始终启用 HTTP/1.1 | `force_http1` |
+| `tcp_keepalive_secs` | 30 | TCP 保活探测前的空闲时间；0 禁用，正数限制到 1–3600 秒 | 无 |
+| `http2_keep_alive_interval_secs` | 15 | 活跃 HTTP/2 连接的 PING 间隔；0 禁用，正数限制到 1–3600 秒 | 无 |
+| `http2_keep_alive_timeout_secs` | 20 | PING 确认期限；0 使用默认值，正数限制到 1–3600 秒 | 无 |
+
+每个显式规范字段都优先于旧 `[tui]` 字段，包括 `0` 与 `false`；省略规范字段则保留旧值。
+正数建连响应头等待时间优先于 `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`（再回退到
+`DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS`）；0 回退到这些变量。省略分块超时会使用
+`CODEWHALE_STREAM_IDLE_TIMEOUT_SECS`（再回退到 `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`），
+显式 0 则使用 900。`CODEWHALE_FORCE_HTTP1`（旧名 `DEEPSEEK_FORCE_HTTP1`）
+与配置做逻辑或，所以配置 `false` 不能取消环境变量固定的 `true`。Profile 逐字段合并此表。
+
+传输设置只影响新建的模型、目录和 HTTP/1 回退客户端，不会重建活跃客户端，
+也不控制 MCP 或其他网络服务。HTTP/2 PING 不作用于空闲连接池；固定 HTTP/1.1
+时 HTTP/2 设置无效。操作系统控制 TCP 探测细节；这些键不会关闭证书校验。
+`[retry]` 仍独立拥有 HTTP 请求退避计划。
+
 ### 工作区笔记
 
 `/note` 在当前工作区的 `.codewhale/notes.md` 管理一个简单的笔记文件(旧 `.deepseek/notes.md` 是尚不存在 `.codewhale/notes.md` 时的回退路径)。现有的 `/note <text>` 用法仍追加笔记。管理形式：
@@ -1635,6 +1672,37 @@ Codewhale 默认加载一个小型核心原生工具目录，把不太常见的�
 always_load = ["Git", "notify"]
 ```
 
+### 脚本工具与覆盖
+
+`~/.codewhale/tools/`（或 `[tools].plugin_dir`）内以 `# name:` 头声明的脚本成为
+模型可见工具，`/plugin tools` 列出它们。脚本从 stdin 读取工具 JSON 输入，
+向 stdout 写 JSON `ToolResult`，例如 `{"content":"...","success":true}`。
+
+```sh
+#!/usr/bin/env sh
+# name: word_count
+# description: Count words in the given text
+# schema: {"type":"object","properties":{"text":{"type":"string"}}}
+# approval: required
+```
+
+`# approval:` 支持 `suggest`（默认）或 `required`；两者都遵守会话审批设置。
+脚本不能自行批准：`approval: auto` 不再受支持，会采用默认值，并在运行时日志
+（`~/.codewhale/logs/`）及 `/plugin tools` 中说明。
+
+与已注册工具重名的脚本不会加载。`[tools.overrides]` 可以禁用内置工具，或以
+新名称添加 `script` / `command` 工具；不能用它们替换内置名称：
+
+```toml
+[tools.overrides]
+"Web" = { type = "disabled" }
+"audited_shell" = { type = "script", path = "audit-shell.sh" }
+"Bash" = { type = "script", path = "audit-shell.sh" } # 拒绝；Bash 仍生效
+```
+
+拒绝的键每个会话显示一次状态行并写入日志。要包装内置工具，请禁用它并用新名称
+注册包装器。覆盖仍可替换同名的普通脚本；相对 `path` 按插件目录解析。
+
 ### `request_user_input` 限制
 
 `request_user_input` 会向用户提出一小批选择题。两个上限都是可配置的（#5949）：当研究或规划工作流确实需要更多澄清时，调高 `user_input_max_questions`；当交互式分诊应保持简洁时，调低它。
@@ -1650,6 +1718,10 @@ user_input_max_options = 4     # default 4, clamped to 2..=10
 ### 用户输入等待超时
 
 `request_user_input` 的提问默认一直等待用户回答或取消（#6003）。省略 `user_input_timeout_seconds` 或设为 `0` 都不设置超时；正数则限定本次等待的秒数，超时后取消。大于 86,400 秒（24 小时）的值会被限制为 86,400 秒。无头的 `exec` 运行没有应答者，因此默认不提供 `request_user_input`：模型会报告该工具不存在并直接结束，而不是卡住。
+
+0.10.1 中，TUI 的挂起工具计时器识别真实的用户输入与审批等待（#6872）。等待时
+暂停该回合的看门狗；答案回到原调用，无需另输 `continue`。回答后重新计算活动等待
+基线。用户取消及正数审批/输入期限仍生效；它不会给正在执行的工具无限时间。
 
 ```toml
 [tools]

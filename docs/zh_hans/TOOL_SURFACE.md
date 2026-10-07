@@ -2,6 +2,7 @@
 
 > 英文原文：[TOOL_SURFACE.md](../TOOL_SURFACE.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 补齐本地解释器权限与后端限制；现有 MCP 有界发现段落已核对。
 
 本文描述当前面向模型的工具（tool）契约。产生它的 v0.9.1 切换记录在
 `docs/RUNTIME_SIMPLIFICATION_DESIGN.md` 中；工作区版本请从 `Cargo.toml` 读取，
@@ -64,6 +65,19 @@ Full Access（完全访问）会改变常规审批行为，但不会绕过硬性
 `update_plan` 仅为已保存工件（artifact）的兼容性而保留注册，对模型不可见。
 `tasks`、`Git`、`Run`、`Web`、`remember` 以及其他专门能力都是可搜索的，
 而不是首回合的必备仪式。
+
+## 本地代码执行
+
+`code_execution`（Python）与 `js_execution`（Node.js）使用工作区任务门禁/测试
+共用的权限感知启动器。常规调用保留会话策略。对被拒绝的精确调用申请更宽权限时，
+提供 `sandbox_permissions`（`workspace-write` 或 `danger-full-access`）与非空
+`justification`；Ask 模式需用户明确批准一次。获准策略只作用于该调用。
+
+两种工具从 stdin 读代码，返回 stdout / stderr / return_code，保留超时及进程树
+清理。它们不是持久 REPL；异常堆栈指向 stdin。独立 RLM/REPL 内核不受此次启动器
+整合影响。共享启动器的平台限制仍适用：没有可用的本地包装器时，workspace-write
+无法强制执行，read-only 则被拒绝。外部 sandbox 会话必须使用自己的 shell 路径，
+不能借此运行本地解释器。参见[沙箱限制](SANDBOX.md)。
 
 ## 延迟与动态工具
 

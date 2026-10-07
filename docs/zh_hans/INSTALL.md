@@ -1,7 +1,7 @@
 # 安装 Codewhale
 
 > 英文原文：[INSTALL.md](../INSTALL.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-29。本文按英文版当前结构（v0.10.0 安装实测版）整体重译；附录部分与英文一样，沿用上一版内容，未在 v0.10.0 上重测。
+> 最后与英文同步日期（last synced with English revision）：2026-10-06。按当前英文源码复核；下文 v0.10.0 安装记录与附录的原始测试范围保留，不能当作 v0.10.1 发布安装回执。
 
 Codewhale 是一个在终端里运行的开源编码智能体（coding agent）。你交给它一个任务（"修复失败的测试"、"加一个 CLI 参数"），它会读取你的仓库、编辑文件并运行命令。在默认的 **Ask**（询问）权限级别下，它会立即应用工作区内的文件编辑（并给你看 diff），但运行 shell 命令之前会先询问，所以请先提交或暂存你在意的改动。它支持多家模型提供商，默认是 **DeepSeek**。
 
@@ -9,7 +9,28 @@ Codewhale 是一个在终端里运行的开源编码智能体（coding agent）�
 
 本指南是在一台全新的 **Ubuntu 24.04 x86_64** 机器上安装 **v0.10.0**（2026-09-22 发布）时写成的，这里描述的每条路径都实际走过。文中每条命令都运行过，输出也核对过（见[安装回执](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)）。在那台机器上无法运行的步骤标注为 **（该虚拟机上未测试：原因）**。macOS、Windows 和 Android 不在测试范围内，只有少量说明。第二轮在 **macOS 26.1（Apple silicon）** 上重新运行了安装器、手动下载、压缩包和 npm 路径、无密钥检查以及 zsh 补全，见 [macOS 说明](#macos-说明)。需要调用模型的步骤没有在 macOS 上重跑。
 
-使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如 2026-09-28 之前的 v0.10.1 源码候选版）。候选版在其标签、校验和与发布资源齐备之前，都不能安装。
+使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如尚未打标签的 v0.10.1 源码候选版）。预编译候选版只有在标签、校验和与发布资源齐备后，才可通过官方安装器获取；贡献者可以先从 `main` 构建源码。
+
+## 使用当前源码参与测试与贡献
+
+`latest` 表示最新已发布版本；想测试尚未发布的修复，请使用权威 GitHub
+`main`，或确认与它提交一致的 CNB `main`。不要把仓库版本号当作发布证明。
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/CodeWhale.git
+cd CodeWhale
+cargo build --release --locked -p codewhale-cli
+target/release/codewhale --version
+```
+
+构建前置条件见下文 Cargo 章节；使用仓库选定的 stable Rust，最低声明版本
+为 1.89。首次构建可能耗时较长。Windows 的可执行文件为
+`target/release/codewhale.exe`，并需要 MSVC 工具链。开发构建不等于已签名发布包。
+
+中国大陆网络可参阅 [CNB 镜像、下载与验证](CNB_MIRROR.md)。npm 的
+`--registry=https://registry.npmmirror.com` 只改变 npm 包来源；包装器仍需要
+从独立的 GitHub、有效的 CNB 发布或完整的 HTTPS 资产镜像下载二进制。
+腾讯轻量应用服务器自建路径见 [Lighthouse 中文/英文引导](../../scripts/tencent-lighthouse/README.md)。
 
 ---
 
@@ -244,6 +265,14 @@ codewhale --version
 ```
 
 这个包是一个很小的包装器。它的 `postinstall` 步骤会下载同样的 `codewhale`/`codew` 发布二进制，对照该发布的 SHA-256 清单校验，并把 `codewhale` 和 `codew` 链接到 npm 的全局 `bin`。整个过程在测试机上用了 6 秒。
+
+**Windows npm 会话：** Node 在整个原生会话期间仍是启动器。
+`taskkill /IM node.exe` 或 `Get-Process node | Stop-Process -Force` 会影响
+所有匹配的 Node 进程，也可能中断 npm 启动的 Codewhale，破坏正常终端清理。
+只停止自己启动的服务器 PID、占用目标端口的进程，或使用 Codewhale 任务取消。
+Windows 原生压缩包/安装器可避免 npm 父进程依赖；可选 JavaScript 工具仍可能需要
+Node。Codewhale 的 Windows shell 安全底线即使在 Full Access 下也会拦住已识别的
+整类 Node 进程终止命令；外部硬终止无法靠这个检查实现优雅退出。
 
 ### 如果遇到 `EACCES: permission denied`
 
@@ -1122,6 +1151,19 @@ codewhale update
 ```
 
 镜像目录必须包含 `codewhale-artifacts-sha256.txt` 以及来自 GitHub 发布的各平台二进制。旧的 `DEEPSEEK_TUI_RELEASE_BASE_URL` 镜像变量仍作为别名受支持。
+
+`codewhale update` 只接受 HTTPS，允许 GitHub 发布主机、CNB 镜像以及
+`CODEWHALE_RELEASE_BASE_URL` 指定的主机；每一次重定向也检查相同规则。
+私有镜像若重定向到另一个 CDN 或对象存储域名，还需显式列出该下载主机：
+
+```bash
+CODEWHALE_UPDATE_ALLOWED_HOSTS=cdn.your-mirror.example.com,objects.example.net \
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
+CODEWHALE_VERSION=X.Y.Z \
+codewhale update
+```
+
+被拒绝的主机和允许主机变量会出现在错误信息里。不要关闭校验或改用 HTTP。
 
 ### Windows 与 npm 下载故障排查
 

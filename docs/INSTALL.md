@@ -1,6 +1,6 @@
 # Installing Codewhale
 
-> 阅读简体中文版：[zh_hans/INSTALL.md](zh_hans/INSTALL.md) (not yet updated for this revision)
+> 阅读简体中文版：[zh_hans/INSTALL.md](zh_hans/INSTALL.md)
 
 Codewhale is an open-source coding agent that runs in your terminal. You give
 it a task ("fix the failing test", "add a CLI flag"). It reads your repository,
@@ -24,8 +24,29 @@ there.
 Install commands that use `latest` resolve to the latest **published** GitHub
 Release or package. Between releases, `main` may already describe the next
 version (for example a v0.10.1 source candidate before its tag). A
-candidate isn't installable until its tag, checksums and release assets
-exist.
+prebuilt candidate is available through the official installer only after its
+tag, checksums and release assets exist. Contributors can build `main` now.
+
+## Test and contribute to current source
+
+`latest` selects the latest published release. To test unreleased repairs,
+build canonical GitHub `main`, or CNB `main` after verifying its commit matches.
+The source version number alone does not establish a published package.
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/CodeWhale.git
+cd CodeWhale
+cargo build --release --locked -p codewhale-cli
+target/release/codewhale --version
+```
+
+See the Cargo section for build prerequisites; use the repository's stable Rust
+selection (declared minimum 1.89). Windows uses `target/release/codewhale.exe`
+and needs MSVC. A development build is separate from a signed release package.
+For mainland-China downloads and source validation, see [CNB mirror](CNB_MIRROR.md).
+The [Tencent Lighthouse bootstrap](../scripts/tencent-lighthouse/README.md) is
+bilingual. An npm registry mirror serves the wrapper; native binary downloads
+still need an available release asset source.
 
 ---
 

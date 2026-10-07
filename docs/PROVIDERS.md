@@ -2,6 +2,10 @@
 
 > 阅读简体中文版：[zh_hans/PROVIDERS.md](zh_hans/PROVIDERS.md)
 
+Speech recognition, synthesis, translation and video have separate execution
+paths. See [media models](MEDIA_MODELS.md) for current support and reviewed
+upstream candidates; a chat catalogue row alone does not add a media backend.
+
 This registry describes provider behavior that is wired into the current
 Codewhale codebase. It is intentionally conservative: shipped entries are
 limited to provider IDs, config keys, auth paths, base URLs, model resolution,

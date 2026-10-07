@@ -2,6 +2,7 @@
 
 > 英文原文：[PLUGIN_AUTHORING.md](../PLUGIN_AUTHORING.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 2026-10-06 核对 DSH 静态转换、显式 Native 入口及本地 Node MCP 工作目录边界。
 
 先从一个 skill 开始：把 Markdown 指令文件放进一个小型插件包。
 [hello-codewhale 示例](../examples/plugins/hello-codewhale/plugin.json)
@@ -304,9 +305,11 @@ patch 操作也会出现在结构化的手工移植列表中，并附带其来�
 转换；包外的服务器会被跳过，宿主路径永远不会被复制。`@deepseek-ai/dsh-skill-filesystem`
 条目只有在其字面的 `customSkillDirs` 子目录位于包内时，才会贡献这些子目录。默认的用户
 和项目 skill 根目录、文件监视器以及外部服务依赖都不会被导入。任意 DSH TypeScript
-插件的执行不在此静态导入器的兼容范围内。明确编写 Native 入口的插件可通过实验性的
-TypeScript 扩展宿主提供工具、用户命令、执行前提议、提示词片段和插件本地状态；
-宿主不会执行导入的 `dsh.bundle.patch` 组合。参见[扩展编写指南](./EXTENSIONS.md)。
+插件的执行不在此静态导入器的兼容范围内。DSH TypeScript 插件代码仅通过实验性的
+TypeScript 扩展宿主运行（`[features] extension_host`，默认关闭）。明确编写 Native 入口的插件可提供
+工具、用户命令、限定范围的执行前提议、追加式提示词片段和 owner 本地状态；
+宿主不会执行导入的 `dsh.bundle.patch` 组合。参见[扩展编写指南](./EXTENSIONS.md)与
+[宿主设计](../design/TS_EXTENSION_HOST.md)。
 
 ### 本地 Node MCP 服务器
 

@@ -264,7 +264,7 @@ describe("public surface contracts", () => {
     expect(installDoc).toContain("One Cargo package is required");
     expect(installDoc).toContain("`codewhale-cli` installs the `codewhale` command");
     expect(installDoc).toContain("Cargo does\nnot create that alias");
-    expect(installPage).toContain("INSTALL_GUIDE.chunks");
+    expect(installPage).toContain('from "@/lib/install-guide.generated"');
     expect(INSTALL_GUIDE.chunks.some((chunk) => chunk.kind === "code" && chunk.text.includes("cargo install --path crates/cli --locked"))).toBe(true);
     expect(installPage).not.toContain("codewhale-tui");
     expect(npmReadme).toContain("installs `codewhale` plus the `codew` convenience name");
