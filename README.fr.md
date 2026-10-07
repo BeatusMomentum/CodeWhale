@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -57,6 +57,12 @@ sur une même machine finissent par se disputer le `PATH`.
 </details>
 
 ## Démarrage rapide
+
+**Les clés API de vos fournisseurs, au même endroit.** [Créez un compte Codewhale](https://app.codewhale.net/register)
+ou lancez `codewhale login` pour vous connecter. Enregistrez et mettez à jour vos clés API dans votre compte,
+puis utilisez-les via le routage des modèles Codewhale sur vos appareils connectés à ce compte.
+[Configurer les clés du compte](docs/CONFIGURATION.md#account-provider-keys).
+La connexion ne transfère pas les clés locales existantes ; l’utilisation locale reste possible sans compte.
 
 1. **Ouvrez votre projet.** Lancez `codewhale` dans le dossier sur lequel vous voulez travailler.
 2. **Connectez un modèle.** Lancez `/provider` (ou appuyez sur `F3`) pour ajouter une clé

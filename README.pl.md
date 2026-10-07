@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -59,6 +59,12 @@ na jednej maszynie zaczyna się kłócić o `PATH`.
 </details>
 
 ## Szybki start
+
+**Klucze API dostawców w jednym miejscu.** [Utwórz konto Codewhale](https://app.codewhale.net/register)
+lub uruchom `codewhale login`, aby się zalogować. Zapisuj i aktualizuj klucze API na swoim koncie,
+a następnie korzystaj z nich przez trasę modeli Codewhale na urządzeniach, na których się zalogowano.
+[Skonfiguruj klucze konta](docs/CONFIGURATION.md#account-provider-keys).
+Logowanie nie przesyła istniejących kluczy lokalnych; korzystanie lokalne jest nadal możliwe bez konta.
 
 1. **Otwórz projekt.** Uruchom `codewhale` w folderze, z którym chcesz pracować.
 2. **Połącz model.** Uruchom `/provider` (lub naciśnij `F3`), aby dodać klucz

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -57,6 +57,12 @@ instalações na mesma máquina acabam disputando o `PATH`.
 </details>
 
 ## Início rápido
+
+**As chaves API dos seus provedores, em um só lugar.** [Crie uma conta Codewhale](https://app.codewhale.net/register)
+ou execute `codewhale login` para entrar. Salve e atualize suas chaves API na conta
+e use-as pela rota de modelos do Codewhale nos dispositivos em que você estiver conectado.
+[Configure as chaves da conta](docs/CONFIGURATION.md#account-provider-keys).
+Entrar na conta não envia as chaves locais existentes; o uso local continua disponível sem uma conta.
 
 1. **Abra seu projeto.** Execute `codewhale` na pasta em que quer trabalhar.
 2. **Conecte um modelo.** Execute `/provider` (ou pressione `F3`) para adicionar

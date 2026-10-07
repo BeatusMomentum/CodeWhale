@@ -737,13 +737,11 @@ pub(crate) async fn run_exec_agent(
     let mut loaded_session_id = None;
     if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
-        let saved_workspace = saved
-            .metadata
-            .workspace
-            .canonicalize()
+        let saved_workspace = tokio::fs::canonicalize(&saved.metadata.workspace)
+            .await
             .unwrap_or_else(|_| saved.metadata.workspace.clone());
-        let launch_workspace = workspace
-            .canonicalize()
+        let launch_workspace = tokio::fs::canonicalize(&workspace)
+            .await
             .unwrap_or_else(|_| workspace.clone());
         if !paths_equal_for_config(&saved_workspace, &launch_workspace)
             && output_format == ExecOutputFormat::Text

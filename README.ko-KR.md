@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -59,6 +59,12 @@ Docker, Nix, Linux의 Homebrew, Android/Termux, 체크섬 검증을 포함한 �
 </details>
 
 ## 빠른 시작
+
+**공급자 API 키를 한곳에서 관리하세요.** [Codewhale 계정을 만들거나](https://app.codewhale.net/register)
+`codewhale login`을 실행해 로그인하세요. 계정에서 API 키를 저장하고 업데이트한 뒤,
+로그인한 기기에서 Codewhale 모델 경로를 통해 사용할 수 있습니다.
+[계정 키 설정하기](docs/CONFIGURATION.md#account-provider-keys).
+로그인해도 기존 로컬 키는 업로드되지 않으며, 계정 없이도 로컬에서 사용할 수 있습니다.
 
 1. **프로젝트를 엽니다.** 작업할 폴더에서 `codewhale`을 실행합니다.
 2. **모델을 연결합니다.** `/provider`를 실행하거나 `F3`을 눌러 호스팅 모델

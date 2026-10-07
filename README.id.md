@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -59,6 +59,12 @@ satu mesin akan saling berebut `PATH`.
 </details>
 
 ## Mulai cepat
+
+**Kelola kunci API penyedia Anda di satu tempat.** [Buat akun Codewhale](https://app.codewhale.net/register)
+atau jalankan `codewhale login` untuk masuk. Simpan dan perbarui kunci API di akun Anda,
+lalu gunakan melalui rute model Codewhale pada perangkat yang sudah masuk.
+[Siapkan kunci akun](docs/CONFIGURATION.md#account-provider-keys).
+Masuk tidak mengunggah kunci lokal yang sudah ada; penggunaan lokal tetap tersedia tanpa akun.
 
 1. **Buka proyek Anda.** Jalankan `codewhale` di folder yang ingin Anda kerjakan.
 2. **Hubungkan model.** Jalankan `/provider` (atau tekan `F3`) untuk menambahkan

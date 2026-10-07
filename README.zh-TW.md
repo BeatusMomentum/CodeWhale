@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:604da19bff2c -->
+<!-- source: README.md sha256:004b3d422063 -->
 <div align="center">
 
 <picture>
@@ -56,6 +56,11 @@ Docker、Nix、Linux 上的 Homebrew、Android/Termux、附校驗碼驗證的手
 </details>
 
 ## 快速開始
+
+**在同一個地方管理你的模型 API 金鑰。** [註冊 Codewhale 帳號](https://app.codewhale.net/register)，
+或執行 `codewhale login` 登入。將 API 金鑰儲存至帳號後，即可集中更新，並在已登入的裝置上
+透過 Codewhale 模型路由使用。[設定帳號金鑰](docs/CONFIGURATION.md#account-provider-keys)。
+登入不會上傳既有的本機金鑰；不註冊帳號也可以繼續在本機使用。
 
 1. **開啟你的專案。** 在要處理的資料夾中執行 `codewhale`。
 2. **連接模型。** 執行 `/provider`（或按 `F3`）新增託管服務的金鑰，或選擇本機執行環境。

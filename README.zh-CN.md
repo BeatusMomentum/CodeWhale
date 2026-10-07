@@ -59,7 +59,7 @@ Docker、Nix、Linux 上的 Homebrew、Android/Termux、带校验和验证的手
 
 **在一个地方管理你的模型 API 密钥。** [注册 Codewhale 账号](https://app.codewhale.net/register)，
 或运行 `codewhale login` 登录。将密钥保存到账号后，可以集中更新，并在已登录的设备上
-通过 Codewhale 模型通道使用。[设置账号密钥](docs/zh_hans/CONFIGURATION.md#账号提供商密钥)。
+通过 Codewhale 模型通道使用。[设置账号密钥](docs/zh_hans/CONFIGURATION.md#账号提供商密钥)（[英文版](docs/CONFIGURATION.md#account-provider-keys)）。
 登录不会自动上传已有的本地密钥；不注册账号也可以继续在本地使用。
 
 1. **打开你的项目。** 在要处理的文件夹中运行 `codewhale`。
