@@ -16,7 +16,7 @@ export function redactMcpOAuthLogs(bundle) {
   output = replaceExactlyOnce(
     output,
     /console\.warn\(`\[mcp-sdk\] OAuth \$\{JSON\.stringify\(error2\.code\)\} — \$\{action\}\. Cause: \$\{JSON\.stringify\(error2\.message\)\}`\);/g,
-    'console.warn(`[mcp-sdk] OAuth ${JSON.stringify(error2.code)} — ${action}; details omitted.`);',
+    'console.warn(`[mcp-sdk] OAuth authorization failed — ${action}; details omitted.`);',
     'OAuth error detail log',
   )
   return replaceExactlyOnce(

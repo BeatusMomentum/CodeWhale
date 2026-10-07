@@ -20357,7 +20357,7 @@ async function parseErrorResponse(input) {
 }
 function warnCredentialInvalidation(provider, error2, invalidated) {
   const action = provider.invalidateCredentials === void 0 ? `retrying authorization without discarding the stored ${invalidated} (provider implements no invalidateCredentials())` : `invalidating the stored ${invalidated} and retrying authorization`;
-  console.warn(`[mcp-sdk] OAuth ${JSON.stringify(error2.code)} — ${action}; details omitted.`);
+  console.warn(`[mcp-sdk] OAuth authorization failed — ${action}; details omitted.`);
 }
 async function auth(provider, options) {
   try {

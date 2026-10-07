@@ -250,6 +250,27 @@ test("replacement account explicitly starts fresh while retaining the old uncert
   assert.equal(f.sent.some((msg) => msg.item_list[0].text_item.text.includes("old private answer")), false);
 });
 
+for (const limit of ["count", "bytes"]) test(`replacement account refuses ${limit} overflow without losing private receipts`, async (t) => {
+  const f = await fixture(t);
+  const retiredAccountStates = limit === "count"
+    ? Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`receipt-${i}`, { threadId: `old-${i}` }]))
+    : { receipt: { prompt: "x".repeat(1024 * 1024) } };
+  const old = { threadId: "old-thread", bindingAccountId: "bot-A", retiredAccountStates,
+    pendingAdmission: { accountId: "bot-A", request: { prompt: "retained private prompt" } } };
+  await fs.writeFile(path.join(f.dir, "thread-map.json"), JSON.stringify({ chats: { alice: old }, messages: [], inflight: {} }));
+  await fs.writeFile(path.join(f.dir, "account.json"), JSON.stringify({ ...f.account, accountId: "bot-B" }));
+  f.batches.push([incoming(1, "/new", "alice", "bot-B-context")]); f.start();
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("Retired account receipt storage is full")), "retirement storage limit was not reported");
+  const current = (await f.disk()).chats.alice;
+  assert.equal(f.threadCreates, 0);
+  assert.equal(current.threadId, old.threadId);
+  assert.equal(current.bindingAccountId, old.bindingAccountId);
+  assert.deepEqual(current.retiredAccountStates, retiredAccountStates);
+  assert.deepEqual(current.pendingAdmission, old.pendingAdmission);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.sent.some((msg) => msg.item_list[0].text_item.text.includes("retained private prompt")), false);
+});
+
 test("same-account new-thread command cannot discard a pending admission", async (t) => {
   const f = await fixture(t, { admission: () => {} }); f.batches.push([incoming(1, "pending")]); f.start();
   await until(() => f.posts.length === 1, "pending admission missing");

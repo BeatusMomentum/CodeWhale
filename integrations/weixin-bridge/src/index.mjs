@@ -331,7 +331,13 @@ async function ensureThread(chatId, { forceNew = false, threadRequest } = {}) {
     // new side effect. It remains in this store, outside automatic recovery.
     const { retiredAccountStates = {}, ...retired } = existing;
     const receipt = crypto.createHash("sha256").update(JSON.stringify(retired)).digest("hex");
-    await threadStore.patchChat(chatId, { retiredAccountStates: { ...retiredAccountStates, [receipt]: retired } });
+    const retained = { ...retiredAccountStates, [receipt]: retired };
+    // Fail before creating a new thread; never evict an uncertain submission
+    // or reply merely to make room. Existing over-limit stores remain intact.
+    if (Object.keys(retained).length > threadStore.options.actionLimit || Buffer.byteLength(JSON.stringify(retained), "utf8") > 1024 * 1024) {
+      throw new Error("Retired account receipt storage is full. Ask the local operator to stop the bridge, back up thread-map.json, and reconcile retiredAccountStates before retrying /new.");
+    }
+    await threadStore.patchChat(chatId, { retiredAccountStates: retained });
     existing = await threadStore.getChat(chatId);
   }
 
