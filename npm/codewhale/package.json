@@ -15,13 +15,13 @@
       "url": "https://www.buymeacoffee.com/hmbown"
     }
   ],
-  "homepage": "https://github.com/codewhale-hq/CodeWhale",
+  "homepage": "https://github.com/codewhale-hq/Codewhale",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/codewhale-hq/CodeWhale.git"
+    "url": "git+https://github.com/codewhale-hq/Codewhale.git"
   },
   "bugs": {
-    "url": "https://github.com/codewhale-hq/CodeWhale/issues"
+    "url": "https://github.com/codewhale-hq/Codewhale/issues"
   },
   "keywords": [
     "codewhale",
